@@ -1,0 +1,14 @@
+raw_controller_order: ["base"]
+default_controllers:
+  base: DifferentialDriveController
+default_joint_pos: [0, 0]
+usd_path: __GENERATED_USD_PATH__
+base_footprint_link_name: chassis_link
+linear_velocity_gain_for_primitives: 0.3
+angular_velocity_gain_for_primitives: 0.2
+locomotion:
+  base_joint_names: ["joint_wheel_left", "joint_wheel_right"]
+two_wheel:
+  wheel_radius: 0.14
+  wheel_axle_length: 0.4132
+

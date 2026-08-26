@@ -1,0 +1,52 @@
+#usda 1.0
+(
+    defaultPrim = "mobile_sensor_robot_v1"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "mobile_sensor_robot_v1" (
+    prepend references = @__NOVA_CARTER_USD__@
+)
+{
+    # Project-owned geometry. The installed NVIDIA layer is referenced, never modified.
+    def Xform "mvwd_sensor_rig"
+    {
+        def Cylinder "mast_lower"
+        {
+            double radius = 0.025
+            double height = 0.45
+            token axis = "Z"
+            float3[] extent = [(-0.025, -0.025, -0.225), (0.025, 0.025, 0.225)]
+            double3 xformOp:translate = (0, 0, 0.575)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def Xform "mast_carriage"
+        {
+            double3 xformOp:translate = (0, 0, 0.8)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+            def Cylinder "mast_upper"
+            {
+                double radius = 0.02
+                double height = 0.4
+                token axis = "Z"
+                float3[] extent = [(-0.02, -0.02, -0.2), (0.02, 0.02, 0.2)]
+            }
+            def Cube "camera_head"
+            {
+                double size = 1
+                float3[] extent = [(-0.06, -0.04, -0.035), (0.06, 0.04, 0.035)]
+                double3 xformOp:scale = (0.12, 0.08, 0.07)
+                uniform token[] xformOpOrder = ["xformOp:scale"]
+            }
+            def Camera "dataset_camera"
+            {
+                float focalLength = 14.991
+                float horizontalAperture = 20.995
+                float2 clippingRange = (0.1, 15)
+                token projection = "perspective"
+            }
+        }
+    }
+}
+

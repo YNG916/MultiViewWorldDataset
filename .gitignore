@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Environments and machine-local configuration
+.venv/
+venv/
+env/
+.conda/
+.env
+.env.*
+!.env.example
+env.sh
+!env.example.sh
+
+# Editors and operating systems
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs, caches, debug and generated configuration
+logs/
+cache/
+caches/
+debug/
+inspection/
+generated_configs/
+reject_logs/
+*.log
+
+# Generated dataset products (images are intentionally not ignored globally)
+dataset/
+datasets_generated/
+outputs/
+episodes/
+generated_episodes/
+*.zarr/
+*.zarr.zip
+*.npz
+*.npy
+*.parquet
+*.hdf5
+*.h5
+*.snapshot
+*.state
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+
