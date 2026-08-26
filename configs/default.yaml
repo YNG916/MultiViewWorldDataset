@@ -36,8 +36,8 @@ bev:
   environment_meters_per_pixel: 0.02
   world_meters_per_pixel: 0.04
   bounds_margin_m: 0.5
-  modalities: [rgb, depth_linear, height, normal, semantic, instance, occupancy]
-  world_modalities: [rgb, depth_linear, height, semantic, instance, occupancy]
+  modalities: [rgb, depth_linear, height, normal, semantic, instance, instance_id, occupancy]
+  world_modalities: [rgb, depth_linear, height, semantic, instance, instance_id, occupancy]
 
 placement:
   cluster_radius_m: 3.0
@@ -76,7 +76,7 @@ intervention:
   application_mode: pre_rollout
 
 generation:
-  settle_steps: 120
+  settle_steps: 30
   maximum_configuration_attempts: 1000
   exact_hash_decimals: 8
   near_duplicate_translation_m: 0.03

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -16,6 +16,7 @@ class BEVRender:
     modalities: dict[str, np.ndarray]
     projection_token: str
     contains_robots: bool
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class BaseSimulatorAdapter(ABC):

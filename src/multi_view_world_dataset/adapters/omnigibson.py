@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from multi_view_world_dataset.adapters.base import BEVRender, BaseSimulatorAdapter
-from multi_view_world_dataset.cameras.transforms import validate_transform
-from multi_view_world_dataset.errors import GeometryError, SimulatorUnavailableError
+from multi_view_world_dataset.cameras.transforms import rotation_angle, validate_transform
+from multi_view_world_dataset.errors import GeometryError, SampleRejected, SimulatorUnavailableError
 from multi_view_world_dataset.rendering.bev import BEVCalibration
 from multi_view_world_dataset.sampling.splits import infer_scene_family
 from multi_view_world_dataset.schema.records import BaseSceneRecord, ObjectState
@@ -27,6 +28,10 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         self._transform_utils: Any = None
         self._asset_utils: Any = None
         self._vision_sensor_type: Any = None
+        self._on_top_type: Any = None
+        self._inside_type: Any = None
+        self._rigid_contact_api: Any = None
+        self._development_camera_mounts: dict[str, np.ndarray] = {}
         self._env: Any = None
         self._scene_id: str | None = None
         self._started = False
@@ -40,13 +45,16 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             import omnigibson as og
             import omnigibson.lazy as lazy
             import omnigibson.utils.transform_utils as transform_utils
+            from omnigibson.object_states import Inside, OnTop
             from omnigibson.sensors.vision_sensor import VisionSensor
             from omnigibson.utils import asset_utils
+            from omnigibson.utils.usd_utils import RigidContactAPI
         except Exception as error:
             raise SimulatorUnavailableError(f"Failed to launch/import OmniGibson: {error}") from error
         self._og, self._lazy, self._th = og, lazy, th
         self._transform_utils, self._asset_utils = transform_utils, asset_utils
         self._vision_sensor_type = VisionSensor
+        self._on_top_type, self._inside_type, self._rigid_contact_api = OnTop, Inside, RigidContactAPI
         if og.sim is None:
             og.launch()
         self._started = True
@@ -94,6 +102,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         self._require_started()
         if self._env is not None:
             self._og.clear()
+        self._development_camera_mounts.clear()
         if scene_id not in self.discover_scenes():
             raise SimulatorUnavailableError(f"Scene is not installed: {scene_id}")
         camera = self.config["camera"]
@@ -154,8 +163,36 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
 
     def _pose_matrix(self, obj: Any) -> np.ndarray:
         position, orientation = obj.get_position_orientation()
+        orientation_values = self._native_value(orientation).astype(np.float64)
+        quaternion_norm = float(np.linalg.norm(orientation_values))
+        norm_drift = abs(quaternion_norm - 1.0)
+        if not np.isfinite(quaternion_norm) or quaternion_norm < 1.0e-8 or norm_drift > 1.0e-3:
+            raise GeometryError(f"Pose quaternion norm drift is unsafe: {quaternion_norm}")
+        if hasattr(orientation, "detach"):
+            orientation = orientation / quaternion_norm
+        else:
+            orientation = orientation_values / quaternion_norm
+        max_drift = float(self._runtime_findings.get("maximum_pose_quaternion_norm_drift", 0.0))
+        self._runtime_findings["maximum_pose_quaternion_norm_drift"] = max(
+            max_drift, norm_drift
+        )
         matrix = self._transform_utils.pose2mat((position, orientation))
-        return validate_transform(matrix.detach().cpu().numpy() if hasattr(matrix, "detach") else matrix)
+        native_matrix = self._native_value(matrix).astype(np.float64).copy()
+        raw_rotation = native_matrix[:3, :3]
+        orthonormality_error = float(np.linalg.norm(raw_rotation.T @ raw_rotation - np.eye(3), ord="fro"))
+        if orthonormality_error > 1.0e-3:
+            raise GeometryError(f"Pose rotation projection would be unsafe: {orthonormality_error}")
+        left, _, right = np.linalg.svd(raw_rotation)
+        rotation = left @ right
+        if np.linalg.det(rotation) < 0:
+            left[:, -1] *= -1
+            rotation = left @ right
+        native_matrix[:3, :3] = rotation
+        max_error = float(self._runtime_findings.get("maximum_pose_rotation_projection_error", 0.0))
+        self._runtime_findings["maximum_pose_rotation_projection_error"] = max(
+            max_error, orthonormality_error
+        )
+        return validate_transform(native_matrix)
 
     @staticmethod
     def _native_value(value: Any) -> np.ndarray:
@@ -223,6 +260,240 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 )
             )
         return tuple(catalog)
+
+    def _native_objects_by_path(self) -> dict[str, Any]:
+        return {str(obj.prim_path): obj for obj in self._require_scene().objects}
+
+    @staticmethod
+    def _attach_relations(
+        catalog: tuple[ObjectState, ...], relations: tuple[dict[str, Any], ...]
+    ) -> tuple[ObjectState, ...]:
+        by_target: dict[str, list[dict[str, Any]]] = {}
+        for relation in relations:
+            by_target.setdefault(str(relation["target_instance_id"]), []).append(
+                {
+                    "predicate": str(relation["predicate"]),
+                    "reference_instance_id": str(relation["reference_instance_id"]),
+                    "reference_category": str(relation["reference_category"]),
+                }
+            )
+        return tuple(
+            replace(
+                obj,
+                relations=tuple(
+                    sorted(
+                        by_target.get(obj.instance_id, ()),
+                        key=lambda item: (item["predicate"], item["reference_instance_id"]),
+                    )
+                ),
+            )
+            for obj in catalog
+        )
+
+    def relation_candidates(
+        self, catalog: tuple[ObjectState, ...] | None = None
+    ) -> tuple[dict[str, Any], ...]:
+        """Return current OnTop / Inside relations suitable for semantic resampling.
+
+        AABB filtering keeps this query local; the final answer always comes from
+        OmniGibson's actual object-state predicates rather than geometry heuristics.
+        """
+        catalog = self.object_catalog() if catalog is None else catalog
+        by_path = self._native_objects_by_path()
+        records: list[dict[str, Any]] = []
+        for target in catalog:
+            native_target = by_path.get(target.native_path)
+            if not target.movable or target.structural or native_target is None:
+                continue
+            target_low = np.asarray(target.bbox_min_world)
+            target_high = np.asarray(target.bbox_max_world)
+            target_center = 0.5 * (target_low + target_high)
+            for reference in catalog:
+                native_reference = by_path.get(reference.native_path)
+                if reference.instance_id == target.instance_id or native_reference is None:
+                    continue
+                reference_low = np.asarray(reference.bbox_min_world)
+                reference_high = np.asarray(reference.bbox_max_world)
+                state_specs: list[tuple[str, Any]] = []
+                if self._inside_type in native_target.states:
+                    contained = np.all(target_center >= reference_low - 0.05) and np.all(
+                        target_center <= reference_high + 0.05
+                    )
+                    if contained:
+                        state_specs.append(("Inside", self._inside_type))
+                if self._on_top_type in native_target.states:
+                    overlap_xy = np.minimum(target_high[:2], reference_high[:2]) - np.maximum(
+                        target_low[:2], reference_low[:2]
+                    )
+                    vertically_close = abs(float(target_low[2] - reference_high[2])) <= 0.25
+                    if np.all(overlap_xy > 0.0) and vertically_close:
+                        state_specs.append(("OnTop", self._on_top_type))
+                for predicate, state_type in state_specs:
+                    try:
+                        active = bool(native_target.states[state_type].get_value(native_reference))
+                    except Exception:
+                        active = False
+                    if active:
+                        records.append(
+                            {
+                                "predicate": predicate,
+                                "target_instance_id": target.instance_id,
+                                "target_category": target.category,
+                                "reference_instance_id": reference.instance_id,
+                                "reference_category": reference.category,
+                                "target_native_path": target.native_path,
+                                "reference_native_path": reference.native_path,
+                            }
+                        )
+        return tuple(
+            sorted(
+                records,
+                key=lambda item: (
+                    item["target_instance_id"],
+                    item["predicate"],
+                    item["reference_instance_id"],
+                ),
+            )
+        )
+
+    def object_catalog_with_relations(self) -> tuple[ObjectState, ...]:
+        catalog = self.object_catalog()
+        return self._attach_relations(catalog, self.relation_candidates(catalog))
+
+    def _free_traversable_candidate_count(self, floor_index: int) -> int:
+        scene = self._require_scene()
+        floor_map = self._th.clone(scene.trav_map.floor_map[floor_index])
+        robot = self._env.robots[0] if self._env.robots else None
+        eroded = scene.trav_map._erode_trav_map(floor_map, robot=robot)
+        return int(self._th.count_nonzero(eroded == 255).item())
+
+    def randomize_relation_preserving_configuration(self, seed: int) -> dict[str, Any]:
+        """Create one native-validated dynamic configuration without random XYZ poses."""
+        from multi_view_world_dataset.sampling.configurations import exact_state_hash
+
+        baseline_snapshot = self.dump_snapshot()
+        baseline_raw_catalog = self.object_catalog()
+        relations = self.relation_candidates(baseline_raw_catalog)
+        baseline_catalog = self._attach_relations(baseline_raw_catalog, relations)
+        if not relations:
+            raise SampleRejected("no_relation_preserving_configuration_candidate")
+        rng = np.random.default_rng(seed)
+        failures: list[dict[str, Any]] = []
+        generation = self.config["generation"]
+        translation_threshold = float(generation["near_duplicate_translation_m"])
+        rotation_threshold = float(np.deg2rad(generation["near_duplicate_rotation_deg"]))
+        baseline_by_id = {obj.instance_id: obj for obj in baseline_catalog}
+        random_tiebreakers = rng.random(len(relations))
+        relation_order = sorted(
+            range(len(relations)),
+            key=lambda index: (
+                relations[index]["reference_category"] != "floors",
+                np.prod(
+                    np.asarray(baseline_by_id[relations[index]["target_instance_id"]].bbox_max_world)
+                    - np.asarray(baseline_by_id[relations[index]["target_instance_id"]].bbox_min_world)
+                ),
+                random_tiebreakers[index],
+            ),
+        )
+        for attempt_index, relation_index in enumerate(relation_order, start=1):
+            relation = relations[relation_index]
+            self.load_snapshot(baseline_snapshot)
+            native_by_path = self._native_objects_by_path()
+            target_native = native_by_path[relation["target_native_path"]]
+            reference_native = native_by_path[relation["reference_native_path"]]
+            state_type = self._on_top_type if relation["predicate"] == "OnTop" else self._inside_type
+            self._th.manual_seed(int(seed + attempt_index))
+            try:
+                sampled = bool(
+                    target_native.states[state_type].set_value(
+                        reference_native,
+                        True,
+                        reset_before_sampling=True,
+                        use_trav_map=(
+                            relation["predicate"] == "OnTop" and relation["reference_category"] == "floors"
+                        ),
+                    )
+                )
+            except Exception as error:
+                failures.append({"reason": "relation_sampler_error", "error": str(error), **relation})
+                continue
+            if not sampled:
+                failures.append({"reason": "relation_sampler_failed", **relation})
+                continue
+            for _ in range(int(generation["settle_steps"])):
+                for robot in self._env.robots:
+                    robot.keep_still()
+                self._og.sim.step_physics()
+            self._og.sim.step()
+            if not bool(target_native.states[state_type].get_value(reference_native)):
+                failures.append({"reason": "relation_lost_after_settle", **relation})
+                continue
+            raw_catalog = self.object_catalog()
+            catalog = self._attach_relations(raw_catalog, (relation,))
+            after_by_id = {obj.instance_id: obj for obj in catalog}
+            before_target = baseline_by_id[relation["target_instance_id"]]
+            after_target = after_by_id[relation["target_instance_id"]]
+            translation = float(
+                np.linalg.norm(after_target.object_to_world[:3, 3] - before_target.object_to_world[:3, 3])
+            )
+            rotation = float(rotation_angle(before_target.object_to_world, after_target.object_to_world))
+            same_identity = set(after_by_id) == set(baseline_by_id)
+            same_floor = after_target.floor_id == before_target.floor_id
+            same_room = before_target.room_id is None or after_target.room_id == before_target.room_id
+            extra_collision = bool(
+                self._rigid_contact_api.is_in_contact(
+                    scene_idx=target_native.scene.idx,
+                    query_set=[target_native],
+                    with_set=None,
+                    ignore_set=[reference_native],
+                    current_only=True,
+                )
+            )
+            floor_index = int((after_target.floor_id or "floor_00").split("_")[-1])
+            free_candidates = self._free_traversable_candidate_count(floor_index)
+            intervention_targets = sum(obj.movable and not obj.structural for obj in catalog)
+            diverse = translation > translation_threshold or rotation > rotation_threshold
+            checks = {
+                "stable_instance_ids": same_identity,
+                "relation_preserved": True,
+                "same_floor": same_floor,
+                "same_room_when_known": same_room,
+                "no_extra_collision": not extra_collision,
+                "configuration_diverse": diverse,
+                "robot_free_space": free_candidates >= 3,
+                "intervention_candidate_available": intervention_targets > 0,
+            }
+            if not all(checks.values()):
+                failures.append({"reason": "configuration_qa_failed", "checks": checks, **relation})
+                continue
+            accepted_snapshot = self.dump_snapshot()
+            accepted_hash = exact_state_hash(catalog, decimals=int(generation["exact_hash_decimals"]))
+            self.load_snapshot(accepted_snapshot)
+            restored_catalog = self._attach_relations(self.object_catalog(), (relation,))
+            restored_hash = exact_state_hash(restored_catalog, decimals=int(generation["exact_hash_decimals"]))
+            if restored_hash != accepted_hash:
+                failures.append({"reason": "configuration_snapshot_restore_mismatch", **relation})
+                continue
+            return {
+                "catalog": restored_catalog,
+                "snapshot": accepted_snapshot,
+                "exact_state_hash": accepted_hash,
+                "baseline_exact_state_hash": exact_state_hash(
+                    baseline_catalog, decimals=int(generation["exact_hash_decimals"])
+                ),
+                "accepted_attempt": attempt_index,
+                "relation": relation,
+                "checks": checks,
+                "translation_m": translation,
+                "rotation_deg": float(np.rad2deg(rotation)),
+                "free_traversable_candidates": free_candidates,
+                "intervention_target_count": intervention_targets,
+            }
+        self.load_snapshot(baseline_snapshot)
+        raise SampleRejected(
+            "configuration_relation_sampling_failed",
+            {"candidate_count": len(relations), "failures": failures[:20]},
+        )
 
     def dump_snapshot(self) -> np.ndarray:
         self._require_scene()
@@ -339,11 +610,18 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 raise SimulatorUnavailableError(
                     f"Expected one VisionSensor on {robot.name}, found {len(vision_sensors)}"
                 )
-            vision_sensors[0].set_position_orientation(position=camera_position, orientation=camera_orientation)
-        self._og.sim.step()
+            sensor = vision_sensors[0]
+            sensor.set_position_orientation(position=camera_position, orientation=camera_orientation)
+            self._development_camera_mounts[robot.name] = camera_to_base.copy()
+        settle_steps = min(30, int(self.config["generation"]["settle_steps"]))
+        for _ in range(settle_steps):
+            for robot in robots:
+                robot.keep_still()
+            self._og.sim.step()
         for _ in range(4):
             self._og.sim.render()
         self._runtime_findings["development_camera_heights_m"] = sampled_heights
+        self._runtime_findings["development_camera_settle_steps"] = settle_steps
         self._runtime_findings["placement_attempts"] = attempts
         self._runtime_findings["placement_candidate_count"] = len(candidates)
         self._runtime_findings["placement_shared_yaw_rad"] = shared_yaw
@@ -364,11 +642,32 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             observation, info = sensor.get_obs()
             usd_camera_to_world = self._pose_matrix(sensor)
             camera_to_world = validate_transform(usd_camera_to_world @ np.diag([1.0, -1.0, -1.0, 1.0]))
+            base_to_world = self._pose_matrix(robot)
+            camera_to_base = np.linalg.inv(base_to_world) @ camera_to_world
+            mount_orthonormality_error = float(
+                np.linalg.norm(camera_to_base[:3, :3].T @ camera_to_base[:3, :3] - np.eye(3), ord="fro")
+            )
+            expected_mount = self._development_camera_mounts.get(robot.name)
+            translation_error = float("inf")
+            rotation_error = float("inf")
+            if expected_mount is not None:
+                translation_error = float(np.linalg.norm(camera_to_base[:3, 3] - expected_mount[:3, 3]))
+                relative_rotation = expected_mount[:3, :3].T @ camera_to_base[:3, :3]
+                rotation_error = float(np.arccos(np.clip((np.trace(relative_rotation) - 1.0) / 2.0, -1.0, 1.0)))
+            sensor_prim_path = str(sensor.prim_path)
+            robot_prim_path = str(robot.prim_path)
             result[robot.name] = {
                 "modalities": {name: self._native_value(value) for name, value in observation.items()},
                 "info": info,
                 "camera_to_world": camera_to_world,
-                "base_to_world": self._pose_matrix(robot),
+                "base_to_world": base_to_world,
+                "camera_to_base": camera_to_base,
+                "expected_camera_to_base": expected_mount,
+                "mount_translation_error_m": translation_error,
+                "mount_rotation_error_rad": rotation_error,
+                "mount_orthonormality_error": mount_orthonormality_error,
+                "sensor_prim_path": sensor_prim_path,
+                "sensor_attached_to_robot": sensor_prim_path.startswith(robot_prim_path + "/"),
             }
         return result
 
@@ -388,8 +687,14 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         scene = self._require_scene()
         if calibration.floor_id != f"floor_{floor_index:02d}":
             raise GeometryError("BEV floor index and calibration floor_id disagree")
-        sensor_modalities = set(modalities) & {"rgb", "depth_linear", "normal", "semantic", "instance"}
-        backend_names = {"semantic": "seg_semantic", "instance": "seg_instance"}
+        sensor_modalities = set(modalities) & {
+            "rgb", "depth_linear", "normal", "semantic", "instance", "instance_id"
+        }
+        backend_names = {
+            "semantic": "seg_semantic",
+            "instance": "seg_instance",
+            "instance_id": "seg_instance_id",
+        }
         sensor_names = [backend_names.get(name, name) for name in sensor_modalities]
         if "height" in modalities:
             sensor_names.append("depth_linear")
@@ -413,8 +718,12 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             with self._og.sim.editing_usd():
                 usd_camera = self._lazy.pxr.UsdGeom.Camera(camera.prim)
                 usd_camera.GetProjectionAttr().Set(self._lazy.pxr.UsdGeom.Tokens.orthographic)
-                usd_camera.GetHorizontalApertureAttr().Set(float(calibration.world_bounds[2] - calibration.world_bounds[0]))
-                usd_camera.GetVerticalApertureAttr().Set(float(calibration.world_bounds[3] - calibration.world_bounds[1]))
+                # Isaac Sim expresses USD camera aperture in tenths of a world unit.
+                # A world-space span of W metres therefore requires aperture 10 * W.
+                world_width = float(calibration.world_bounds[2] - calibration.world_bounds[0])
+                world_height = float(calibration.world_bounds[3] - calibration.world_bounds[1])
+                usd_camera.GetHorizontalApertureAttr().Set(10.0 * world_width)
+                usd_camera.GetVerticalApertureAttr().Set(10.0 * world_height)
             projection = str(self._lazy.pxr.UsdGeom.Camera(camera.prim).GetProjectionAttr().Get())
             if projection != "orthographic":
                 raise GeometryError(f"BEV camera projection is {projection!r}, not orthographic")
@@ -433,7 +742,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             camera.initialize()
             for _ in range(4):
                 self._og.sim.render()
-            observation, _ = camera.get_obs()
+            observation, info = camera.get_obs()
             arrays: dict[str, np.ndarray] = {}
             for public_name in sensor_modalities:
                 backend_name = backend_names.get(public_name, public_name)
@@ -447,7 +756,18 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                     depth = self._native_value(observation["depth_linear"]).squeeze()
                     height = np.where(np.isfinite(depth), camera_z - depth - calibration.floor_z, np.nan)
                 arrays["occupancy"] = (np.isfinite(height) & (height > 0.10)).astype(np.uint8)
-            return BEVRender(calibration, arrays, projection, include_robots)
+            return BEVRender(
+                calibration,
+                arrays,
+                projection,
+                include_robots,
+                metadata={
+                    "segmentation_info": info,
+                    "horizontal_aperture": 10.0 * world_width,
+                    "vertical_aperture": 10.0 * world_height,
+                    "camera_z": camera_z,
+                },
+            )
         finally:
             for obj, was_visible in reversed(hidden):
                 obj.visible = was_visible
