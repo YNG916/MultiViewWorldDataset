@@ -23,7 +23,7 @@ def materialize_mobile_sensor_robot(
     yaml_template = template_root / "mobile_sensor_robot_v1.yaml.in"
     if not usd_template.is_file() or not yaml_template.is_file():
         raise SimulatorUnavailableError(f"Final robot templates are missing under {template_root}")
-    model_root = generated_root / "mobile_sensor_robot_v1"
+    model_root = generated_root / "models" / "mobile_sensor_robot_v1"
     usd_root = model_root / "usd"
     usd_root.mkdir(parents=True, exist_ok=True)
     usd_path = usd_root / "mobile_sensor_robot_v1.usda"

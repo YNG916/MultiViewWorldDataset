@@ -46,6 +46,7 @@ def validate_config(config: dict[str, Any]) -> None:
     camera = config.get("camera", {})
     bev = config.get("bev", {})
     intervention = config.get("intervention", {})
+    generation = config.get("generation", {})
     if dataset.get("robots") != 3:
         errors.append("Dataset v1 requires exactly 3 robots")
     if config.get("profile") not in {"smoke", "integration"} and dataset.get("frames") != 60:
@@ -75,6 +76,16 @@ def validate_config(config: dict[str, Any]) -> None:
         errors.append("Intervention type weights must sum to 1")
     if intervention.get("application_mode") != "pre_rollout":
         errors.append("Dataset v1 only supports pre_rollout interventions")
+    for key in (
+        "native_relation_high_level_attempts",
+        "native_relation_low_level_attempts",
+    ):
+        value = generation.get(key)
+        if not isinstance(value, int) or value < 1:
+            errors.append(f"Generation setting {key} must be a positive integer")
+    restore_tolerance = generation.get("snapshot_restore_tolerance")
+    if not isinstance(restore_tolerance, (int, float)) or restore_tolerance <= 0:
+        errors.append("Generation setting snapshot_restore_tolerance must be positive")
     if errors:
         raise ConfigurationError("Invalid dataset configuration:\n- " + "\n- ".join(errors))
 

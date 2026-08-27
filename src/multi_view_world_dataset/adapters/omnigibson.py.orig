@@ -1396,6 +1396,10 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 position=self._th.tensor([(xmin + xmax) / 2, (ymin + ymax) / 2, camera_z]),
                 orientation=self._th.tensor([0.0, 0.0, 0.0, 1.0]),
             )
+            if not include_robots:
+                hidden.extend(self._set_visible(list(self._env.robots), False))
+            ceilings = [obj for obj in scene.objects if str(getattr(obj, "category", "")) in {"ceilings", "roof"}]
+            hidden.extend(self._set_visible(ceilings, False))
             camera.initialize()
             self._refresh_physics_handles_after_sensor_edit()
             for _ in range(4):

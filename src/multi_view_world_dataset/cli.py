@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from multi_view_world_dataset.generator import generate_dataset
 from multi_view_world_dataset.pipeline import inspect_simulator_runtime, run_simulator_probe
 from multi_view_world_dataset.utils.config import load_yaml_config
 from multi_view_world_dataset.utils.runtime import resolve_runtime_paths
@@ -45,6 +46,19 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--config", required=True)
     smoke.add_argument("--scene", help="Installed scene ID; defaults to first dynamically discovered scene")
     _machine_arguments(smoke, output=True)
+
+    generate = subparsers.add_parser(
+        "generate",
+        help="Generate or safely resume an accepted smoke/integration dataset",
+    )
+    generate.add_argument("--config", required=True)
+    generate.add_argument("--scene", help="Installed scene ID; defaults to dynamically discovered scenes")
+    generate.add_argument(
+        "--allow-large",
+        action="store_true",
+        help="Explicitly allow pilot/default generation (never enabled implicitly)",
+    )
+    _machine_arguments(generate, output=True)
     return parser
 
 
@@ -63,6 +77,21 @@ def main(argv: list[str] | None = None) -> int:
         output, findings = run_simulator_probe(runtime, config, scene_id=args.scene)
         print(json.dumps({"status": findings["status"], "output": str(output)}, indent=2))
         return 0 if findings["status"] == "pass" else 2
+    if args.command == "generate":
+        output, result = generate_dataset(
+            runtime,
+            config,
+            scene_id=args.scene,
+            allow_large=bool(args.allow_large),
+        )
+        print(
+            json.dumps(
+                {"status": result["status"], "output": str(output), **result},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0 if result["status"] == "pass" else 2
     raise AssertionError(args.command)
 
 

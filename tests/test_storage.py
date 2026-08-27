@@ -49,3 +49,23 @@ def test_nonfinite_values_serialize_as_json_null(tmp_path):
     path = tmp_path / "strict.json"
     dump_json(path, {"limits": np.asarray([-np.inf, np.inf])})
     assert json.loads(path.read_text()) == {"limits": [None, None]}
+
+def test_dense_storage_falls_back_without_zarr(tmp_path):
+    writer = DatasetWriter(tmp_path / "dataset")
+    with writer.begin_episode("scene", "config", "dense") as transaction:
+        reference = transaction.write_dense_group("robot_views/before/robot_00", {"rgb": np.zeros((2, 3, 4, 3))})
+        transaction.write_json("meta.json", {"dense_ref": reference})
+        target = transaction.finalize()
+    assert (target / reference).exists()
+
+
+def test_resume_indexes_and_reject_log(tmp_path):
+    writer = DatasetWriter(tmp_path / "dataset")
+    dump_json(writer.root / "configurations" / "scene" / "config_000" / "config_meta.json", {"ok": True})
+    dump_json(writer.root / "episodes" / "scene" / "config_000" / "episode_000" / "meta.json", {"ok": True})
+    writer.record_reject("configuration:scene", "collision", {"attempt": 3})
+    writer.record_reject("episode:scene/config_000", "overlap", {"attempt": 4})
+    assert writer.completed_configuration_ids("scene") == ("config_000",)
+    assert writer.completed_episode_ids("scene", "config_000") == ("episode_000",)
+    records = [json.loads(line) for line in (writer.root / "rejects.jsonl").read_text().splitlines()]
+    assert [record["reason"] for record in records] == ["collision", "overlap"]

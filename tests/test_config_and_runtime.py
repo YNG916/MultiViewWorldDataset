@@ -24,6 +24,13 @@ def test_frozen_camera_setting_cannot_drift():
         validate_config(config)
 
 
+def test_native_relation_attempt_budget_must_be_positive():
+    config = load_yaml_config(REPOSITORY / "configs" / "smoke.yaml")
+    config["generation"]["native_relation_low_level_attempts"] = 0
+    with pytest.raises(ConfigurationError, match="native_relation_low_level_attempts"):
+        validate_config(config)
+
+
 def test_runtime_path_precedence_and_failure(tmp_path):
     behavior = tmp_path / "behavior"
     (behavior / "OmniGibson" / "omnigibson").mkdir(parents=True)

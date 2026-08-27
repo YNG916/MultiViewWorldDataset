@@ -36,6 +36,17 @@ scripts/run_smoke.sh /path/to/output
 The wrapper verifies the persisted result marker because Kit fast shutdown may terminate before the Python CLI can
 propagate its intended exit code.
 
+Generate or resume an accepted development dataset with an explicit output root:
+
+```bash
+mvwd generate --config configs/smoke.yaml --scene Rs_int --output-root /path/to/smoke-output
+mvwd generate --config configs/integration.yaml --scene Rs_int --output-root /path/to/integration-output
+```
+
+Generation writes `generation_status.json` while running, appends structured rejects to `rejects.jsonl`, and
+atomically finalizes accepted configurations and episodes. Re-running the same command resumes finalized work.
+Pilot/default profiles are refused unless `--allow-large` is supplied; this workflow stops after integration.
+
 The full profile is never started automatically. See [the environment guide](docs/environment_setup.md),
 [dataset v1 specification](docs/dataset_v1_spec.md), [pipeline gates](docs/pipeline.md), and the
 

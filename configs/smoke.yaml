@@ -4,7 +4,10 @@ dataset:
   scene_limit: 1
   accepted_configurations_per_scene: 1
   accepted_episodes_per_configuration: 1
-  frames: 10
+  frames: 21
+trajectory:
+  path_length_min_m: 0.5
+  path_length_max_m: 1.0
 intervention:
   type_weights:
     rigid_relocation: 1.0
@@ -12,4 +15,7 @@ intervention:
     state_change: 0.0
 robot:
   use_final_robot: false
+generation:
+  native_relation_high_level_attempts: 2
+  native_relation_low_level_attempts: 3
 

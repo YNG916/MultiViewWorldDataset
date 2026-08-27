@@ -36,6 +36,7 @@ bev:
   environment_meters_per_pixel: 0.02
   world_meters_per_pixel: 0.04
   bounds_margin_m: 0.5
+  robot_mask_projection_tolerance_m: 0.75
   modalities: [rgb, depth_linear, height, normal, semantic, instance, instance_id, occupancy]
   world_modalities: [rgb, depth_linear, height, semantic, instance, instance_id, occupancy]
 
@@ -77,6 +78,9 @@ intervention:
 
 generation:
   settle_steps: 30
+  native_relation_high_level_attempts: 10
+  native_relation_low_level_attempts: 10
+  snapshot_restore_tolerance: 1.0e-5
   maximum_configuration_attempts: 1000
   exact_hash_decimals: 8
   near_duplicate_translation_m: 0.03

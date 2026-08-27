@@ -142,7 +142,14 @@ def run_simulator_probe(
             scenes, config["dataset"]["splits"], int(config["dataset"]["scene_family_split_seed"])
         )
         stage = "load_scene"
-        adapter.load_scene(selected_scene, robot_count=3, development_robot=config["robot"]["development_model"])
+        robot_model = (
+            config["robot"]["final_model"]
+            if config["robot"]["use_final_robot"]
+            else config["robot"]["development_model"]
+        )
+        adapter.load_scene(
+            selected_scene, robot_count=3, development_robot=robot_model
+        )
         load_seconds = time.perf_counter() - started
         stage = "place_and_settle_robots"
         sampled_heights = adapter.place_development_robots(int(config["seed"]))

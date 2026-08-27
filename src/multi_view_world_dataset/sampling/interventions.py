@@ -60,7 +60,7 @@ def eligible_intervention_targets(
             and len(obj.joint_limits) == len(obj.joint_values)
         )
     elif intervention_type is InterventionType.STATE_CHANGE:
-        candidates = (obj for obj in catalog if obj.available_states)
+        candidates = (obj for obj in catalog if obj.semantic_states)
     else:
         candidates = iter(())
     return tuple(sorted(candidates, key=lambda obj: obj.instance_id))
@@ -113,9 +113,9 @@ def propose_state_change(
     rng: np.random.Generator,
 ) -> InterventionEvent:
     """Toggle one advertised boolean object state and preserve the exact before/after record."""
-    if not target.available_states:
+    if not target.semantic_states:
         raise SampleRejected("no_meaningful_state_target", {"instance_id": target.instance_id})
-    state_name = sorted(target.available_states)[int(rng.integers(len(target.available_states)))]
+    state_name = sorted(target.semantic_states)[int(rng.integers(len(target.semantic_states)))]
     value_before = bool(target.semantic_states.get(state_name, False))
     value_after = not value_before
     semantic_states = dict(target.semantic_states)

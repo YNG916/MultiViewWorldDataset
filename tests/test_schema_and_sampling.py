@@ -2,6 +2,8 @@ from dataclasses import replace
 
 import numpy as np
 import pytest
+from multi_view_world_dataset.adapters.omnigibson import OmniGibsonAdapter
+from multi_view_world_dataset.errors import SampleRejected
 
 from multi_view_world_dataset.sampling.configurations import exact_state_hash, near_duplicate_configuration
 from multi_view_world_dataset.sampling.interventions import (
@@ -10,7 +12,12 @@ from multi_view_world_dataset.sampling.interventions import (
     propose_state_change,
 )
 from multi_view_world_dataset.sampling.splits import assign_scene_family_splits, infer_scene_family
-from multi_view_world_dataset.sampling.trajectories import generate_smooth_trajectory, trajectories_equal
+from multi_view_world_dataset.sampling.trajectories import (
+    generate_smooth_trajectory,
+    sample_smooth_trajectory_set,
+    trajectories_equal,
+    trajectory_kinematic_metrics,
+)
 from multi_view_world_dataset.schema.records import (
     ApplicationMode,
     InterventionEvent,
@@ -67,6 +74,64 @@ def test_smooth_trajectory_and_exact_pairing():
     assert not trajectories_equal(trajectory, changed)
 
 
+def test_sample_three_robot_trajectory_set_is_traversable_smooth_and_separated():
+    starts = {}
+    mounts = {}
+    for index, y in enumerate((0.0, 1.0, 2.0)):
+        robot_id = f"robot_{index:02d}"
+        starts[robot_id] = np.array(
+            [[1, 0, 0, 0], [0, 1, 0, y], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=float
+        )
+        mounts[robot_id] = np.eye(4)
+    trajectories = sample_smooth_trajectory_set(
+        starts,
+        mounts,
+        np.asarray([[1.0, 0.0], [1.0, 1.0], [1.0, 2.0]]),
+        0.0,
+        np.random.default_rng(9),
+        frames=60,
+        fps=10,
+        path_length_range_m=(0.99, 1.01),
+        minimum_pairwise_distance_m=0.6,
+        maximum_linear_speed_mps=0.8,
+        maximum_angular_speed_radps=1.2,
+        maximum_acceleration_mps2=1.5,
+        is_path_traversable=lambda xy: bool(np.all((xy[:, 0] >= 0) & (xy[:, 0] <= 1))),
+        maximum_attempts=5,
+    )
+    assert len(trajectories) == 3
+    assert all(trajectory_kinematic_metrics(item)["path_length_m"] == pytest.approx(1.0) for item in trajectories)
+    positions = np.stack([item.base_to_world[:, :2, 3] for item in trajectories])
+    assert np.min(np.linalg.norm(positions[0] - positions[1], axis=1)) >= 0.6
+
+
+def test_short_trajectory_rejects_infeasible_distance_before_path_checks():
+    starts = {"robot_00": np.eye(4)}
+    mounts = {"robot_00": np.eye(4)}
+
+    def unexpected_path_check(_: np.ndarray) -> bool:
+        raise AssertionError("infeasible endpoints must be filtered first")
+
+    with pytest.raises(SampleRejected) as error:
+        sample_smooth_trajectory_set(
+            starts,
+            mounts,
+            np.asarray([[3.0, 0.0]]),
+            0.0,
+            np.random.default_rng(1),
+            frames=21,
+            fps=10,
+            path_length_range_m=(1.0, 3.0),
+            minimum_pairwise_distance_m=0.6,
+            maximum_linear_speed_mps=0.8,
+            maximum_angular_speed_radps=1.2,
+            maximum_acceleration_mps2=1.5,
+            is_path_traversable=unexpected_path_check,
+            maximum_attempts=200,
+        )
+    assert error.value.reason == "trajectory_constraints_infeasible"
+
+
 def test_future_timed_event_schema_is_compatible():
     target = make_object()
     event = InterventionEvent(
@@ -111,3 +176,16 @@ def test_state_hash_accepts_unbounded_joint_limits():
         joint_values=(0.0,),
     )
     assert len(exact_state_hash((target,))) == 64
+
+
+def test_snapshot_restore_metrics_allow_float32_pose_noise_but_not_state_drift():
+    before = make_object()
+    transform = before.object_to_world.copy()
+    transform[0, 3] += 2.4e-7
+    restored = replace(before, object_to_world=transform)
+    error, discrete_equal = OmniGibsonAdapter._catalog_restore_metrics(
+        (before,),
+        (restored,),
+    )
+    assert error == pytest.approx(2.4e-7)
+    assert discrete_equal
