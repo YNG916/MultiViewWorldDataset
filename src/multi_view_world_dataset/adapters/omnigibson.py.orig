@@ -1392,14 +1392,19 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 sensor.set_position_orientation(position=camera_position, orientation=camera_orientation)
             self._development_camera_mounts[robot.name] = camera_to_base.copy()
         settle_steps = min(30, int(self.config["generation"]["settle_steps"]))
-        for _ in range(settle_steps):
+        rendering_settle_steps = min(2, settle_steps)
+        for step_index in range(settle_steps):
             for robot in robots:
                 robot.keep_still()
-            self._og.sim.step_physics()
-        for _ in range(4):
-            self._og.sim.render()
+            if step_index >= settle_steps - rendering_settle_steps:
+                # Full steps run OG's non-physics callbacks and propagate pose
+                # edits to render products without a burst of bare renders.
+                self._og.sim.step()
+            else:
+                self._og.sim.step_physics()
         self._runtime_findings["development_camera_heights_m"] = sampled_heights
         self._runtime_findings["development_camera_settle_steps"] = settle_steps
+        self._runtime_findings["development_camera_rendering_settle_steps"] = rendering_settle_steps
         self._runtime_findings["placement_attempts"] = attempts
         self._runtime_findings["placement_attempts_by_radius_m"] = attempts_by_radius
         self._runtime_findings["placement_pairwise_minimum_m"] = minimum_distance
@@ -1943,6 +1948,8 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         minimum_depth_valid_ratio = 1.0
         world_bev_flip_axes: tuple[int, ...] | None = None
         world_bev_orientation_scores: dict[str, float] = {}
+        world_bev_orientation_max_errors: dict[str, float] = {}
+        world_bev_orientation_worst_samples: dict[str, dict[str, Any]] = {}
         robot_mask_diagnostics: list[dict[str, Any]] = []
         robot_instance_ids: dict[str, set[int]] = {
             robot_id: set() for robot_id in robots
@@ -2098,29 +2105,46 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                             )
                             if not np.any(candidate_mask):
                                 score_pixels += missing_penalty
-                                continue
-                            candidate_rows, candidate_columns = np.nonzero(
-                                candidate_mask
-                            )
-                            score_pixels += float(
-                                np.hypot(
+                                candidate_error_m = (
+                                    missing_penalty * calibration.meters_per_pixel
+                                )
+                                mask_bounds_uv = None
+                            else:
+                                candidate_rows, candidate_columns = np.nonzero(
+                                    candidate_mask
+                                )
+                                candidate_distances = np.hypot(
                                     candidate_columns - float(planned_uv[0]),
                                     candidate_rows - float(planned_uv[1]),
-                                ).min()
-                            )
+                                )
+                                candidate_error_m = float(
+                                    candidate_distances.min()
+                                    * calibration.meters_per_pixel
+                                )
+                                score_pixels += float(candidate_distances.min())
+                                mask_bounds_uv = [
+                                    int(candidate_columns.min()),
+                                    int(candidate_rows.min()),
+                                    int(candidate_columns.max()),
+                                    int(candidate_rows.max()),
+                                ]
+                            if candidate_error_m > world_bev_orientation_max_errors.get(
+                                orientation_name, -1.0
+                            ):
+                                world_bev_orientation_max_errors[orientation_name] = (
+                                    candidate_error_m
+                                )
+                                world_bev_orientation_worst_samples[orientation_name] = {
+                                    "frame_index": frame_index,
+                                    "robot_id": robot_id,
+                                    "planned_uv": np.asarray(planned_uv).tolist(),
+                                    "mask_bounds_uv": mask_bounds_uv,
+                                    "error_m": candidate_error_m,
+                                }
                         world_bev_orientation_scores[orientation_name] = (
-                            score_pixels * calibration.meters_per_pixel
+                            world_bev_orientation_scores.get(orientation_name, 0.0)
+                            + score_pixels * calibration.meters_per_pixel
                         )
-                    best_orientation = min(
-                        world_bev_orientation_scores,
-                        key=world_bev_orientation_scores.get,
-                    )
-                    world_bev_flip_axes = flip_candidates[best_orientation]
-                    self._runtime_findings["world_bev_axis_calibration"] = {
-                        "orientation": best_orientation,
-                        "flip_axes": list(world_bev_flip_axes),
-                        "scores_m": world_bev_orientation_scores,
-                    }
                 if world_bev_flip_axes:
                     frame_arrays = {
                         name: np.flip(values, axis=world_bev_flip_axes).copy()
@@ -2131,6 +2155,21 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                     ).copy()
                 for name in world_modalities:
                     world_frames[name].append(frame_arrays[name])
+                robot_mask_diagnostics.append(
+                    {
+                        "instance_labels": instance_labels.copy(),
+                        "raw_ids": {
+                            robot_id: tuple(sorted(ids))
+                            for robot_id, ids in frame_robot_instance_ids.items()
+                        },
+                        "planned_uv": {
+                            robot_id: calibration.world_to_pixel(
+                                by_id[robot_id].base_to_world[frame_index, :3, 3]
+                            )
+                            for robot_id in robots
+                        },
+                    }
+                )
                 for robot_id in robots:
                     planned_uv = calibration.world_to_pixel(
                         by_id[robot_id].base_to_world[frame_index, :3, 3]
@@ -2199,6 +2238,65 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                         & (depth <= float(self.config["camera"]["far_m"]))
                     )
                     minimum_depth_valid_ratio = min(minimum_depth_valid_ratio, float(valid.mean()))
+            flip_candidates = {
+                "identity": (),
+                "horizontal": (1,),
+                "vertical": (0,),
+                "rotate_180": (0, 1),
+            }
+            best_orientation = min(
+                world_bev_orientation_scores,
+                key=world_bev_orientation_scores.get,
+            )
+            world_bev_flip_axes = flip_candidates[best_orientation]
+            if world_bev_flip_axes:
+                for name in world_modalities:
+                    world_frames[name] = [
+                        np.flip(values, axis=world_bev_flip_axes).copy()
+                        for values in world_frames[name]
+                    ]
+            minimum_robot_pixels = float("inf")
+            maximum_robot_mask_error = 0.0
+            for diagnostic in robot_mask_diagnostics:
+                instance_labels = diagnostic["instance_labels"]
+                if world_bev_flip_axes:
+                    instance_labels = np.flip(
+                        instance_labels, axis=world_bev_flip_axes
+                    )
+                for robot_id in robots:
+                    planned_uv = diagnostic["planned_uv"][robot_id]
+                    raw_ids = set(diagnostic["raw_ids"][robot_id])
+                    if not raw_ids:
+                        column = int(np.rint(planned_uv[0]))
+                        row = int(np.rint(planned_uv[1]))
+                        if (
+                            0 <= row < instance_labels.shape[0]
+                            and 0 <= column < instance_labels.shape[1]
+                        ):
+                            center_id = int(instance_labels[row, column])
+                            if center_id:
+                                raw_ids.add(center_id)
+                    mask = np.isin(instance_labels, tuple(raw_ids))
+                    pixels = int(mask.sum())
+                    minimum_robot_pixels = min(minimum_robot_pixels, pixels)
+                    if pixels:
+                        rows, columns = np.nonzero(mask)
+                        nearest_mask_distance = float(
+                            np.hypot(
+                                columns - float(planned_uv[0]),
+                                rows - float(planned_uv[1]),
+                            ).min()
+                            * calibration.meters_per_pixel
+                        )
+                        maximum_robot_mask_error = max(
+                            maximum_robot_mask_error, nearest_mask_distance
+                        )
+            self._runtime_findings["world_bev_axis_calibration"] = {
+                "orientation": best_orientation,
+                "flip_axes": list(world_bev_flip_axes),
+                "scores_m": world_bev_orientation_scores,
+                "frame_count": len(robot_mask_diagnostics),
+            }
             position_tolerance = float(self.config["trajectory"]["validation_position_tolerance_m"])
             rotation_tolerance = float(self.config["trajectory"]["validation_rotation_tolerance_rad"])
             mask_tolerance = float(self.config["bev"]["robot_mask_projection_tolerance_m"])
