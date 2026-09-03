@@ -48,6 +48,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         self._env: Any = None
         self._scene_id: str | None = None
         self._using_final_robot = False
+        self._development_bev_sensor: Any = None
         self._final_robot_bev_added_modalities: tuple[str, ...] = ()
         self._started = False
         self._runtime_findings: dict[str, Any] = {}
@@ -159,6 +160,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         self._require_started()
         if self._env is not None:
             self._og.clear()
+        self._development_bev_sensor = None
         self._development_camera_mounts.clear()
         self._relation_cache = None
         if scene_id not in self.discover_scenes():
@@ -321,6 +323,21 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 xform_prim_module.XFormPrim.get_attribute = original_xform_get_attribute
         self._scene_id = scene_id
         self._og.sim.step()
+        if not self._using_final_robot:
+            # Keep the visible semantic instance set stable for the lifetime of
+            # the persistent BEV graph. Toggling ceilings between paired
+            # rollouts invalidates SyntheticData's instance-mapping graph.
+            ceilings = [
+                obj
+                for obj in self._require_scene().objects
+                if str(getattr(obj, "category", "")) in {"ceilings", "roof"}
+            ]
+            for ceiling in ceilings:
+                ceiling.visible = False
+            self._runtime_findings["development_hidden_ceilings"] = sorted(
+                ceiling.name for ceiling in ceilings
+            )
+            self._initialize_development_bev_sensor()
         if self._using_final_robot:
             mast_qa = {}
             for robot in self._env.robots:
@@ -1108,16 +1125,198 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
     def load_snapshot(self, snapshot: np.ndarray) -> None:
         self._require_scene()
         state = self._th.as_tensor(snapshot, dtype=self._th.float32, device=self._og.sim.device)
-        self._og.sim.load_state(state, serialized=True)
+        simulator_state, consumed = self._og.sim.deserialize(state)
+        if consumed != len(state):
+            raise SimulatorUnavailableError(
+                "OmniGibson snapshot deserialization consumed "
+                f"{consumed} values out of {len(state)}"
+            )
+        # Simulator.load_state() always reapplies the scene-root transform,
+        # even though MVWD never moves it. That USD transform edit invalidates
+        # persistent SyntheticData render products and can segfault either in
+        # set_world_pose() or on the following render. Restore only registry
+        # entries whose serialized state actually changed; calling load_state
+        # on every unchanged furniture object also invalidates SyntheticData.
+        for index, scene in enumerate(self._og.sim.scenes):
+            scene_state = simulator_state[index]
+            target_position = scene_state.get("pos")
+            target_orientation = scene_state.get("ori")
+            if target_position is not None:
+                current_position, current_orientation = scene.get_position_orientation()
+                if not (
+                    self._th.allclose(current_position, target_position, atol=1.0e-6)
+                    and self._th.allclose(current_orientation, target_orientation, atol=1.0e-6)
+                ):
+                    raise SimulatorUnavailableError(
+                        "MVWD snapshots cannot restore a changed scene-root transform "
+                        "while persistent render products are active"
+                    )
+            target_registry_state = scene_state.get("registry", scene_state)
+            registries = (
+                ("object_registry", scene.object_registry),
+                ("system_registry", scene.system_registry),
+            )
+            previous_filters: list[tuple[Any, Any]] = []
+            changed_by_registry: dict[str, list[str]] = {}
+            development_robot_names = {robot.name for robot in self._env.robots}
+            lightweight_robot_restores: set[str] = set()
+            for registry_name, registry in registries:
+                target_subregistry_state = target_registry_state.get(registry_name)
+                if target_subregistry_state is None:
+                    raise SimulatorUnavailableError(
+                        f"OmniGibson snapshot is missing {registry_name}"
+                    )
+                changed_names: set[str] = set()
+                for obj in registry.objects:
+                    target_object_state = target_subregistry_state.get(obj.name)
+                    if target_object_state is None:
+                        continue
+                    current_serialized = obj.dump_state(serialized=True)
+                    target_serialized = obj.serialize(target_object_state)
+                    is_development_object = (
+                        registry_name == "object_registry"
+                        and not self._using_final_robot
+                    )
+                    if is_development_object and obj.name not in development_robot_names:
+                        requires_restore = self._development_object_requires_restore(
+                            obj,
+                            current_serialized,
+                            target_serialized,
+                            target_object_state,
+                        )
+                    else:
+                        requires_restore = (
+                            current_serialized.shape != target_serialized.shape
+                            or not self._th.allclose(
+                                current_serialized,
+                                target_serialized,
+                                rtol=0.0,
+                                atol=1.0e-7,
+                                equal_nan=True,
+                            )
+                        )
+                    if requires_restore:
+                        if (
+                            registry_name == "object_registry"
+                            and not self._using_final_robot
+                            and obj.name in development_robot_names
+                        ):
+                            self._restore_development_robot_snapshot(
+                                obj,
+                                target_object_state,
+                            )
+                            lightweight_robot_restores.add(obj.name)
+                        else:
+                            changed_names.add(obj.name)
+                previous_filter = registry._load_filter
+                previous_filters.append((registry, previous_filter))
+                registry.set_load_filter(
+                    lambda obj, allowed=changed_names, prior=previous_filter: (
+                        prior(obj) and obj.name in allowed
+                    )
+                )
+                changed_by_registry[registry_name] = sorted(changed_names)
+            try:
+                scene.load_state(state=target_registry_state, serialized=False)
+            finally:
+                for registry, previous_filter in previous_filters:
+                    registry.set_load_filter(previous_filter)
+            self._runtime_findings["snapshot_changed_registry_entries"] = (
+                changed_by_registry
+            )
+            self._runtime_findings["snapshot_lightweight_robot_restores"] = sorted(
+                lightweight_robot_restores
+            )
         if self._using_final_robot:
-            # A serialized restore rebuilds PhysX tensor views, but it does not
-            # replace robot camera prims or their render products. Removing and
-            # re-adding annotators here leaves stale SyntheticData nodes and can
-            # segfault on the next render. Keep stable camera graphs attached.
             self._og.sim.update_handles()
             self._runtime_findings["final_robot_snapshot_sensor_lifecycle"] = (
-                "annotators_retained"
+                "scene_root_retained+changed_registry_entries_restored+handles_refreshed+annotators_retained"
             )
+        else:
+            self._runtime_findings["development_snapshot_sensor_lifecycle"] = (
+                "scene_root_retained+lightweight_robot_restore+changed_registry_entries_restored+graph_retained"
+            )
+
+    def _restore_development_robot_snapshot(self, robot: Any, state: dict[str, Any]) -> None:
+        """Restore physics state without reloading robot controllers or sensor graphs."""
+        root_state = state["root_link"]
+        robot.set_position_orientation(
+            position=root_state["pos"],
+            orientation=root_state["ori"],
+        )
+        robot.set_linear_velocity(root_state["lin_vel"])
+        robot.set_angular_velocity(root_state["ang_vel"])
+        if robot.n_joints > 0:
+            robot.set_joint_positions(state["joint_pos"], drive=False)
+            robot.set_joint_velocities(state["joint_vel"])
+
+    def _development_object_requires_restore(
+        self,
+        obj: Any,
+        current: Any,
+        target: Any,
+        target_state: dict[str, Any],
+    ) -> bool:
+        """Compare only object state represented in MVWD's public schema."""
+        joint_count = int(obj.n_joints)
+        root_state_size = int(
+            obj.root_link.serialize(target_state["root_link"]).numel()
+        )
+        joint_position_start = 1 + root_state_size
+        entity_state_size = joint_position_start + 2 * joint_count
+        if current.shape != target.shape or current.numel() < entity_state_size:
+            return True
+        if not self._th.allclose(
+            current[1:4], target[1:4], rtol=0.0, atol=1.0e-6
+        ):
+            return True
+        orientation_delta = self._th.minimum(
+            self._th.max(self._th.abs(current[4:8] - target[4:8])),
+            self._th.max(self._th.abs(current[4:8] + target[4:8])),
+        )
+        if bool(orientation_delta > 1.0e-6):
+            return True
+        if joint_count > 0 and not self._th.allclose(
+            current[joint_position_start : joint_position_start + joint_count],
+            target[joint_position_start : joint_position_start + joint_count],
+            rtol=0.0,
+            atol=1.0e-6,
+        ):
+            return True
+        meaningful_boolean_states = {
+            "Open",
+            "ToggledOn",
+            "Cooked",
+            "Burnt",
+            "Frozen",
+            "Heated",
+            "OnFire",
+        }
+        target_non_kinematic = target_state.get("non_kin", {})
+        for state_type, state_instance in getattr(obj, "states", {}).items():
+            state_name = state_type.__name__
+            if (
+                state_name not in meaningful_boolean_states
+                or not state_instance.stateful
+                or state_name not in target_non_kinematic
+            ):
+                continue
+            current_state = state_instance.dump_state(serialized=True)
+            target_state_value = state_instance.serialize(
+                target_non_kinematic[state_name]
+            )
+            if (
+                current_state.shape != target_state_value.shape
+                or not self._th.allclose(
+                    current_state,
+                    target_state_value,
+                    rtol=0.0,
+                    atol=1.0e-7,
+                    equal_nan=True,
+                )
+            ):
+                return True
+        return False
 
     def _restore_final_robot_mast_mount(self, robot: Any) -> None:
         """Restore the passive mast after a rollout physics step."""
@@ -1700,6 +1899,49 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         if simulator.is_playing():
             simulator.update_handles()
 
+    def _initialize_development_bev_sensor(self) -> None:
+        """Create the development BEV render product before any physics snapshot."""
+        if self._development_bev_sensor is not None:
+            return
+        calibration = self.calibrated_floor_bounds(
+            0,
+            float(self.config["bev"]["environment_meters_per_pixel"]),
+            float(self.config["bev"]["bounds_margin_m"]),
+        )
+        sensor_names = self._configured_bev_sensor_names()
+        camera = self._vision_sensor_type(
+            relative_prim_path="/mvwd_persistent_development_bev_camera",
+            name="mvwd_persistent_development_bev_camera",
+            modalities=sensor_names,
+            image_width=calibration.width,
+            image_height=calibration.height,
+            clipping_range=(0.01, 100.0),
+        )
+        camera.load(None)
+        self._configure_bev_camera(camera, calibration)
+        catalog = self.object_catalog()
+        top_z = max(
+            (obj.bbox_max_world[2] for obj in catalog),
+            default=calibration.floor_z + 3.0,
+        )
+        xmin, ymin, xmax, ymax = calibration.world_bounds
+        camera.set_position_orientation(
+            position=self._th.tensor(
+                [(xmin + xmax) / 2, (ymin + ymax) / 2, top_z + 2.0]
+            ),
+            orientation=self._th.tensor([0.0, 0.0, 0.0, 1.0]),
+        )
+        camera.initialize()
+        self._refresh_physics_handles_after_sensor_edit()
+        for _ in range(4):
+            self._og.sim.render()
+        self._development_bev_sensor = camera
+        self._runtime_findings["development_bev_sensor"] = {
+            "backend": "persistent_pre_snapshot_vision_sensor+numpy_nearest_resample",
+            "resolution": [calibration.width, calibration.height],
+            "modalities": sensor_names,
+        }
+
     def _prepare_bev_sensor(
         self,
         *,
@@ -1716,6 +1958,8 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         is restored: SyntheticData can retain an invalid on-demand graph and
         segfault on the next render. The simulator viewer camera predates all
         scene snapshots, so reuse its render product for final-robot BEV data.
+        Development runs similarly reuse one sensor initialized before the
+        first snapshot without changing its graph topology.
         """
         if self._using_final_robot:
             camera = self._og.sim.viewer_camera
@@ -1751,6 +1995,16 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 int(camera.image_height),
             ]
             self._runtime_findings["final_robot_bev_target_resolution"] = [width, height]
+            return camera, False, True
+        if self._development_bev_sensor is not None:
+            camera = self._development_bev_sensor
+            missing_modalities = sorted(set(sensor_names) - set(camera.modalities))
+            if missing_modalities:
+                raise SimulatorUnavailableError(
+                    "Persistent development BEV sensor is missing modalities: "
+                    f"{missing_modalities}"
+                )
+            self._runtime_findings["development_bev_target_resolution"] = [width, height]
             return camera, False, True
         camera = self._vision_sensor_type(
             relative_prim_path=f"/mvwd_{sensor_role}_bev_camera_{floor_index}",
@@ -1799,13 +2053,36 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             )
         sensor_role = "world" if include_robots else "environment"
         hidden: list[tuple[Any, bool]] = []
+        displaced_robots: list[tuple[Any, Any, Any]] = []
         camera: Any = None
         created_camera = False
         simulator_owned_camera = False
         try:
             if not include_robots:
-                hidden.extend(self._set_visible(list(self._env.robots), False))
-            ceilings = [obj for obj in scene.objects if str(getattr(obj, "category", "")) in {"ceilings", "roof"}]
+                xmin, ymin, xmax, ymax = calibration.world_bounds
+                span = max(xmax - xmin, ymax - ymin)
+                for robot_index, robot in enumerate(self._env.robots):
+                    position, orientation = robot.get_position_orientation()
+                    displaced_robots.append(
+                        (robot, position.detach().clone(), orientation.detach().clone())
+                    )
+                    parking_offset = span + 10.0 + 5.0 * robot_index
+                    robot.set_position_orientation(
+                        position=self._th.tensor(
+                            [xmax + parking_offset, ymax + parking_offset, float(position[2])],
+                            dtype=position.dtype,
+                            device=position.device,
+                        ),
+                        orientation=orientation,
+                    )
+                self._runtime_findings["environment_bev_robot_suppression"] = (
+                    "out_of_frustum_pose+restored"
+                )
+            ceilings = [] if not self._using_final_robot else [
+                obj
+                for obj in scene.objects
+                if str(getattr(obj, "category", "")) in {"ceilings", "roof"}
+            ]
             hidden.extend(self._set_visible(ceilings, False))
             camera, created_camera, simulator_owned_camera = self._prepare_bev_sensor(
                 sensor_role=sensor_role,
@@ -1833,8 +2110,13 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             if created_camera:
                 camera.initialize()
                 self._refresh_physics_handles_after_sensor_edit()
-            for _ in range(4):
+            # Flush enough frames for out-of-frustum robot poses to reach every
+            # annotator. The visible instance set was stabilized at scene load,
+            # so these ticks no longer invalidate instance mapping.
+            render_ticks = 4
+            for _ in range(render_ticks):
                 self._og.sim.render()
+            self._runtime_findings["bev_render_ticks_per_capture"] = render_ticks
             observation, info = camera.get_obs()
             arrays: dict[str, np.ndarray] = {}
             for public_name in sensor_modalities:
@@ -1884,6 +2166,11 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 },
             )
         finally:
+            for robot, position, orientation in reversed(displaced_robots):
+                robot.set_position_orientation(
+                    position=position,
+                    orientation=orientation,
+                )
             for obj, was_visible in reversed(hidden):
                 obj.visible = was_visible
             if camera is not None and simulator_owned_camera:
@@ -1928,8 +2215,10 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             | ({"depth_linear"} if {"height", "occupancy"} & set(world_modalities) else set())
         )
         scene = self._require_scene()
-        ceilings = [
-            obj for obj in scene.objects if str(getattr(obj, "category", "")) in {"ceilings", "roof"}
+        ceilings = [] if not self._using_final_robot else [
+            obj
+            for obj in scene.objects
+            if str(getattr(obj, "category", "")) in {"ceilings", "roof"}
         ]
         floors = [obj for obj in scene.objects if str(getattr(obj, "category", "")) == "floors"]
         self._preflight_trajectory_contacts(by_id, robots, floors, frames)
@@ -1992,7 +2281,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 robot.set_position_orientation(position=position, orientation=orientation)
                 self._restore_final_robot_mast_mount(robot)
                 robot.keep_still()
-            self._og.sim.step()
+            self._og.sim.step_physics()
             for robot_id, robot in robots.items():
                 planned = by_id[robot_id].base_to_world[0]
                 position, orientation = self._transform_utils.mat2pose(
