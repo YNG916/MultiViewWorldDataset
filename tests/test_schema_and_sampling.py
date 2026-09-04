@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from multi_view_world_dataset.adapters.omnigibson import OmniGibsonAdapter
+from multi_view_world_dataset.errors import SampleRejected
 from multi_view_world_dataset.sampling.configurations import exact_state_hash, near_duplicate_configuration
 from multi_view_world_dataset.sampling.interventions import (
     eligible_intervention_targets,
@@ -75,7 +76,7 @@ def test_final_robot_capture_uses_only_raw_aov_for_segmentation():
     }.issubset(adapter._configured_bev_sensor_names())
 
 
-def _sample_parallel_trajectories(seed):
+def _sample_parallel_trajectories(seed, minimum_waypoint_trajectories=0):
     starts = {}
     mounts = {}
     candidates = []
@@ -103,6 +104,7 @@ def _sample_parallel_trajectories(seed):
         plan_segment=_straight_planner,
         is_path_traversable=validator,
         path_family_weights={"direct": 1.0, "one_waypoint": 0.0, "two_waypoint": 0.0},
+        minimum_waypoint_trajectories=minimum_waypoint_trajectories,
         initial_heading_tolerance_rad=np.deg2rad(10.0),
         line_validation_spacing_m=0.02,
         smoothing_validation_spacing_m=0.02,
@@ -111,6 +113,11 @@ def _sample_parallel_trajectories(seed):
         maximum_attempts=10,
         joint_pool_rounds=2,
     )
+
+
+def test_joint_set_enforces_configured_waypoint_minimum():
+    with pytest.raises(SampleRejected, match="trajectory_joint_separation_failed"):
+        _sample_parallel_trajectories(17, minimum_waypoint_trajectories=1)
 
 
 def test_state_hash_is_order_independent_and_near_duplicate():

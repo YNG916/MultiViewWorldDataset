@@ -1713,7 +1713,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             common_view_focus_xy.tolist()
         )
         self._runtime_findings["placement_heading_mode"] = (
-            "common_view_focus_with_independent_robot_eroded_los_corridors"
+            "distant_common_focus_with_independent_robot_eroded_los_corridors"
         )
         self._runtime_findings["placement_cluster_center_xy"] = cluster_center_xy.tolist()
         self._runtime_findings["placement_focus_xy_by_robot"] = {
@@ -2058,8 +2058,11 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             if len(sensors) != 1:
                 raise SimulatorUnavailableError(f"Expected one VisionSensor on {robot.name}")
             sensor = sensors[0]
-            usd_camera_to_world = self._pose_matrix(sensor)
+            requested_usd_camera_to_world = self._pose_matrix(sensor)
+            usd_camera_to_world = requested_usd_camera_to_world
             observation_sensor = sensor
+            capture_pose_translation_error = 0.0
+            capture_pose_rotation_error = 0.0
             if self._using_final_robot:
                 observation_sensor = self._final_robot_capture_sensor
                 if observation_sensor is None:
@@ -2075,6 +2078,19 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                     self._og.sim.render()
             if self._using_final_robot:
                 observation, info = self._get_final_robot_capture_observation(
+                usd_camera_to_world = self._pose_matrix(observation_sensor)
+                capture_pose_translation_error = float(
+                    np.linalg.norm(
+                        usd_camera_to_world[:3, 3]
+                        - requested_usd_camera_to_world[:3, 3]
+                    )
+                )
+                capture_relative_rotation = (
+                    requested_usd_camera_to_world[:3, :3].T
+                    @ usd_camera_to_world[:3, :3]
+                )
+                capture_pose_rotation_error = float(
+                    np.arccos(np.clip((np.trace(capture_relative_rotation) - 1.0) / 2.0, -1.0, 1.0))
                     observation_sensor
                 )
             else:

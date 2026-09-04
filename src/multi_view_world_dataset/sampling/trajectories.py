@@ -506,6 +506,7 @@ def sample_geodesic_trajectory_set(
     plan_segment: PlanSegment,
     is_path_traversable: PathValidator,
     path_family_weights: Mapping[str, float],
+    minimum_waypoint_trajectories: int,
     initial_heading_tolerance_rad: float,
     line_validation_spacing_m: float,
     smoothing_validation_spacing_m: float,
@@ -526,8 +527,10 @@ def sample_geodesic_trajectory_set(
         or candidate_pool_size < 1
         or maximum_attempts < 1
         or joint_pool_rounds < 1
+        or minimum_waypoint_trajectories < 0
+        or minimum_waypoint_trajectories > len(robot_ids)
     ):
-        raise ValueError("trajectory sampling counts must be positive")
+        raise ValueError("invalid trajectory sampling count or waypoint minimum")
 
     round_diagnostics: list[dict[str, object]] = []
     for round_index in range(joint_pool_rounds):
@@ -571,26 +574,65 @@ def sample_geodesic_trajectory_set(
         combinations = list(
             product(*(range(len(pools[robot_id])) for robot_id in robot_ids))
         )
+        best: tuple[tuple[float, float, float], tuple[Trajectory, ...]] | None = None
         for combination_index in rng.permutation(len(combinations)):
             selection = combinations[int(combination_index)]
             trajectories = tuple(
                 pools[robot_id][selection[index]]
                 for index, robot_id in enumerate(robot_ids)
             )
+            waypoint_count = sum(
+                trajectory.path_family != "direct"
+                for trajectory in trajectories
+            )
+            if waypoint_count < minimum_waypoint_trajectories:
+                continue
             positions = np.stack(
                 [trajectory.base_to_world[:, :2, 3] for trajectory in trajectories]
             )
-            if all(
-                np.all(
+            pairwise_distances = np.stack(
+                [
                     np.linalg.norm(positions[left] - positions[right], axis=1)
-                    >= minimum_pairwise_distance_m
+                    for left in range(len(trajectories))
+                    for right in range(left + 1, len(trajectories))
+                ]
+            )
+            if np.any(pairwise_distances < minimum_pairwise_distance_m):
+                continue
+            yaws = np.stack(
+                [
+                    np.arctan2(
+                        trajectory.base_to_world[:, 1, 0],
+                        trajectory.base_to_world[:, 0, 0],
+                    )
+                    for trajectory in trajectories
+                ]
+            )
+            maximum_heading_spread = max(
+                float(
+                    np.max(
+                        np.abs(_wrap_angles(yaws[left] - yaws[right]))
+                    )
                 )
                 for left in range(len(trajectories))
                 for right in range(left + 1, len(trajectories))
-            ):
-                for trajectory in trajectories:
-                    trajectory.metadata["joint_pool_round"] = round_index
-                return trajectories
+            )
+            score = (
+                float(np.max(pairwise_distances)),
+                maximum_heading_spread,
+                float(np.mean(pairwise_distances)),
+            )
+            if best is None or score < best[0]:
+                best = score, trajectories
+        if best is not None:
+            score, trajectories = best
+            for trajectory in trajectories:
+                trajectory.metadata["joint_pool_round"] = round_index
+                trajectory.metadata["joint_compactness_score"] = list(score)
+                trajectory.metadata["joint_waypoint_trajectory_count"] = sum(
+                    item.path_family != "direct" for item in trajectories
+                )
+            return trajectories
         round_diagnostics.append(
             {
                 "round_index": round_index,
@@ -607,5 +649,6 @@ def sample_geodesic_trajectory_set(
             "joint_pool_rounds": joint_pool_rounds,
             "round_diagnostics": round_diagnostics,
             "minimum_pairwise_distance_m": minimum_pairwise_distance_m,
+            "minimum_waypoint_trajectories": minimum_waypoint_trajectories,
         },
     )

@@ -123,6 +123,24 @@ def _initial_overlap(
                 "connected": graph.connected,
                 "near_duplicate_pairs": graph.near_duplicate_pairs,
                 "overlaps": graph.overlaps,
+                "camera_positions": {
+                    robot_id: record["camera_to_world"][:3, 3].tolist()
+                    for robot_id, record in observations.items()
+                },
+                "capture_pose_translation_error_m": {
+                    robot_id: float(record["capture_pose_translation_error_m"])
+                    for robot_id, record in observations.items()
+                },
+                "capture_pose_rotation_error_rad": {
+                    robot_id: float(record["capture_pose_rotation_error_rad"])
+                    for robot_id, record in observations.items()
+                },
+                "depth_valid_ratio": {
+                    robot_id: float(
+                        np.mean(np.isfinite(depth) & (depth > 0))
+                    )
+                    for robot_id, depth in depths.items()
+                },
             },
         )
     return graph, observations

@@ -14,3 +14,13 @@ placement:
   # The successful final-robot camera geometry uses a distant shared focus;
   # 1.5 m over-converges the three 70-degree-FOV cameras in Rs_int.
   common_view_focus_distance_m: 3.0
+  minimum_pairwise_distance_m: 0.6
+  # Begin farther apart than the hard limit so independently sampled curved
+  # paths have room to turn while retaining a connected shared view.
+  trajectory_separation_headroom_m: 0.8
+
+trajectory:
+  # A larger independent pool materially improves feasible 3-way combinations
+  # without coupling the robots to one shared path.
+  candidate_pool_size: 18
+  sampling_maximum_attempts: 400

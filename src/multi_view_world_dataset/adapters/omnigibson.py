@@ -282,7 +282,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             }
             if self._using_final_robot:
                 robot_config["include_sensor_names"] = ["dataset_camera"]
-                robot_config["obs_modalities"] = ["rgb"]
+                robot_config["obs_modalities"] = ["rgb", "depth_linear"]
             robots.append(robot_config)
         environment_config = {
             "scene": {
@@ -1673,11 +1673,10 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 sensor.set_position_orientation(position=camera_position, orientation=camera_orientation)
             self._development_camera_mounts[robot.name] = camera_to_base.copy()
         settle_steps = min(30, int(self.config["generation"]["settle_steps"]))
-        # Development cameras need render ticks after a teleport. Final-robot
-        # capture renders explicitly in robot_observations(); ticking the
-        # InstanceMapping graph here immediately after moving articulated bases
-        # can crash OmniGibson 3.9.2 in native SyntheticData code.
-        rendering_settle_steps = 0 if self._using_final_robot else min(2, settle_steps)
+        # Propagate articulated camera transforms into their stable RGB/depth
+        # render products. Final-robot segmentation uses a separate raw AOV,
+        # so no InstanceMapping graph is ticked here.
+        rendering_settle_steps = min(2, settle_steps)
         for _ in range(settle_steps):
             for robot in robots:
                 robot.keep_still()
@@ -1696,11 +1695,28 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             )
             self._restore_final_robot_mast_mount(robot)
             robot.keep_still()
-        # OmniGibson 3.9.2 can segfault in SyntheticData when a full
-        # physics+render step follows an articulated camera teleport. Keep
-        # physics settling and render-graph propagation as separate operations.
+        # A full step is required for articulation-mounted VisionSensor render
+        # products; bare render ticks can retain a stale camera transform.
         for _ in range(rendering_settle_steps):
-            self._og.sim.render()
+            for robot in robots:
+                robot.keep_still()
+            self._og.sim.step()
+        # The static traversability raster does not move with randomized
+        # furniture. Reject such starts immediately, before camera-overlap and
+        # geodesic candidate generation make the same frame-0 discovery much
+        # more expensively in rollout preflight.
+        floors = [
+            obj
+            for obj in scene.objects
+            if str(getattr(obj, "category", "")) == "floors"
+        ]
+        for robot in robots:
+            external_pairs = self._external_robot_contact_pairs(robot, floors)
+            if external_pairs:
+                raise SampleRejected(
+                    "initial_robot_collision",
+                    {"robot_id": robot.name, "contact_pairs": external_pairs[:50]},
+                )
         self._runtime_findings["development_camera_heights_m"] = sampled_heights
         self._runtime_findings["development_camera_settle_steps"] = settle_steps
         self._runtime_findings["development_camera_rendering_settle_steps"] = rendering_settle_steps
@@ -1842,6 +1858,9 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             plan_segment=plan_segment,
             is_path_traversable=is_path_traversable,
             path_family_weights=trajectory_config["path_family_weights"],
+            minimum_waypoint_trajectories=int(
+                trajectory_config["minimum_waypoint_trajectories"]
+            ),
             initial_heading_tolerance_rad=np.deg2rad(
                 float(trajectory_config["initial_heading_tolerance_deg"])
             ),
@@ -2058,8 +2077,11 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             if len(sensors) != 1:
                 raise SimulatorUnavailableError(f"Expected one VisionSensor on {robot.name}")
             sensor = sensors[0]
-            usd_camera_to_world = self._pose_matrix(sensor)
+            requested_usd_camera_to_world = self._pose_matrix(sensor)
+            usd_camera_to_world = requested_usd_camera_to_world
             observation_sensor = sensor
+            capture_pose_translation_error = 0.0
+            capture_pose_rotation_error = 0.0
             if self._using_final_robot:
                 observation_sensor = self._final_robot_capture_sensor
                 if observation_sensor is None:
@@ -2071,11 +2093,46 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 observation_sensor.set_position_orientation(
                     position=sensor_position, orientation=sensor_orientation
                 )
-                for _ in range(2):
+                capture_settle_render_ticks = 4
+                for _ in range(capture_settle_render_ticks):
                     self._og.sim.render()
+                self._runtime_findings["final_robot_capture_settle_render_ticks"] = (
+                    capture_settle_render_ticks
+                )
             if self._using_final_robot:
                 observation, info = self._get_final_robot_capture_observation(
                     observation_sensor
+                )
+                mounted_observation, mounted_info = sensor.get_obs()
+                for mounted_modality in ("rgb", "depth_linear"):
+                    if mounted_modality not in mounted_observation:
+                        raise SimulatorUnavailableError(
+                            "Final-robot mounted camera is missing modality: "
+                            f"{mounted_modality}"
+                        )
+                    observation[mounted_modality] = mounted_observation[
+                        mounted_modality
+                    ]
+                    info[mounted_modality] = mounted_info.get(mounted_modality, {})
+                usd_camera_to_world = self._pose_matrix(observation_sensor)
+                capture_pose_translation_error = float(
+                    np.linalg.norm(
+                        usd_camera_to_world[:3, 3]
+                        - requested_usd_camera_to_world[:3, 3]
+                    )
+                )
+                capture_relative_rotation = (
+                    requested_usd_camera_to_world[:3, :3].T
+                    @ usd_camera_to_world[:3, :3]
+                )
+                capture_pose_rotation_error = float(
+                    np.arccos(
+                        np.clip(
+                            (np.trace(capture_relative_rotation) - 1.0) / 2.0,
+                            -1.0,
+                            1.0,
+                        )
+                    )
                 )
             else:
                 observation, info = observation_sensor.get_obs()
@@ -2107,6 +2164,8 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 "mount_translation_error_m": translation_error,
                 "mount_rotation_error_rad": rotation_error,
                 "mount_orthonormality_error": mount_orthonormality_error,
+                "capture_pose_translation_error_m": capture_pose_translation_error,
+                "capture_pose_rotation_error_rad": capture_pose_rotation_error,
                 "sensor_prim_path": sensor_prim_path,
                 "sensor_attached_to_robot": sensor_prim_path.startswith(robot_prim_path + "/"),
             }
@@ -2249,15 +2308,35 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             raise SimulatorUnavailableError(
                 "Final-robot fast instance annotator is unavailable"
             )
-        raw = annotator.get_data(device=self._og.sim.device)
-        renderer_ids = raw["data"] if isinstance(raw, dict) else raw
-        if self._og.sim.device == "cpu":
-            renderer_ids = camera._preprocess_cpu_obs(
-                renderer_ids, "seg_instance_id"
+        renderer_ids = None
+        renderer_id_count = 0
+        maximum_read_attempts = 9
+        for read_attempt in range(maximum_read_attempts):
+            raw = annotator.get_data(device=self._og.sim.device)
+            renderer_ids = raw["data"] if isinstance(raw, dict) else raw
+            if self._og.sim.device == "cpu":
+                renderer_ids = camera._preprocess_cpu_obs(
+                    renderer_ids, "seg_instance_id"
+                )
+            else:
+                renderer_ids = camera._preprocess_gpu_obs(
+                    renderer_ids, "seg_instance_id"
+                )
+            renderer_id_count = (
+                int(renderer_ids.numel())
+                if hasattr(renderer_ids, "numel")
+                else int(np.asarray(renderer_ids).size)
             )
-        else:
-            renderer_ids = camera._preprocess_gpu_obs(
-                renderer_ids, "seg_instance_id"
+            if renderer_id_count:
+                self._runtime_findings["final_robot_raw_instance_read_attempts"] = (
+                    read_attempt + 1
+                )
+                break
+            self._og.sim.render()
+        if renderer_ids is None or not renderer_id_count:
+            raise SimulatorUnavailableError(
+                "Final-robot raw instance AOV remained empty after "
+                f"{maximum_read_attempts} render attempts"
             )
         id_to_path, id_to_semantic = self._final_robot_renderer_labels()
         for renderer_id in self._th.unique(renderer_ids).tolist():

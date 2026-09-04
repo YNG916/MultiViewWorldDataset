@@ -96,6 +96,14 @@ def validate_config(config: dict[str, Any]) -> None:
         or abs(sum(float(value) for value in family_weights.values()) - 1.0) > 1.0e-8
     ):
         errors.append("Trajectory path family weights must be non-negative and sum to 1")
+    minimum_waypoint = trajectory.get("minimum_waypoint_trajectories")
+    if (
+        not isinstance(minimum_waypoint, int)
+        or not 0 <= minimum_waypoint <= 3
+    ):
+        errors.append(
+            "Trajectory minimum_waypoint_trajectories must be an integer in [0,3]"
+        )
     for key in (
         "initial_heading_tolerance_deg",
         "line_validation_spacing_m",
