@@ -44,6 +44,8 @@ placement:
   cluster_radius_m: 3.0
   preferred_cluster_radius_m: 0.8
   heading_jitter_deg: 5.0
+  common_view_focus_distance_m: 1.5
+  trajectory_separation_headroom_m: 0.10
   minimum_pairwise_distance_m: 0.6
   maximum_attempts: 200
 
@@ -61,6 +63,24 @@ trajectory:
   maximum_linear_speed_mps: 0.8
   maximum_angular_speed_radps: 1.2
   maximum_acceleration_mps2: 1.5
+  path_family_weights:
+    direct: 0.30
+    one_waypoint: 0.50
+    two_waypoint: 0.20
+  initial_heading_tolerance_deg: 35.0
+  line_validation_spacing_m: 0.025
+  smoothing_validation_spacing_m: 0.025
+  smoothing_strengths: [1.0, 0.5, 0.25]
+  candidate_pool_size: 6
+  joint_pool_rounds: 5
+  sampling_maximum_attempts: 200
+  overlap_preflight:
+    keyframe_count: 7
+    geometry_width: 224
+    geometry_height: 128
+    connected_fraction_min: 0.60
+    maximum_consecutive_isolated_keyframes: 2
+    depth_sample_stride: 4
   validation_position_tolerance_m: 1.0e-5
   validation_rotation_tolerance_rad: 1.0e-5
 

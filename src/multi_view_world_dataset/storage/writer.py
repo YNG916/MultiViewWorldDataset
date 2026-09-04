@@ -40,7 +40,15 @@ class EpisodeTransaction:
         for trajectory in trajectories:
             arrays[f"{trajectory.robot_id}_base_to_world"] = trajectory.base_to_world
             arrays[f"{trajectory.robot_id}_camera_to_world"] = trajectory.camera_to_world
-            metadata[trajectory.robot_id] = {"fps": trajectory.fps, "frames": trajectory.frames}
+            arrays[f"{trajectory.robot_id}_control_waypoints_xy"] = trajectory.control_waypoints_xy
+            arrays[f"{trajectory.robot_id}_planner_path_xy"] = trajectory.planner_path_xy
+            arrays[f"{trajectory.robot_id}_smoothed_path_xy"] = trajectory.smoothed_path_xy
+            metadata[trajectory.robot_id] = {
+                "fps": trajectory.fps,
+                "frames": trajectory.frames,
+                "path_family": trajectory.path_family,
+                **trajectory.metadata,
+            }
         np.savez_compressed(self.staging / "trajectories.npz", **arrays)
         self.write_json("trajectories_meta.json", metadata)
 

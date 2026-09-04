@@ -1,0 +1,11 @@
+extends: default.yaml
+profile: smoke
+
+dataset:
+  scene_limit: 1
+  accepted_configurations_per_scene: 1
+  accepted_episodes_per_configuration: 1
+  frames: 60
+
+robot:
+  use_final_robot: true

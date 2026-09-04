@@ -1,0 +1,16 @@
+extends: default.yaml
+profile: smoke
+
+dataset:
+  scene_limit: 1
+  accepted_configurations_per_scene: 1
+  accepted_episodes_per_configuration: 1
+  frames: 60
+
+robot:
+  use_final_robot: true
+
+placement:
+  # The successful final-robot camera geometry uses a distant shared focus;
+  # 1.5 m over-converges the three 70-degree-FOV cameras in Rs_int.
+  common_view_focus_distance_m: 3.0

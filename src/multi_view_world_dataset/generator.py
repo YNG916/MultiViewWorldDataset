@@ -14,7 +14,7 @@ from multi_view_world_dataset.cameras.transforms import invert_transform
 from multi_view_world_dataset.errors import ConfigurationError, SampleRejected
 from multi_view_world_dataset.pipeline import _bev_geometry_metrics
 from multi_view_world_dataset.qa.checks import check_bev_pair, check_paired_trajectories, require_all
-from multi_view_world_dataset.rendering.inspection import save_rgb, write_html_summary
+from multi_view_world_dataset.rendering.inspection import save_rgb, save_trajectory_inspection, write_html_summary
 from multi_view_world_dataset.sampling.configurations import near_duplicate_configuration
 from multi_view_world_dataset.sampling.splits import assign_scene_family_splits
 from multi_view_world_dataset.schema.records import (
@@ -128,6 +128,101 @@ def _initial_overlap(
     return graph, observations
 
 
+
+def _temporal_overlap_preflight(
+    adapter: OmniGibsonAdapter,
+    config: dict[str, Any],
+    trajectories: tuple[Any, ...],
+) -> dict[str, Any]:
+    """Validate sparse synchronized GT-depth overlap before full rollout capture."""
+    preflight = config["trajectory"]["overlap_preflight"]
+    frame_count = trajectories[0].frames
+    keyframe_indices = np.unique(
+        np.rint(np.linspace(0, frame_count - 1, int(preflight["keyframe_count"]))).astype(int)
+    )
+    width = int(preflight["geometry_width"])
+    height = int(preflight["geometry_height"])
+    camera_config = config["camera"]
+    calibration = PinholeCalibration(
+        width,
+        height,
+        float(camera_config["hfov_deg"]),
+        float(camera_config["near_m"]),
+        float(camera_config["far_m"]),
+    )
+    overlap_config = config["overlap"]
+    robot_ids = tuple(sorted(trajectory.robot_id for trajectory in trajectories))
+    connected_count = 0
+    isolation_runs = {robot_id: 0 for robot_id in robot_ids}
+    maximum_isolation_runs = {robot_id: 0 for robot_id in robot_ids}
+    keyframes: list[dict[str, Any]] = []
+    try:
+        for frame_index in keyframe_indices:
+            adapter.place_robots_at_trajectory_frame(trajectories, int(frame_index))
+            observations = adapter.robot_observations()
+            depths = {}
+            for robot_id, record in observations.items():
+                depth = np.asarray(record["modalities"]["depth_linear"]).squeeze()
+                rows = np.rint(np.linspace(0, depth.shape[0] - 1, height)).astype(np.int64)
+                columns = np.rint(np.linspace(0, depth.shape[1] - 1, width)).astype(np.int64)
+                depths[robot_id] = depth[rows[:, None], columns[None, :]]
+            graph = build_overlap_graph(
+                robot_ids,
+                depths,
+                {robot_id: calibration.pixel_intrinsics for robot_id in robot_ids},
+                {robot_id: observations[robot_id]["camera_to_world"] for robot_id in robot_ids},
+                edge_threshold=float(overlap_config["edge_threshold"]),
+                near_duplicate_threshold=float(overlap_config["near_duplicate_threshold"]),
+                stride=int(preflight["depth_sample_stride"]),
+                tolerance_m=float(overlap_config["reprojection_tolerance_m"]),
+            )
+            connected_count += int(graph.connected)
+            incident = {robot_id: False for robot_id in robot_ids}
+            for left, right in graph.edges:
+                incident[left] = True
+                incident[right] = True
+            isolated = []
+            for robot_id in robot_ids:
+                isolation_runs[robot_id] = 0 if incident[robot_id] else isolation_runs[robot_id] + 1
+                maximum_isolation_runs[robot_id] = max(
+                    maximum_isolation_runs[robot_id], isolation_runs[robot_id]
+                )
+                if not incident[robot_id]:
+                    isolated.append(robot_id)
+            keyframes.append(
+                {
+                    "frame_index": int(frame_index),
+                    "connected": bool(graph.connected),
+                    "edges": [list(edge) for edge in graph.edges],
+                    "isolated_robot_ids": isolated,
+                    "overlaps": {
+                        f"{left}|{right}": float(value)
+                        for (left, right), value in graph.overlaps.items()
+                    },
+                }
+            )
+    finally:
+        adapter.place_robots_at_trajectory_frame(trajectories, 0)
+    connected_fraction = connected_count / len(keyframe_indices)
+    maximum_allowed_isolation = int(preflight["maximum_consecutive_isolated_keyframes"])
+    passed = (
+        connected_fraction >= float(preflight["connected_fraction_min"])
+        and all(value <= maximum_allowed_isolation for value in maximum_isolation_runs.values())
+    )
+    metrics = {
+        "keyframe_indices": keyframe_indices.tolist(),
+        "connected_keyframe_count": connected_count,
+        "keyframe_count": len(keyframe_indices),
+        "connected_fraction": connected_fraction,
+        "required_connected_fraction": float(preflight["connected_fraction_min"]),
+        "maximum_consecutive_isolated_keyframes": maximum_isolation_runs,
+        "allowed_consecutive_isolated_keyframes": maximum_allowed_isolation,
+        "geometry_resolution": [width, height],
+        "keyframes": keyframes,
+    }
+    if not passed:
+        raise SampleRejected("trajectory_temporal_overlap_failed", metrics)
+    return metrics
 def _robot_states(
     config: dict[str, Any],
     heights: dict[str, float],
@@ -429,6 +524,7 @@ def generate_dataset(
                     w0_snapshot = None
                     w0_catalog = None
                     trajectory_metrics = None
+                    temporal_overlap_metrics = None
                     for placement_attempt in range(int(config["placement"]["maximum_attempts"])):
                         _write_status(
                             root,
@@ -451,6 +547,10 @@ def generate_dataset(
                                 episode_seed + placement_attempt + 101
                             )
                             w0_snapshot = adapter.dump_snapshot()
+                            temporal_overlap_metrics = _temporal_overlap_preflight(
+                                adapter, config, trajectories
+                            )
+                            trajectory_metrics["temporal_overlap"] = temporal_overlap_metrics
                             w0_catalog = adapter.object_catalog_with_relations()
                             world_calibration = adapter.calibrated_floor_bounds(
                                 int(trajectory_metrics["floor_index"]),
@@ -527,6 +627,18 @@ def generate_dataset(
                                     metrics={
                                         "minimum_overlap": float(min(graph.overlaps.values())),
                                         "maximum_overlap": float(max(graph.overlaps.values())),
+                                    },
+                                ),
+                                QAResult(
+                                    "temporal_overlap_connectivity",
+                                    True,
+                                    metrics={
+                                        "connected_fraction": float(
+                                            temporal_overlap_metrics["connected_fraction"]
+                                        ),
+                                        "maximum_isolated_run": max(
+                                            temporal_overlap_metrics["maximum_consecutive_isolated_keyframes"].values()
+                                        ),
                                     },
                                 ),
                                 QAResult(
@@ -673,6 +785,16 @@ def generate_dataset(
                         image_names.extend(
                             ["world_before_t000.png", "world_after_t000.png"]
                         )
+                        trajectory_image_name = "trajectory_inspection.png"
+                        save_trajectory_inspection(
+                            inspection_root / trajectory_image_name,
+                            adapter.trajectory_traversability_inspection(
+                                int(trajectory_metrics["floor_index"])
+                            ),
+                            trajectories,
+                            temporal_overlap_metrics,
+                        )
+                        image_names.append(trajectory_image_name)
                         for robot_id in sorted(before["robot_views"]):
                             name = f"{robot_id}_before_t000.png"
                             save_rgb(

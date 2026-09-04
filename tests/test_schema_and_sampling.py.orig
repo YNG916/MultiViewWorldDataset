@@ -52,29 +52,6 @@ def _straight_planner(start, goal):
     return path, float(np.linalg.norm(goal - start))
 
 
-def test_final_robot_capture_uses_only_raw_aov_for_segmentation():
-    adapter = object.__new__(OmniGibsonAdapter)
-    adapter.config = {
-        "bev": {
-            "modalities": ["rgb", "depth_linear", "semantic", "instance"],
-            "world_modalities": ["normal", "instance_id"],
-        }
-    }
-    adapter._using_final_robot = True
-    assert adapter._configured_bev_sensor_names() == [
-        "depth_linear",
-        "normal",
-        "rgb",
-    ]
-
-    adapter._using_final_robot = False
-    assert {
-        "seg_semantic",
-        "seg_instance",
-        "seg_instance_id",
-    }.issubset(adapter._configured_bev_sensor_names())
-
-
 def _sample_parallel_trajectories(seed):
     starts = {}
     mounts = {}

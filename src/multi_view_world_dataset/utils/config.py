@@ -47,6 +47,7 @@ def validate_config(config: dict[str, Any]) -> None:
     bev = config.get("bev", {})
     intervention = config.get("intervention", {})
     generation = config.get("generation", {})
+    trajectory = config.get("trajectory", {})
     if dataset.get("robots") != 3:
         errors.append("Dataset v1 requires exactly 3 robots")
     if config.get("profile") not in {"smoke", "integration"} and dataset.get("frames") != 60:
@@ -86,6 +87,40 @@ def validate_config(config: dict[str, Any]) -> None:
     restore_tolerance = generation.get("snapshot_restore_tolerance")
     if not isinstance(restore_tolerance, (int, float)) or restore_tolerance <= 0:
         errors.append("Generation setting snapshot_restore_tolerance must be positive")
+    family_weights = trajectory.get("path_family_weights", {})
+    required_families = {"direct", "one_waypoint", "two_waypoint"}
+    if set(family_weights) != required_families:
+        errors.append("Trajectory path_family_weights must define direct, one_waypoint, and two_waypoint")
+    elif (
+        any(float(value) < 0.0 for value in family_weights.values())
+        or abs(sum(float(value) for value in family_weights.values()) - 1.0) > 1.0e-8
+    ):
+        errors.append("Trajectory path family weights must be non-negative and sum to 1")
+    for key in (
+        "initial_heading_tolerance_deg",
+        "line_validation_spacing_m",
+        "smoothing_validation_spacing_m",
+        "candidate_pool_size",
+        "joint_pool_rounds",
+        "sampling_maximum_attempts",
+    ):
+        value = trajectory.get(key)
+        if not isinstance(value, (int, float)) or value <= 0:
+            errors.append(f"Trajectory setting {key} must be positive")
+    strengths = trajectory.get("smoothing_strengths", ())
+    if not strengths or any(not 0.0 < float(value) <= 1.0 for value in strengths):
+        errors.append("Trajectory smoothing_strengths must lie in (0,1]")
+    preflight = trajectory.get("overlap_preflight", {})
+    connected_fraction = preflight.get("connected_fraction_min")
+    if not isinstance(connected_fraction, (int, float)) or not 0.0 <= connected_fraction <= 1.0:
+        errors.append("Trajectory overlap connected_fraction_min must lie in [0,1]")
+    for key in (
+        "keyframe_count", "geometry_width", "geometry_height",
+        "maximum_consecutive_isolated_keyframes", "depth_sample_stride",
+    ):
+        value = preflight.get(key)
+        if not isinstance(value, int) or value < 1:
+            errors.append(f"Trajectory overlap setting {key} must be a positive integer")
     if errors:
         raise ConfigurationError("Invalid dataset configuration:\n- " + "\n- ".join(errors))
 

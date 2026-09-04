@@ -3,7 +3,7 @@ import json
 import numpy as np
 import pytest
 
-from multi_view_world_dataset.sampling.trajectories import generate_smooth_trajectory
+from multi_view_world_dataset.sampling.trajectories import trajectory_from_spatial_path
 from multi_view_world_dataset.storage.writer import DatasetWriter
 from multi_view_world_dataset.utils.serialization import dump_json
 
@@ -12,7 +12,9 @@ def test_episode_transaction_is_atomic_and_resume_safe(tmp_path):
     writer = DatasetWriter(tmp_path / "dataset")
     writer.initialize({"schema_version": "1.0.0"})
     camera = np.eye(4)
-    trajectory = generate_smooth_trajectory("robot_00", (0, 0, 0), (1, 0, 0), 0, camera, frames=3, fps=10)
+    trajectory = trajectory_from_spatial_path(
+        "robot_00", np.asarray([[0.0, 0.0], [1.0, 0.0]]), 0, camera, frames=3, fps=10
+    )
     with writer.begin_episode("scene", "config", "episode") as transaction:
         transaction.write_json("meta.json", {"accepted": True})
         transaction.write_trajectories((trajectory,))

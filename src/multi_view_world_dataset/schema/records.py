@@ -144,6 +144,17 @@ class Trajectory:
     fps: float
     base_to_world: FloatArray
     camera_to_world: FloatArray
+    path_family: str = "unspecified"
+    control_waypoints_xy: FloatArray = field(
+        default_factory=lambda: np.empty((0, 2), dtype=np.float64)
+    )
+    planner_path_xy: FloatArray = field(
+        default_factory=lambda: np.empty((0, 2), dtype=np.float64)
+    )
+    smoothed_path_xy: FloatArray = field(
+        default_factory=lambda: np.empty((0, 2), dtype=np.float64)
+    )
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         base = np.asarray(self.base_to_world, dtype=np.float64)
@@ -156,6 +167,15 @@ class Trajectory:
             raise ValueError("Trajectory contains non-finite poses")
         if self.fps <= 0:
             raise ValueError("fps must be positive")
+        for name in (
+            "control_waypoints_xy",
+            "planner_path_xy",
+            "smoothed_path_xy",
+        ):
+            points = np.asarray(getattr(self, name), dtype=np.float64)
+            if points.ndim != 2 or points.shape[1] != 2 or not np.isfinite(points).all():
+                raise ValueError(f"{name} must be a finite [N,2] array")
+            object.__setattr__(self, name, points)
         object.__setattr__(self, "base_to_world", base)
         object.__setattr__(self, "camera_to_world", camera)
 

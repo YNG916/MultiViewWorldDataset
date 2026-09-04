@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -20,7 +20,10 @@ from multi_view_world_dataset.sampling.interventions import (
     propose_state_change,
 )
 from multi_view_world_dataset.sampling.splits import infer_scene_family
-from multi_view_world_dataset.sampling.trajectories import sample_smooth_trajectory_set, trajectory_kinematic_metrics
+from multi_view_world_dataset.sampling.trajectories import (
+    sample_geodesic_trajectory_set,
+    trajectory_kinematic_metrics,
+)
 from multi_view_world_dataset.schema.records import (
     BaseSceneRecord, InterventionEvent, InterventionType, ObjectState, Trajectory,
 )
@@ -48,7 +51,10 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         self._env: Any = None
         self._scene_id: str | None = None
         self._using_final_robot = False
-        self._final_robot_bev_added_modalities: tuple[str, ...] = ()
+        self._development_bev_sensor: Any = None
+        self._final_robot_capture_sensor: Any = None
+        self._final_robot_fast_instance_annotator: Any = None
+        self._syntheticdata_helpers: Any = None
         self._started = False
         self._runtime_findings: dict[str, Any] = {}
 
@@ -59,7 +65,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         )
         backend_names = {
             "semantic": "seg_semantic",
-            "instance": "seg_instance",
+            "instance": "seg_instance_id" if self._using_final_robot else "seg_instance",
             "instance_id": "seg_instance_id",
         }
         sensor_names = {
@@ -77,6 +83,14 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         }
         if {"height", "occupancy"} & public_modalities:
             sensor_names.add("depth_linear")
+        if self._using_final_robot:
+            # Final-robot segmentation is derived from the raw renderer-ID
+            # AOV. Letting VisionSensor own any segmentation modality also
+            # installs SemanticSegmentation / InstanceMapping graphs, which
+            # are unsafe after articulation motion in Isaac Sim 5.0.
+            sensor_names.difference_update(
+                {"seg_semantic", "seg_instance", "seg_instance_id"}
+            )
         return sorted(sensor_names)
 
     def start(self) -> None:
@@ -101,19 +115,9 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         self._object_state_utils = object_state_utils
         if og.sim is None:
             og.launch()
-        if bool(self.config["robot"].get("use_final_robot", False)):
-            camera = og.sim.viewer_camera
-            if camera is None:
-                raise SimulatorUnavailableError(
-                    "Final-robot BEV rendering requires OmniGibson's viewer camera"
-                )
-            configured_modalities = self._configured_bev_sensor_names()
-            deferred_modalities = sorted(set(configured_modalities) - set(camera.modalities))
-            self._final_robot_bev_added_modalities = tuple(deferred_modalities)
-            self._runtime_findings["final_robot_bev_modalities_deferred_until_capture"] = {
-                "configured": configured_modalities,
-                "deferred": deferred_modalities,
-            }
+        from omni.syntheticdata import helpers as syntheticdata_helpers
+
+        self._syntheticdata_helpers = syntheticdata_helpers
         self._started = True
         self._runtime_findings.update(
             versions=installed_versions(),
@@ -159,6 +163,8 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         self._require_started()
         if self._env is not None:
             self._og.clear()
+        self._development_bev_sensor = None
+        self._final_robot_capture_sensor = None
         self._development_camera_mounts.clear()
         self._relation_cache = None
         if scene_id not in self.discover_scenes():
@@ -276,6 +282,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             }
             if self._using_final_robot:
                 robot_config["include_sensor_names"] = ["dataset_camera"]
+                robot_config["obs_modalities"] = ["rgb"]
             robots.append(robot_config)
         environment_config = {
             "scene": {
@@ -321,6 +328,21 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 xform_prim_module.XFormPrim.get_attribute = original_xform_get_attribute
         self._scene_id = scene_id
         self._og.sim.step()
+        if not self._using_final_robot:
+            # Keep the visible semantic instance set stable for the lifetime of
+            # the persistent BEV graph. Toggling ceilings between paired
+            # rollouts invalidates SyntheticData's instance-mapping graph.
+            ceilings = [
+                obj
+                for obj in self._require_scene().objects
+                if str(getattr(obj, "category", "")) in {"ceilings", "roof"}
+            ]
+            for ceiling in ceilings:
+                ceiling.visible = False
+            self._runtime_findings["development_hidden_ceilings"] = sorted(
+                ceiling.name for ceiling in ceilings
+            )
+            self._initialize_development_bev_sensor()
         if self._using_final_robot:
             mast_qa = {}
             for robot in self._env.robots:
@@ -354,7 +376,8 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                     "sensor_prim_path": str(sensors[0].prim_path),
                 }
             self._runtime_findings["final_robot_mast_qa"] = mast_qa
-            self._release_final_robot_bev_modalities(self._og.sim.viewer_camera)
+            self._initialize_final_robot_capture_sensor()
+            self._release_final_robot_bev_modalities(self._final_robot_capture_sensor)
         self._runtime_findings["loaded_scene"] = scene_id
         self._runtime_findings["device"] = str(self._og.sim.device)
         self._runtime_findings["loaded_robot_count"] = len(self._env.robots)
@@ -1108,16 +1131,210 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
     def load_snapshot(self, snapshot: np.ndarray) -> None:
         self._require_scene()
         state = self._th.as_tensor(snapshot, dtype=self._th.float32, device=self._og.sim.device)
-        self._og.sim.load_state(state, serialized=True)
-        if self._using_final_robot:
-            # A serialized restore rebuilds PhysX tensor views, but it does not
-            # replace robot camera prims or their render products. Removing and
-            # re-adding annotators here leaves stale SyntheticData nodes and can
-            # segfault on the next render. Keep stable camera graphs attached.
-            self._og.sim.update_handles()
-            self._runtime_findings["final_robot_snapshot_sensor_lifecycle"] = (
-                "annotators_retained"
+        simulator_state, consumed = self._og.sim.deserialize(state)
+        if consumed != len(state):
+            raise SimulatorUnavailableError(
+                "OmniGibson snapshot deserialization consumed "
+                f"{consumed} values out of {len(state)}"
             )
+        # Simulator.load_state() always reapplies the scene-root transform,
+        # even though MVWD never moves it. That USD transform edit invalidates
+        # persistent SyntheticData render products and can segfault either in
+        # set_world_pose() or on the following render. Restore only registry
+        # entries whose serialized state actually changed; calling load_state
+        # on every unchanged furniture object also invalidates SyntheticData.
+        requires_handle_refresh = False
+        for index, scene in enumerate(self._og.sim.scenes):
+            scene_state = simulator_state[index]
+            target_position = scene_state.get("pos")
+            target_orientation = scene_state.get("ori")
+            if target_position is not None:
+                current_position, current_orientation = scene.get_position_orientation()
+                if not (
+                    self._th.allclose(current_position, target_position, atol=1.0e-6)
+                    and self._th.allclose(current_orientation, target_orientation, atol=1.0e-6)
+                ):
+                    raise SimulatorUnavailableError(
+                        "MVWD snapshots cannot restore a changed scene-root transform "
+                        "while persistent render products are active"
+                    )
+            target_registry_state = scene_state.get("registry", scene_state)
+            registries = (
+                ("object_registry", scene.object_registry),
+                ("system_registry", scene.system_registry),
+            )
+            previous_filters: list[tuple[Any, Any]] = []
+            changed_by_registry: dict[str, list[str]] = {}
+            development_robot_names = {robot.name for robot in self._env.robots}
+            lightweight_robot_restores: set[str] = set()
+            for registry_name, registry in registries:
+                target_subregistry_state = target_registry_state.get(registry_name)
+                if target_subregistry_state is None:
+                    raise SimulatorUnavailableError(
+                        f"OmniGibson snapshot is missing {registry_name}"
+                    )
+                changed_names: set[str] = set()
+                for obj in registry.objects:
+                    target_object_state = target_subregistry_state.get(obj.name)
+                    if target_object_state is None:
+                        continue
+                    current_serialized = obj.dump_state(serialized=True)
+                    target_serialized = obj.serialize(target_object_state)
+                    is_development_object = (
+                        registry_name == "object_registry"
+                        and not self._using_final_robot
+                    )
+                    if is_development_object and obj.name not in development_robot_names:
+                        requires_restore = self._development_object_requires_restore(
+                            obj,
+                            current_serialized,
+                            target_serialized,
+                            target_object_state,
+                        )
+                    else:
+                        requires_restore = (
+                            current_serialized.shape != target_serialized.shape
+                            or not self._th.allclose(
+                                current_serialized,
+                                target_serialized,
+                                rtol=0.0,
+                                atol=1.0e-7,
+                                equal_nan=True,
+                            )
+                        )
+                    if requires_restore:
+                        if (
+                            registry_name == "object_registry"
+                            and obj.name in development_robot_names
+                        ):
+                            self._restore_robot_snapshot_lightweight(
+                                obj,
+                                target_object_state,
+                            )
+                            lightweight_robot_restores.add(obj.name)
+                        else:
+                            changed_names.add(obj.name)
+                previous_filter = registry._load_filter
+                previous_filters.append((registry, previous_filter))
+                registry.set_load_filter(
+                    lambda obj, allowed=changed_names, prior=previous_filter: (
+                        prior(obj) and obj.name in allowed
+                    )
+                )
+                changed_by_registry[registry_name] = sorted(changed_names)
+                # Lightweight robot root / joint restores preserve existing
+                # articulation and sensor handles. A complete furniture or
+                # system restore is the only operation here that can require
+                # OmniGibson to rebuild its tensor views.
+                requires_handle_refresh = requires_handle_refresh or bool(changed_names)
+            try:
+                scene.load_state(state=target_registry_state, serialized=False)
+            finally:
+                for registry, previous_filter in previous_filters:
+                    registry.set_load_filter(previous_filter)
+            self._runtime_findings["snapshot_changed_registry_entries"] = (
+                changed_by_registry
+            )
+            self._runtime_findings["snapshot_lightweight_robot_restores"] = sorted(
+                lightweight_robot_restores
+            )
+        if self._using_final_robot:
+            if requires_handle_refresh:
+                self._rebuild_final_robot_capture_sensor()
+                self._og.sim.update_handles()
+            self._runtime_findings["final_robot_snapshot_sensor_lifecycle"] = (
+                "scene_root_retained+robot_root_joint_restore+"
+                "changed_registry_entries_restored+furniture_or_system_handle_refresh+"
+                "capture_graph_rebuilt_before_handle_refresh"
+            )
+            self._runtime_findings["snapshot_handles_refreshed"] = (
+                requires_handle_refresh
+            )
+        else:
+            self._runtime_findings["development_snapshot_sensor_lifecycle"] = (
+                "scene_root_retained+lightweight_robot_restore+changed_registry_entries_restored+graph_retained"
+            )
+
+    def _restore_robot_snapshot_lightweight(self, robot: Any, state: dict[str, Any]) -> None:
+        """Restore robot physics state without reloading controllers or sensor graphs."""
+        root_state = state["root_link"]
+        robot.set_position_orientation(
+            position=root_state["pos"],
+            orientation=root_state["ori"],
+        )
+        robot.set_linear_velocity(root_state["lin_vel"])
+        robot.set_angular_velocity(root_state["ang_vel"])
+        if robot.n_joints > 0:
+            robot.set_joint_positions(state["joint_pos"], drive=False)
+            robot.set_joint_velocities(state["joint_vel"])
+
+    def _development_object_requires_restore(
+        self,
+        obj: Any,
+        current: Any,
+        target: Any,
+        target_state: dict[str, Any],
+    ) -> bool:
+        """Compare only object state represented in MVWD's public schema."""
+        joint_count = int(obj.n_joints)
+        root_state_size = int(
+            obj.root_link.serialize(target_state["root_link"]).numel()
+        )
+        joint_position_start = 1 + root_state_size
+        entity_state_size = joint_position_start + 2 * joint_count
+        if current.shape != target.shape or current.numel() < entity_state_size:
+            return True
+        if not self._th.allclose(
+            current[1:4], target[1:4], rtol=0.0, atol=1.0e-6
+        ):
+            return True
+        orientation_delta = self._th.minimum(
+            self._th.max(self._th.abs(current[4:8] - target[4:8])),
+            self._th.max(self._th.abs(current[4:8] + target[4:8])),
+        )
+        if bool(orientation_delta > 1.0e-6):
+            return True
+        if joint_count > 0 and not self._th.allclose(
+            current[joint_position_start : joint_position_start + joint_count],
+            target[joint_position_start : joint_position_start + joint_count],
+            rtol=0.0,
+            atol=1.0e-6,
+        ):
+            return True
+        meaningful_boolean_states = {
+            "Open",
+            "ToggledOn",
+            "Cooked",
+            "Burnt",
+            "Frozen",
+            "Heated",
+            "OnFire",
+        }
+        target_non_kinematic = target_state.get("non_kin", {})
+        for state_type, state_instance in getattr(obj, "states", {}).items():
+            state_name = state_type.__name__
+            if (
+                state_name not in meaningful_boolean_states
+                or not state_instance.stateful
+                or state_name not in target_non_kinematic
+            ):
+                continue
+            current_state = state_instance.dump_state(serialized=True)
+            target_state_value = state_instance.serialize(
+                target_non_kinematic[state_name]
+            )
+            if (
+                current_state.shape != target_state_value.shape
+                or not self._th.allclose(
+                    current_state,
+                    target_state_value,
+                    rtol=0.0,
+                    atol=1.0e-7,
+                    equal_nan=True,
+                )
+            ):
+                return True
+        return False
 
     def _restore_final_robot_mast_mount(self, robot: Any) -> None:
         """Restore the passive mast after a rollout physics step."""
@@ -1267,12 +1484,9 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         # component, not over a neighborhood of the reference point. On large components
         # that makes the probability of landing inside a 3 m cluster needlessly tiny.
         # Build the local candidate pool from the installed traversability map instead.
-        trav_map = scene.trav_map
-        eroded = self._robot_eroded_traversability(floor_index, robots[0])
-        pixels = self._th.stack(self._th.where(eroded == 255), dim=1)
-        if pixels.shape[0] < 3:
+        world_xy, is_path_traversable, _ = self._trajectory_traversability(floor_index, robots[0])
+        if len(world_xy) < 3:
             raise SimulatorUnavailableError(f"Floor {floor_index} has fewer than three traversable pixels")
-        world_xy = self._native_value(trav_map.map_to_world(pixels)).astype(float)
         z = float(scene.get_floor_height(floor_index))
         candidates = np.column_stack((world_xy, np.full(len(world_xy), z)))
         cluster_radius = float(placement["cluster_radius_m"])
@@ -1292,10 +1506,26 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             if radius > candidate_radii[-1] + 1.0e-9:
                 candidate_radii.append(radius)
         minimum_distance = float(placement["minimum_pairwise_distance_m"])
-        trajectory_headroom = 0.5 * trajectory_minimum_length
+        trajectory_headroom = float(placement["trajectory_separation_headroom_m"])
         selection_distance = minimum_distance + trajectory_headroom
         maximum_attempts = int(placement["maximum_attempts"])
         selected: list[np.ndarray] = []
+        selected_focus_xy_by_robot: list[np.ndarray] = []
+        selected_shared_heading: float | None = None
+        heading_jitter = np.deg2rad(float(placement.get("heading_jitter_deg", 5.0)))
+        heading_tolerance = np.deg2rad(
+            float(self.config["trajectory"]["initial_heading_tolerance_deg"])
+        )
+        maximum_focus_bearing_error = max(0.0, heading_tolerance - heading_jitter)
+
+        def has_safe_forward_line(source_xy: np.ndarray, target_xy: np.ndarray) -> bool:
+            distance = float(np.linalg.norm(target_xy - source_xy))
+            samples = max(2, int(np.ceil(distance / 0.025)) + 1)
+            line = source_xy + np.linspace(0.0, 1.0, samples)[:, None] * (
+                target_xy - source_xy
+            )
+            return is_path_traversable(line)
+
         attempts = 0
         attempts_by_radius: dict[str, int] = {}
         effective_radius = preferred_radius
@@ -1309,23 +1539,73 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 if len(local) < 3:
                     continue
                 selection = [local[int(rng.integers(len(local)))]]
-                # Greedy farthest-point selection is deterministic under the seeded tie order
-                # and avoids rejection loops when the connected component is large.
+                # Keep the group compact while respecting the hard separation.
+                # Compact starts materially improve shared camera coverage.
                 tie_order = rng.permutation(len(local))
                 while len(selection) < 3:
-                    distances = np.stack(
+                    pairwise = np.stack(
                         [np.linalg.norm(local[:, :2] - point[:2], axis=1) for point in selection], axis=1
-                    ).min(axis=1)
-                    distances[distances < selection_distance] = -1.0
-                    best_distance = float(distances.max())
-                    if best_distance < selection_distance:
+                    )
+                    nearest = pairwise.min(axis=1)
+                    valid = nearest >= selection_distance
+                    if not np.any(valid):
                         break
-                    best = tie_order[np.argmax(distances[tie_order])]
+                    compactness = pairwise.max(axis=1)
+                    score = np.where(valid, compactness, np.inf)
+                    best = tie_order[np.argmin(score[tie_order])]
                     selection.append(local[int(best)])
                 if len(selection) == 3:
-                    selected = selection
-                    effective_radius = radius
-                    break
+                    positions_xy = np.stack(selection, axis=0)[:, :2]
+                    cluster_center = positions_xy.mean(axis=0)
+                    heading_targets = world_xy[
+                        rng.permutation(len(world_xy))[: min(32, len(world_xy))]
+                    ]
+                    heading_candidates = np.arctan2(
+                        heading_targets[:, 1] - cluster_center[1],
+                        heading_targets[:, 0] - cluster_center[0],
+                    )
+                    for proposed_heading in heading_candidates:
+                        per_robot_focus: list[np.ndarray] = []
+                        for point in selection:
+                            deltas = world_xy - point[:2]
+                            distances = np.linalg.norm(deltas, axis=1)
+                            bearings = np.arctan2(deltas[:, 1], deltas[:, 0])
+                            bearing_errors = np.abs(
+                                (bearings - proposed_heading + np.pi)
+                                % (2.0 * np.pi)
+                                - np.pi
+                            )
+                            forward_indices = np.flatnonzero(
+                                (distances >= trajectory_minimum_length)
+                                & (distances <= float(
+                                    self.config["trajectory"]["path_length_max_m"]
+                                ))
+                                & (bearing_errors <= maximum_focus_bearing_error)
+                            )
+                            forward_order = forward_indices[
+                                np.argsort(bearing_errors[forward_indices])
+                            ]
+                            safe_focus = next(
+                                (
+                                    world_xy[int(focus_index)]
+                                    for focus_index in forward_order[:32]
+                                    if has_safe_forward_line(
+                                        point[:2], world_xy[int(focus_index)]
+                                    )
+                                ),
+                                None,
+                            )
+                            if safe_focus is None:
+                                break
+                            per_robot_focus.append(safe_focus.copy())
+                        if len(per_robot_focus) == len(selection):
+                            selected = selection
+                            selected_focus_xy_by_robot = per_robot_focus
+                            selected_shared_heading = float(proposed_heading)
+                            effective_radius = radius
+                            break
+                    if selected:
+                        break
             attempts_by_radius[f"{radius:.6g}"] = radius_attempts
             if selected:
                 break
@@ -1341,21 +1621,22 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         camera_rotation_base = np.array([[0.0, sine, cosine], [-1.0, 0.0, 0.0], [0.0, -cosine, sine]])
         cv_to_usd = np.diag([1.0, -1.0, -1.0, 1.0])
         cluster_center_xy = np.mean(np.stack(selected, axis=0)[:, :2], axis=0)
-        shared_yaw = float(rng.uniform(-np.pi, np.pi))
-        focus_distance = max(2.0, cluster_radius)
-        focus_xy = cluster_center_xy + focus_distance * np.asarray(
-            [np.cos(shared_yaw), np.sin(shared_yaw)]
+        assert selected_shared_heading is not None
+        assert len(selected_focus_xy_by_robot) == len(selected)
+        common_view_distance = float(placement["common_view_focus_distance_m"])
+        common_view_focus_xy = cluster_center_xy + common_view_distance * np.array(
+            [np.cos(selected_shared_heading), np.sin(selected_shared_heading)]
         )
-        heading_jitter = np.deg2rad(float(placement.get("heading_jitter_deg", 5.0)))
+        focus_distances_m = [
+            float(np.linalg.norm(focus - point[:2]))
+            for focus, point in zip(selected_focus_xy_by_robot, selected, strict=True)
+        ]
         heading_offsets = np.linspace(-heading_jitter, heading_jitter, len(robots))
         placement_yaws: dict[str, float] = {}
         for robot, point, heading_offset in zip(robots, selected, heading_offsets, strict=True):
-            focus_delta = focus_xy - point[:2]
-            if float(np.linalg.norm(focus_delta)) > 1.0e-6:
-                base_yaw = float(np.arctan2(focus_delta[1], focus_delta[0]))
-            else:
-                base_yaw = shared_yaw
-            yaw = base_yaw + float(heading_offset)
+            delta_to_focus = common_view_focus_xy - point[:2]
+            base_yaw = float(np.arctan2(delta_to_focus[1], delta_to_focus[0]))
+            yaw = float((base_yaw + heading_offset + np.pi) % (2.0 * np.pi) - np.pi)
             placement_yaws[robot.name] = yaw
             orientation = self._transform_utils.euler2quat(self._th.tensor([0.0, 0.0, yaw]))
             robot.set_position_orientation(
@@ -1392,16 +1673,34 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 sensor.set_position_orientation(position=camera_position, orientation=camera_orientation)
             self._development_camera_mounts[robot.name] = camera_to_base.copy()
         settle_steps = min(30, int(self.config["generation"]["settle_steps"]))
-        rendering_settle_steps = min(2, settle_steps)
-        for step_index in range(settle_steps):
+        # Development cameras need render ticks after a teleport. Final-robot
+        # capture renders explicitly in robot_observations(); ticking the
+        # InstanceMapping graph here immediately after moving articulated bases
+        # can crash OmniGibson 3.9.2 in native SyntheticData code.
+        rendering_settle_steps = 0 if self._using_final_robot else min(2, settle_steps)
+        for _ in range(settle_steps):
             for robot in robots:
                 robot.keep_still()
-            if step_index >= settle_steps - rendering_settle_steps:
-                # Full steps run OG's non-physics callbacks and propagate pose
-                # edits to render products without a burst of bare renders.
-                self._og.sim.step()
-            else:
-                self._og.sim.step_physics()
+            self._og.sim.step_physics()
+        # Keep the sampled base poses exactly on their validated map pixels;
+        # passive wheel settling must not move a trajectory start into an
+        # adjacent non-traversable cell.
+        for robot, point in zip(robots, selected, strict=True):
+            yaw = placement_yaws[robot.name]
+            orientation = self._transform_utils.euler2quat(
+                self._th.tensor([0.0, 0.0, yaw])
+            )
+            robot.set_position_orientation(
+                position=self._th.as_tensor(point, dtype=self._th.float32),
+                orientation=orientation,
+            )
+            self._restore_final_robot_mast_mount(robot)
+            robot.keep_still()
+        # OmniGibson 3.9.2 can segfault in SyntheticData when a full
+        # physics+render step follows an articulated camera teleport. Keep
+        # physics settling and render-graph propagation as separate operations.
+        for _ in range(rendering_settle_steps):
+            self._og.sim.render()
         self._runtime_findings["development_camera_heights_m"] = sampled_heights
         self._runtime_findings["development_camera_settle_steps"] = settle_steps
         self._runtime_findings["development_camera_rendering_settle_steps"] = rendering_settle_steps
@@ -1410,14 +1709,94 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         self._runtime_findings["placement_pairwise_minimum_m"] = minimum_distance
         self._runtime_findings["placement_pairwise_target_m"] = selection_distance
         self._runtime_findings["placement_candidate_count"] = len(candidates)
-        self._runtime_findings["placement_heading_mode"] = "toward_shared_forward_focus"
+        self._runtime_findings["placement_common_view_focus_xy"] = (
+            common_view_focus_xy.tolist()
+        )
+        self._runtime_findings["placement_heading_mode"] = (
+            "common_view_focus_with_independent_robot_eroded_los_corridors"
+        )
         self._runtime_findings["placement_cluster_center_xy"] = cluster_center_xy.tolist()
-        self._runtime_findings["placement_focus_xy"] = focus_xy.tolist()
-        self._runtime_findings["placement_focus_distance_m"] = focus_distance
+        self._runtime_findings["placement_focus_xy_by_robot"] = {
+            robot.name: focus.tolist()
+            for robot, focus in zip(robots, selected_focus_xy_by_robot, strict=True)
+        }
+        self._runtime_findings["placement_focus_distances_m"] = focus_distances_m
         self._runtime_findings["placement_yaws_rad"] = placement_yaws
         self._runtime_findings["placement_source"] = "robot-eroded traversability map"
         self._runtime_findings["placement_effective_radius_m"] = effective_radius
         return sampled_heights
+
+    def _trajectory_traversability(
+        self,
+        floor_index: int,
+        robot: Any,
+    ) -> tuple[
+        np.ndarray, Callable[[np.ndarray], bool],
+        Callable[[np.ndarray, np.ndarray], tuple[np.ndarray, float] | None],
+    ]:
+        """Return strict robot-eroded candidates, validator, and OG planner."""
+        scene = self._require_scene()
+        trav_map = scene.trav_map
+        eroded = trav_map._erode_trav_map(
+            self._th.clone(trav_map.floor_map[floor_index]), robot=robot
+        )
+        pixels = self._th.stack(self._th.where(eroded == 255), dim=1)
+        world_xy = self._native_value(trav_map.map_to_world(pixels)).astype(np.float64)
+
+        eroded_native = self._native_value(eroded) == 255
+        height, width = eroded_native.shape
+        def is_path_traversable(path_xy: np.ndarray) -> bool:
+            points = np.asarray(path_xy, dtype=np.float64)
+            map_points = self._native_value(
+                trav_map.world_to_map(
+                    self._th.as_tensor(points, dtype=self._th.float32)
+                )
+            ).astype(int)
+            rows = map_points[:, 0]
+            columns = map_points[:, 1]
+            inside = (
+                (rows >= 0)
+                & (rows < height)
+                & (columns >= 0)
+                & (columns < width)
+            )
+            return bool(
+                np.all(inside)
+                and np.all(eroded_native[rows, columns])
+            )
+
+        def plan_segment(
+            source_xy: np.ndarray,
+            target_xy: np.ndarray,
+        ) -> tuple[np.ndarray, float] | None:
+            original_waypoint_interval = int(trav_map.waypoint_interval)
+            trav_map.waypoint_interval = 1
+            try:
+                path, distance = scene.get_shortest_path(
+                    floor_index,
+                    self._th.as_tensor(source_xy, dtype=self._th.float32),
+                    self._th.as_tensor(target_xy, dtype=self._th.float32),
+                    entire_path=True,
+                    robot=robot,
+                )
+            finally:
+                trav_map.waypoint_interval = original_waypoint_interval
+            if path is None or distance is None:
+                return None
+            return (
+                self._native_value(path).astype(np.float64),
+                float(self._native_value(distance)),
+            )
+
+        self._runtime_findings["trajectory_planner"] = {
+            "api": "scene.get_shortest_path",
+            "entire_path": True,
+            "planner_waypoint_interval": 1,
+            "native_waypoint_interval": int(trav_map.waypoint_interval),
+            "robot_eroded": True,
+            "erosion_source": "installed_omnigibson_3.9.2",
+        }
+        return world_xy, is_path_traversable, plan_segment
 
     def sample_robot_trajectories(self, seed: int) -> tuple[tuple[Trajectory, ...], dict[str, Any]]:
         observations = self.robot_observations()
@@ -1440,47 +1819,11 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         if len(robot_floor_indices) != 1:
             raise SampleRejected("robots_span_multiple_floors", {"floor_indices": sorted(robot_floor_indices)})
         floor_index = robot_floor_indices.pop()
-        scene = self._require_scene()
-        trav_map = scene.trav_map
-        eroded = self._robot_eroded_traversability(floor_index, self._env.robots[0])
-        pixels = self._th.stack(self._th.where(eroded == 255), dim=1)
-        world_xy = self._native_value(trav_map.map_to_world(pixels)).astype(np.float64)
-
-        pixel_tolerance = 1
-        eroded_native = self._native_value(eroded) == 255
-        padded = np.pad(eroded_native, pixel_tolerance, constant_values=False)
-        tolerant_traversable = np.zeros_like(eroded_native)
-        height, width = eroded_native.shape
-        for row_offset in range(2 * pixel_tolerance + 1):
-            for column_offset in range(2 * pixel_tolerance + 1):
-                tolerant_traversable |= padded[
-                    row_offset : row_offset + height,
-                    column_offset : column_offset + width,
-                ]
-
-        def is_path_traversable(path_xy: np.ndarray) -> bool:
-            points = np.asarray(path_xy, dtype=np.float64)
-            columns = np.trunc(
-                points[:, 0] / float(trav_map.map_resolution)
-                + float(trav_map.map_size) / 2.0
-            ).astype(int)
-            rows = np.trunc(
-                points[:, 1] / float(trav_map.map_resolution)
-                + float(trav_map.map_size) / 2.0
-            ).astype(int)
-            inside = (
-                (rows >= 0)
-                & (rows < height)
-                & (columns >= 0)
-                & (columns < width)
-            )
-            return bool(
-                np.all(inside)
-                and np.all(tolerant_traversable[rows, columns])
-            )
-
+        world_xy, is_path_traversable, plan_segment = self._trajectory_traversability(
+            floor_index, self._env.robots[0]
+        )
         trajectory_config = self.config["trajectory"]
-        trajectories = sample_smooth_trajectory_set(
+        trajectories = sample_geodesic_trajectory_set(
             starts,
             mounts,
             world_xy,
@@ -1496,13 +1839,33 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             maximum_linear_speed_mps=float(trajectory_config["maximum_linear_speed_mps"]),
             maximum_angular_speed_radps=float(trajectory_config["maximum_angular_speed_radps"]),
             maximum_acceleration_mps2=float(trajectory_config["maximum_acceleration_mps2"]),
+            plan_segment=plan_segment,
             is_path_traversable=is_path_traversable,
-            maximum_attempts=int(self.config["placement"]["maximum_attempts"]),
+            path_family_weights=trajectory_config["path_family_weights"],
+            initial_heading_tolerance_rad=np.deg2rad(
+                float(trajectory_config["initial_heading_tolerance_deg"])
+            ),
+            line_validation_spacing_m=float(trajectory_config["line_validation_spacing_m"]),
+            smoothing_validation_spacing_m=float(trajectory_config["smoothing_validation_spacing_m"]),
+            smoothing_strengths=trajectory_config["smoothing_strengths"],
+            candidate_pool_size=int(trajectory_config["candidate_pool_size"]),
+            maximum_attempts=int(trajectory_config["sampling_maximum_attempts"]),
+            joint_pool_rounds=int(trajectory_config["joint_pool_rounds"]),
         )
         metrics = {
             "floor_index": floor_index,
             "traversable_candidate_count": int(len(world_xy)),
-            "robots": {trajectory.robot_id: trajectory_kinematic_metrics(trajectory) for trajectory in trajectories},
+            "robots": {
+                trajectory.robot_id: {
+                    **trajectory_kinematic_metrics(trajectory),
+                    "path_family": trajectory.path_family,
+                    "control_waypoints_xy": trajectory.control_waypoints_xy.tolist(),
+                    "planner_geodesic_length_m": float(
+                        trajectory.metadata["planner_geodesic_length_m"]
+                    ),
+                }
+                for trajectory in trajectories
+            },
             "minimum_pairwise_distance_m": min(
                 float(
                     np.linalg.norm(
@@ -1516,6 +1879,52 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             ),
         }
         return trajectories, metrics
+
+    def trajectory_traversability_inspection(self, floor_index: int) -> dict[str, Any]:
+        """Expose the exact robot-eroded planning raster for inspection only."""
+        trav_map = self._require_scene().trav_map
+        eroded = trav_map._erode_trav_map(
+            self._th.clone(trav_map.floor_map[floor_index]),
+            robot=self._env.robots[0],
+        )
+        return {
+            "traversable": (self._native_value(eroded) == 255).astype(np.uint8),
+            "map_resolution_m": float(trav_map.map_resolution),
+            "map_size": int(trav_map.map_size),
+        }
+
+    def place_robots_at_trajectory_frame(
+        self,
+        trajectories: tuple[Trajectory, ...],
+        frame_index: int,
+    ) -> None:
+        """Place all robots at one synchronized frame and refresh their sensors."""
+        by_id = {trajectory.robot_id: trajectory for trajectory in trajectories}
+        robots = {robot.name: robot for robot in self._env.robots}
+        if by_id.keys() != robots.keys():
+            raise SampleRejected(
+                "trajectory_robot_identity_mismatch",
+                {"trajectory_ids": sorted(by_id), "robot_ids": sorted(robots)},
+            )
+        for robot_id, robot in robots.items():
+            planned = by_id[robot_id].base_to_world[frame_index]
+            position, orientation = self._transform_utils.mat2pose(
+                self._th.as_tensor(planned, dtype=self._th.float32)
+            )
+            robot.set_position_orientation(position=position, orientation=orientation)
+            self._restore_final_robot_mast_mount(robot)
+            robot.keep_still()
+        self._og.sim.step_physics()
+        for robot_id, robot in robots.items():
+            planned = by_id[robot_id].base_to_world[frame_index]
+            position, orientation = self._transform_utils.mat2pose(
+                self._th.as_tensor(planned, dtype=self._th.float32)
+            )
+            robot.set_position_orientation(position=position, orientation=orientation)
+            self._restore_final_robot_mast_mount(robot)
+            robot.keep_still()
+        for _ in range(2):
+            self._og.sim.render()
 
     def _reshape_vision_observation(self, sensor: Any, modality: str, value: Any) -> np.ndarray:
         """Restore image axes when Replicator returns a flattened render variable."""
@@ -1649,8 +2058,27 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             if len(sensors) != 1:
                 raise SimulatorUnavailableError(f"Expected one VisionSensor on {robot.name}")
             sensor = sensors[0]
-            observation, info = sensor.get_obs()
             usd_camera_to_world = self._pose_matrix(sensor)
+            observation_sensor = sensor
+            if self._using_final_robot:
+                observation_sensor = self._final_robot_capture_sensor
+                if observation_sensor is None:
+                    raise SimulatorUnavailableError(
+                        "Final-robot capture sensor is unavailable"
+                    )
+                self._configure_final_robot_ego_capture(observation_sensor)
+                sensor_position, sensor_orientation = sensor.get_position_orientation()
+                observation_sensor.set_position_orientation(
+                    position=sensor_position, orientation=sensor_orientation
+                )
+                for _ in range(2):
+                    self._og.sim.render()
+            if self._using_final_robot:
+                observation, info = self._get_final_robot_capture_observation(
+                    observation_sensor
+                )
+            else:
+                observation, info = observation_sensor.get_obs()
             camera_to_world = validate_transform(usd_camera_to_world @ np.diag([1.0, -1.0, -1.0, 1.0]))
             base_to_world = self._pose_matrix(robot)
             camera_to_base = np.linalg.inv(base_to_world) @ camera_to_world
@@ -1668,7 +2096,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             robot_prim_path = str(robot.prim_path)
             result[robot.name] = {
                 "modalities": {
-                    name: self._reshape_vision_observation(sensor, name, value)
+                    name: self._reshape_vision_observation(observation_sensor, name, value)
                     for name, value in observation.items()
                 },
                 "info": info,
@@ -1700,6 +2128,263 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         if simulator.is_playing():
             simulator.update_handles()
 
+    def _initialize_development_bev_sensor(self) -> None:
+        """Create the development BEV render product before any physics snapshot."""
+        if self._development_bev_sensor is not None:
+            return
+        calibration = self.calibrated_floor_bounds(
+            0,
+            float(self.config["bev"]["environment_meters_per_pixel"]),
+            float(self.config["bev"]["bounds_margin_m"]),
+        )
+        sensor_names = self._configured_bev_sensor_names()
+        camera = self._vision_sensor_type(
+            relative_prim_path="/mvwd_persistent_development_bev_camera",
+            name="mvwd_persistent_development_bev_camera",
+            modalities=sensor_names,
+            image_width=calibration.width,
+            image_height=calibration.height,
+            clipping_range=(0.01, 100.0),
+        )
+        camera.load(None)
+        self._configure_bev_camera(camera, calibration)
+        catalog = self.object_catalog()
+        top_z = max(
+            (obj.bbox_max_world[2] for obj in catalog),
+            default=calibration.floor_z + 3.0,
+        )
+        xmin, ymin, xmax, ymax = calibration.world_bounds
+        camera.set_position_orientation(
+            position=self._th.tensor(
+                [(xmin + xmax) / 2, (ymin + ymax) / 2, top_z + 2.0]
+            ),
+            orientation=self._th.tensor([0.0, 0.0, 0.0, 1.0]),
+        )
+        camera.initialize()
+        self._refresh_physics_handles_after_sensor_edit()
+        for _ in range(4):
+            self._og.sim.render()
+        self._development_bev_sensor = camera
+        self._runtime_findings["development_bev_sensor"] = {
+            "backend": "persistent_pre_snapshot_vision_sensor+numpy_nearest_resample",
+            "resolution": [calibration.width, calibration.height],
+            "modalities": sensor_names,
+        }
+
+    def _attach_final_robot_fast_instance_annotator(self, camera: Any) -> None:
+        """Attach the raw renderer AOV without TokenMap or InstanceMapping."""
+        registry = self._lazy.omni.replicator.core.AnnotatorRegistry
+        annotator_name = "mvwd_raw_instance_segmentation"
+        if annotator_name not in registry._annotators:
+            registry.register_annotator_from_aov(
+                aov="InstanceSegmentationSD",
+                name=annotator_name,
+                output_data_type=np.uint32,
+                output_channels=1,
+            )
+        with self._og.sim.editing_usd():
+            annotator = registry.get_annotator(annotator_name)
+            annotator.attach([camera._render_product])
+        self._final_robot_fast_instance_annotator = annotator
+        self._runtime_findings["final_robot_raw_instance_backend"] = {
+            "annotator": annotator_name,
+            "aov": "InstanceSegmentationSD",
+            "mapping_graph_dependencies": [],
+        }
+
+    def _detach_final_robot_fast_instance_annotator(self, camera: Any) -> None:
+        annotator = self._final_robot_fast_instance_annotator
+        if annotator is None:
+            return
+        with self._og.sim.editing_usd():
+            annotator.detach(camera._render_product)
+        self._final_robot_fast_instance_annotator = None
+
+    def _final_robot_renderer_labels(
+        self,
+    ) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
+        """Map leaf renderer IDs to semantic parent paths and classes."""
+        if self._syntheticdata_helpers is None:
+            raise SimulatorUnavailableError(
+                "omni.syntheticdata helpers are unavailable"
+            )
+        mappings = self._syntheticdata_helpers.get_instance_mappings()
+        rows = sorted(
+            mappings,
+            key=lambda row: str(row["name"]).count("/"),
+            reverse=True,
+        )
+        id_to_path: dict[str, str] = {"0": "BACKGROUND"}
+        id_to_semantic: dict[str, dict[str, str]] = {
+            "0": {"class": "background"}
+        }
+        for row in rows:
+            path = str(row["name"])
+            semantic_label = str(row["semanticLabel"]).strip().lower()
+            if not semantic_label:
+                semantic_label = "unlabelled"
+            instance_ids = row["instanceIds"]
+            if instance_ids is None:
+                continue
+            for renderer_id in instance_ids:
+                key = str(int(renderer_id))
+                # The deepest semantically-labelled ancestor is the closest
+                # object identity for a leaf renderer instance.
+                if key not in id_to_path:
+                    id_to_path[key] = path
+                    id_to_semantic[key] = {"class": semantic_label}
+        self._runtime_findings["final_robot_renderer_mapping"] = {
+            "semantic_parent_count": int(len(mappings)),
+            "renderer_id_count": len(id_to_path),
+            "source": "omni.syntheticdata.helpers.get_instance_mappings",
+        }
+        return id_to_path, id_to_semantic
+
+    def _final_robot_segmentation_observation(
+        self, camera: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Build OG-compatible semantic and instance masks from renderer IDs."""
+        annotator = self._final_robot_fast_instance_annotator
+        if annotator is None:
+            raise SimulatorUnavailableError(
+                "Final-robot fast instance annotator is unavailable"
+            )
+        raw = annotator.get_data(device=self._og.sim.device)
+        renderer_ids = raw["data"] if isinstance(raw, dict) else raw
+        if self._og.sim.device == "cpu":
+            renderer_ids = camera._preprocess_cpu_obs(
+                renderer_ids, "seg_instance_id"
+            )
+        else:
+            renderer_ids = camera._preprocess_gpu_obs(
+                renderer_ids, "seg_instance_id"
+            )
+        id_to_path, id_to_semantic = self._final_robot_renderer_labels()
+        for renderer_id in self._th.unique(renderer_ids).tolist():
+            key = str(int(renderer_id))
+            id_to_path.setdefault(key, "UNLABELLED")
+            id_to_semantic.setdefault(key, {"class": "unlabelled"})
+        instance, instance_info = camera._remap_instance_segmentation(
+            renderer_ids.clone(), dict(id_to_path), id=True
+        )
+        semantic, semantic_info = camera._remap_semantic_segmentation(
+            renderer_ids.clone(), id_to_semantic
+        )
+        return (
+            {
+                "seg_semantic": semantic,
+                "seg_instance": instance,
+                "seg_instance_id": instance,
+            },
+            {
+                "seg_semantic": semantic_info,
+                "seg_instance": instance_info,
+                "seg_instance_id": instance_info,
+            },
+        )
+
+    def _get_final_robot_capture_observation(
+        self, camera: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        observation, info = camera.get_obs()
+        segmentation, segmentation_info = (
+            self._final_robot_segmentation_observation(camera)
+        )
+        observation.update(segmentation)
+        info.update(segmentation_info)
+        return observation, info
+
+    def _initialize_final_robot_capture_sensor(self) -> None:
+        """Create one stable world-space render graph before the first snapshot."""
+        if not self._using_final_robot:
+            return
+        configured = [
+            name
+            for name in self._configured_bev_sensor_names()
+            if not name.startswith("seg_")
+        ]
+        camera_config = self.config["camera"]
+        aperture = 20.995
+        focal = aperture / (
+            2.0 * np.tan(np.deg2rad(float(camera_config["hfov_deg"])) / 2.0)
+        )
+        camera = self._vision_sensor_type(
+            relative_prim_path="/mvwd_persistent_final_capture_camera",
+            name="mvwd_persistent_final_capture_camera",
+            modalities=configured,
+            image_width=int(camera_config["rgb_width"]),
+            image_height=int(camera_config["rgb_height"]),
+            focal_length=float(focal),
+            horizontal_aperture=aperture,
+            clipping_range=(camera_config["near_m"], camera_config["far_m"]),
+        )
+        camera.load(None)
+        attached = next(
+            sensor
+            for sensor in self._env.robots[0].sensors.values()
+            if isinstance(sensor, self._vision_sensor_type)
+        )
+        position, orientation = attached.get_position_orientation()
+        camera.set_position_orientation(position=position, orientation=orientation)
+        camera.initialize()
+        self._attach_final_robot_fast_instance_annotator(camera)
+        warmup_ticks = 4
+        for _ in range(warmup_ticks):
+            self._og.sim.render()
+        self._final_robot_capture_sensor = camera
+        observation, _ = self._get_final_robot_capture_observation(camera)
+        required = set(configured) | {
+            "seg_semantic",
+            "seg_instance",
+            "seg_instance_id",
+        }
+        absent = sorted(required - set(observation))
+        if absent:
+            raise SimulatorUnavailableError(
+                f"Final-robot capture warmup is missing modalities: {absent}"
+            )
+        self._runtime_findings["final_robot_capture_graph_initialization"] = {
+            "stage": "pre_snapshot",
+            "backend": "persistent_world_space_vision_sensor+renderer_id_fast",
+            "modalities": sorted(required),
+            "warmup_render_ticks": warmup_ticks,
+            "update_handles_called": False,
+        }
+
+    def _rebuild_final_robot_capture_sensor(self) -> None:
+        """Rebind Replicator before refreshing furniture/system physics handles."""
+        camera = self._final_robot_capture_sensor
+        if camera is None:
+            return
+        self._detach_final_robot_fast_instance_annotator(camera)
+        camera.remove()
+        self._final_robot_capture_sensor = None
+        rebuild_count = int(
+            self._runtime_findings.get("final_robot_capture_graph_rebuild_count", 0)
+        )
+        self._initialize_final_robot_capture_sensor()
+        self._runtime_findings["final_robot_capture_graph_rebuild_count"] = (
+            rebuild_count + 1
+        )
+
+    def _configure_final_robot_ego_capture(self, camera: Any) -> None:
+        """Configure the persistent sensor to match the physical mast camera."""
+        camera_config = self.config["camera"]
+        aperture = 20.995
+        focal = aperture / (
+            2.0 * np.tan(np.deg2rad(float(camera_config["hfov_deg"])) / 2.0)
+        )
+        with self._og.sim.editing_usd():
+            usd_camera = self._lazy.pxr.UsdGeom.Camera(camera.prim)
+            usd_camera.GetProjectionAttr().Set(
+                self._lazy.pxr.UsdGeom.Tokens.perspective
+            )
+            usd_camera.GetFocalLengthAttr().Set(float(focal))
+            usd_camera.GetHorizontalApertureAttr().Set(aperture)
+            usd_camera.GetClippingRangeAttr().Set(
+                self._lazy.pxr.Gf.Vec2f(camera_config["near_m"], camera_config["far_m"])
+            )
+
     def _prepare_bev_sensor(
         self,
         *,
@@ -1716,41 +2401,52 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         is restored: SyntheticData can retain an invalid on-demand graph and
         segfault on the next render. The simulator viewer camera predates all
         scene snapshots, so reuse its render product for final-robot BEV data.
+        Development runs similarly reuse one sensor initialized before the
+        first snapshot without changing its graph topology.
         """
         if self._using_final_robot:
-            camera = self._og.sim.viewer_camera
+            camera = self._final_robot_capture_sensor
             if camera is None:
                 raise SimulatorUnavailableError(
-                    "Final-robot BEV rendering requires OmniGibson's viewer camera"
+                    "Final-robot capture sensor was not initialized before snapshot"
                 )
-            modality_order = {
-                "seg_semantic": 0,
-                "seg_instance": 1,
-                "seg_instance_id": 2,
-                "depth_linear": 3,
-                "normal": 4,
-                "rgb": 5,
+            graph_modalities = set(sensor_names) - {
+                "seg_semantic",
+                "seg_instance",
+                "seg_instance_id",
             }
             missing_modalities = sorted(
-                set(sensor_names) - set(camera.modalities),
-                key=lambda name: (modality_order.get(name, 100), name),
+                graph_modalities - set(camera.modalities)
             )
-            for modality in missing_modalities:
-                camera.add_modality(modality)
             if missing_modalities:
-                self._runtime_findings.setdefault(
-                    "final_robot_bev_reattached_modalities", []
-                ).append(missing_modalities)
-            camera.clipping_range = [0.01, 100.0]
-            self._refresh_physics_handles_after_sensor_edit()
+                raise SimulatorUnavailableError(
+                    "Final-robot capture graph is missing modalities: "
+                    f"{missing_modalities}"
+                )
+            # VisionSensor.clipping_range toggles visibility and calls render().
+            # Direct USD writes avoid hidden graph ticks while robots move.
+            with self._og.sim.editing_usd():
+                self._lazy.pxr.UsdGeom.Camera(camera.prim).GetClippingRangeAttr().Set(
+                    self._lazy.pxr.Gf.Vec2f(0.01, 100.0)
+                )
             self._runtime_findings["final_robot_bev_sensor_backend"] = (
-                "omnigibson.sim.viewer_camera+numpy_nearest_resample"
+                "persistent_world_space_vision_sensor+numpy_nearest_resample"
             )
             self._runtime_findings["final_robot_bev_capture_resolution"] = [
                 int(camera.image_width),
                 int(camera.image_height),
             ]
             self._runtime_findings["final_robot_bev_target_resolution"] = [width, height]
+            return camera, False, True
+        if self._development_bev_sensor is not None:
+            camera = self._development_bev_sensor
+            missing_modalities = sorted(set(sensor_names) - set(camera.modalities))
+            if missing_modalities:
+                raise SimulatorUnavailableError(
+                    "Persistent development BEV sensor is missing modalities: "
+                    f"{missing_modalities}"
+                )
+            self._runtime_findings["development_bev_target_resolution"] = [width, height]
             return camera, False, True
         camera = self._vision_sensor_type(
             relative_prim_path=f"/mvwd_{sensor_role}_bev_camera_{floor_index}",
@@ -1763,15 +2459,11 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         return camera, True, False
 
     def _release_final_robot_bev_modalities(self, camera: Any) -> None:
-        """Retain viewer annotators until shutdown to keep Replicator graphs valid."""
-        if not self._using_final_robot or camera is not self._og.sim.viewer_camera:
+        """Keep the pre-snapshot final capture graph intact for the process lifetime."""
+        if not self._using_final_robot or camera is not self._final_robot_capture_sensor:
             return
-        # The simulator-owned viewer prim predates and survives serialized
-        # physics snapshots. Detaching and later reattaching its annotators
-        # leaves stale SyntheticData graph nodes and intermittently segfaults.
-        # Keep this one stable render product attached for the process lifetime.
-        self._runtime_findings["final_robot_bev_modalities_retained"] = sorted(
-            set(camera.modalities) & set(self._final_robot_bev_added_modalities)
+        self._runtime_findings["final_robot_capture_modalities_retained"] = sorted(
+            camera.modalities
         )
 
     def render_floor_bev(
@@ -1785,7 +2477,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         }
         backend_names = {
             "semantic": "seg_semantic",
-            "instance": "seg_instance",
+            "instance": "seg_instance_id" if self._using_final_robot else "seg_instance",
             "instance_id": "seg_instance_id",
         }
         sensor_names = [backend_names.get(name, name) for name in sensor_modalities]
@@ -1799,13 +2491,36 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             )
         sensor_role = "world" if include_robots else "environment"
         hidden: list[tuple[Any, bool]] = []
+        displaced_robots: list[tuple[Any, Any, Any]] = []
         camera: Any = None
         created_camera = False
         simulator_owned_camera = False
         try:
             if not include_robots:
-                hidden.extend(self._set_visible(list(self._env.robots), False))
-            ceilings = [obj for obj in scene.objects if str(getattr(obj, "category", "")) in {"ceilings", "roof"}]
+                xmin, ymin, xmax, ymax = calibration.world_bounds
+                span = max(xmax - xmin, ymax - ymin)
+                for robot_index, robot in enumerate(self._env.robots):
+                    position, orientation = robot.get_position_orientation()
+                    displaced_robots.append(
+                        (robot, position.detach().clone(), orientation.detach().clone())
+                    )
+                    parking_offset = span + 10.0 + 5.0 * robot_index
+                    robot.set_position_orientation(
+                        position=self._th.tensor(
+                            [xmax + parking_offset, ymax + parking_offset, float(position[2])],
+                            dtype=position.dtype,
+                            device=position.device,
+                        ),
+                        orientation=orientation,
+                    )
+                self._runtime_findings["environment_bev_robot_suppression"] = (
+                    "out_of_frustum_pose+restored"
+                )
+            ceilings = [] if not self._using_final_robot else [
+                obj
+                for obj in scene.objects
+                if str(getattr(obj, "category", "")) in {"ceilings", "roof"}
+            ]
             hidden.extend(self._set_visible(ceilings, False))
             camera, created_camera, simulator_owned_camera = self._prepare_bev_sensor(
                 sensor_role=sensor_role,
@@ -1833,9 +2548,19 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             if created_camera:
                 camera.initialize()
                 self._refresh_physics_handles_after_sensor_edit()
-            for _ in range(4):
+            # Flush enough frames for out-of-frustum robot poses to reach every
+            # annotator. The visible instance set was stabilized at scene load,
+            # so these ticks no longer invalidate instance mapping.
+            render_ticks = 4
+            for _ in range(render_ticks):
                 self._og.sim.render()
-            observation, info = camera.get_obs()
+            self._runtime_findings["bev_render_ticks_per_capture"] = render_ticks
+            if self._using_final_robot:
+                observation, info = self._get_final_robot_capture_observation(
+                    camera
+                )
+            else:
+                observation, info = camera.get_obs()
             arrays: dict[str, np.ndarray] = {}
             for public_name in sensor_modalities:
                 backend_name = backend_names.get(public_name, public_name)
@@ -1884,6 +2609,11 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 },
             )
         finally:
+            for robot, position, orientation in reversed(displaced_robots):
+                robot.set_position_orientation(
+                    position=position,
+                    orientation=orientation,
+                )
             for obj, was_visible in reversed(hidden):
                 obj.visible = was_visible
             if camera is not None and simulator_owned_camera:
@@ -1917,7 +2647,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         }
         backend_names = {
             "semantic": "seg_semantic",
-            "instance": "seg_instance",
+            "instance": "seg_instance_id" if self._using_final_robot else "seg_instance",
             "instance_id": "seg_instance_id",
         }
         sensor_names = sorted(
@@ -1928,8 +2658,10 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             | ({"depth_linear"} if {"height", "occupancy"} & set(world_modalities) else set())
         )
         scene = self._require_scene()
-        ceilings = [
-            obj for obj in scene.objects if str(getattr(obj, "category", "")) in {"ceilings", "roof"}
+        ceilings = [] if not self._using_final_robot else [
+            obj
+            for obj in scene.objects
+            if str(getattr(obj, "category", "")) in {"ceilings", "roof"}
         ]
         floors = [obj for obj in scene.objects if str(getattr(obj, "category", "")) == "floors"]
         self._preflight_trajectory_contacts(by_id, robots, floors, frames)
@@ -1982,6 +2714,25 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             if created_camera:
                 camera.initialize()
                 self._refresh_physics_handles_after_sensor_edit()
+            # Prime Replicator with trajectory frame 0, not the unrelated
+            # placement pose that preceded rollout playback.
+            for robot_id, robot in robots.items():
+                planned = by_id[robot_id].base_to_world[0]
+                position, orientation = self._transform_utils.mat2pose(
+                    self._th.as_tensor(planned, dtype=self._th.float32)
+                )
+                robot.set_position_orientation(position=position, orientation=orientation)
+                self._restore_final_robot_mast_mount(robot)
+                robot.keep_still()
+            self._og.sim.step_physics()
+            for robot_id, robot in robots.items():
+                planned = by_id[robot_id].base_to_world[0]
+                position, orientation = self._transform_utils.mat2pose(
+                    self._th.as_tensor(planned, dtype=self._th.float32)
+                )
+                robot.set_position_orientation(position=position, orientation=orientation)
+                self._restore_final_robot_mast_mount(robot)
+                robot.keep_still()
             for _ in range(2):
                 self._og.sim.render()
             for frame_index in range(frames):
@@ -2021,7 +2772,12 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                         float(rotation_angle(actual, planned)),
                     )
                 self._og.sim.render()
-                world_observation, world_info = camera.get_obs()
+                if self._using_final_robot:
+                    world_observation, world_info = (
+                        self._get_final_robot_capture_observation(camera)
+                    )
+                else:
+                    world_observation, world_info = camera.get_obs()
                 frame_arrays: dict[str, np.ndarray] = {}
                 for public_name in sensor_modalities:
                     backend_name = backend_names.get(public_name, public_name)
@@ -2246,7 +3002,10 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             }
             best_orientation = min(
                 world_bev_orientation_scores,
-                key=world_bev_orientation_scores.get,
+                key=lambda name: (
+                    world_bev_orientation_max_errors[name],
+                    world_bev_orientation_scores[name],
+                ),
             )
             world_bev_flip_axes = flip_candidates[best_orientation]
             if world_bev_flip_axes:
@@ -2295,6 +3054,8 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 "orientation": best_orientation,
                 "flip_axes": list(world_bev_flip_axes),
                 "scores_m": world_bev_orientation_scores,
+                "maximum_errors_m": world_bev_orientation_max_errors,
+                "worst_samples": world_bev_orientation_worst_samples,
                 "frame_count": len(robot_mask_diagnostics),
             }
             position_tolerance = float(self.config["trajectory"]["validation_position_tolerance_m"])
@@ -2321,6 +3082,9 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                         "minimum_depth_valid_ratio": minimum_depth_valid_ratio,
                         "minimum_robot_pixels": minimum_robot_pixels,
                         "maximum_robot_mask_error_m": maximum_robot_mask_error,
+                        "world_bev_axis_calibration": self._runtime_findings[
+                            "world_bev_axis_calibration"
+                        ],
                         "robot_instance_ids": {
                             robot_id: sorted(raw_ids)
                             for robot_id, raw_ids in robot_instance_ids.items()
