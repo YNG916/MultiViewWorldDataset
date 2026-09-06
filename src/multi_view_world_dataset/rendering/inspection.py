@@ -38,21 +38,26 @@ def save_trajectory_inspection(
     mask = np.asarray(traversability["traversable"], dtype=bool)
     raster = np.full((*mask.shape, 3), 35, dtype=np.uint8)
     raster[mask] = (225, 225, 225)
+    # OmniGibson traversability rows increase with world Y, while image rows
+    # increase downwards. Flip the native map to match RGB BEV: +X right, +Y up.
+    raster = np.flipud(raster).copy()
     scale = max(1, int(np.ceil(700 / max(mask.shape))))
     base = Image.fromarray(raster).resize(
         (mask.shape[1] * scale, mask.shape[0] * scale),
         resample=Image.Resampling.NEAREST,
     )
-    banner_height = 82
+    banner_height = 103
     canvas = Image.new("RGB", (base.width, base.height + banner_height), (248, 248, 248))
     canvas.paste(base, (0, banner_height))
     draw = ImageDraw.Draw(canvas)
     resolution = float(traversability["map_resolution_m"])
-    map_size = float(traversability["map_size"])
+    map_height, map_width = mask.shape
 
     def pixel(point: np.ndarray) -> tuple[float, float]:
-        column = (float(point[0]) / resolution + map_size / 2.0) * scale
-        row = (float(point[1]) / resolution + map_size / 2.0) * scale + banner_height
+        native_column = float(point[0]) / resolution + map_width / 2.0
+        native_row = float(point[1]) / resolution + map_height / 2.0
+        column = native_column * scale
+        row = (map_height - 1.0 - native_row) * scale + banner_height
         return column, row
 
     colors = ((220, 45, 45), (35, 105, 220), (25, 155, 80))
@@ -75,20 +80,22 @@ def save_trajectory_inspection(
                 trajectory.base_to_world[frame_index, 0, 0],
             ))
             arrow_length = max(10, 6 * scale)
-            tip = (u + arrow_length * np.cos(yaw), v + arrow_length * np.sin(yaw))
+            # Positive world Y points upward, i.e. toward decreasing image row.
+            tip = (u + arrow_length * np.cos(yaw), v - arrow_length * np.sin(yaw))
             draw.line((u, v, *tip), fill=(0, 0, 0), width=max(1, scale))
             draw.ellipse((tip[0] - 2, tip[1] - 2, tip[0] + 2, tip[1] + 2), fill=(0, 0, 0))
         draw.text((start_u + radius + 2, start_v - radius), f"{trajectory.robot_id} {trajectory.path_family}", fill=color)
 
     connected_fraction = float(temporal_overlap["connected_fraction"])
     maximum_isolation = temporal_overlap["maximum_consecutive_isolated_keyframes"]
-    draw.text((10, 8), "Robot-eroded traversability | circle=start square=end yellow=intermediate waypoint", fill=(0, 0, 0))
+    draw.text((10, 8), "Robot-eroded traversability (not RGB BEV) | +X right, +Y up", fill=(0, 0, 0))
+    draw.text((10, 29), "circle=start square=end yellow=intermediate waypoint arrows=planned heading", fill=(0, 0, 0))
     draw.text(
-        (10, 29),
+        (10, 50),
         f"temporal overlap connected: {temporal_overlap['connected_keyframe_count']}/{temporal_overlap['keyframe_count']} ({connected_fraction:.3f})",
         fill=(0, 0, 0),
     )
-    draw.text((10, 50), f"maximum consecutive isolated keyframes: {maximum_isolation}", fill=(0, 0, 0))
+    draw.text((10, 71), f"maximum consecutive isolated keyframes: {maximum_isolation}", fill=(0, 0, 0))
     path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(path)
 

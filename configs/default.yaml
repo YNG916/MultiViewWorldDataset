@@ -31,6 +31,8 @@ camera:
   near_m: 0.1
   far_m: 15.0
   heights_m: [0.8, 1.0, 1.2, 1.4]
+  multimodal_alignment_keyframe_count: 7
+  minimum_multimodal_alignment_fraction: 0.75
 
 bev:
   environment_meters_per_pixel: 0.02

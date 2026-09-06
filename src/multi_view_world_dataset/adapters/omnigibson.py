@@ -30,6 +30,128 @@ from multi_view_world_dataset.schema.records import (
 from multi_view_world_dataset.utils.runtime import RuntimePaths, installed_versions
 
 
+def _resize_nearest(values: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    """Nearest-resize the first two axes without adding an image dependency."""
+    array = np.asarray(values)
+    if array.shape[:2] == shape:
+        return array
+    rows = np.rint(np.linspace(0, array.shape[0] - 1, shape[0])).astype(np.int64)
+    columns = np.rint(np.linspace(0, array.shape[1] - 1, shape[1])).astype(np.int64)
+    return array[rows[:, None], columns[None, :]]
+
+
+def _continuous_edge_magnitude(values: np.ndarray) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim == 2:
+        array = array[..., None]
+    elif array.ndim != 3:
+        raise ValueError(f"Expected 2D or channel-last image, got {array.shape}")
+    squared = np.zeros(array.shape[:2], dtype=np.float64)
+    for channel in range(array.shape[-1]):
+        plane = array[..., channel]
+        finite = np.isfinite(plane)
+        fill = float(np.median(plane[finite])) if np.any(finite) else 0.0
+        plane = np.where(finite, plane, fill)
+        gradient_y, gradient_x = np.gradient(plane)
+        squared += gradient_x * gradient_x + gradient_y * gradient_y
+    return np.sqrt(squared)
+
+
+def _label_edge_mask(values: np.ndarray) -> np.ndarray:
+    labels = np.asarray(values).squeeze()
+    if labels.ndim != 2:
+        raise ValueError(f"Expected a 2D label image, got {labels.shape}")
+    edges = np.zeros(labels.shape, dtype=bool)
+    horizontal = labels[:, 1:] != labels[:, :-1]
+    vertical = labels[1:, :] != labels[:-1, :]
+    edges[:, 1:] |= horizontal
+    edges[:, :-1] |= horizontal
+    edges[1:, :] |= vertical
+    edges[:-1, :] |= vertical
+    return edges.astype(np.float64)
+
+
+def _edge_correlation(first: np.ndarray, second: np.ndarray) -> float:
+    left = np.asarray(first, dtype=np.float64).ravel()
+    right = np.asarray(second, dtype=np.float64).ravel()
+    left -= left.mean()
+    right -= right.mean()
+    denominator = float(np.linalg.norm(left) * np.linalg.norm(right))
+    return float(left @ right / denominator) if denominator > 0.0 else 0.0
+
+
+def robot_multimodal_alignment_metrics(
+    robot_frames: dict[str, dict[str, Any]],
+    *,
+    keyframe_count: int,
+) -> dict[str, Any]:
+    """Check that every image modality belongs to the same robot viewpoint."""
+    robot_ids = sorted(robot_frames)
+    if not robot_ids:
+        raise ValueError("robot_frames must not be empty")
+    frame_count = len(robot_frames[robot_ids[0]]["depth_linear"])
+    if frame_count < 1:
+        raise ValueError("robot_frames must contain at least one frame")
+    keyframes = np.unique(
+        np.rint(np.linspace(0, frame_count - 1, max(1, keyframe_count))).astype(int)
+    )
+    edge_builders: dict[str, Callable[[np.ndarray], np.ndarray]] = {
+        "rgb": lambda value: _continuous_edge_magnitude(np.asarray(value)[..., :3]),
+        "semantic": _label_edge_mask,
+        "instance": _label_edge_mask,
+        "normal": lambda value: _continuous_edge_magnitude(np.asarray(value)[..., :3]),
+    }
+    results: dict[str, Any] = {}
+    for modality, edge_builder in edge_builders.items():
+        own_best_count = 0
+        own_scores: list[float] = []
+        margins: list[float] = []
+        assignments: dict[str, dict[str, str]] = {}
+        for frame_index in keyframes:
+            depth_edges = {}
+            for robot_id in robot_ids:
+                depth = np.asarray(
+                    robot_frames[robot_id]["depth_linear"][int(frame_index)]
+                ).squeeze()
+                depth_edges[robot_id] = _continuous_edge_magnitude(depth)
+            target_shape = next(iter(depth_edges.values())).shape
+            frame_assignments: dict[str, str] = {}
+            for robot_id in robot_ids:
+                value = np.asarray(robot_frames[robot_id][modality][int(frame_index)])
+                value = _resize_nearest(value, target_shape)
+                target_edge = edge_builder(value)
+                scores = [
+                    _edge_correlation(target_edge, depth_edges[candidate])
+                    for candidate in robot_ids
+                ]
+                own_index = robot_ids.index(robot_id)
+                own_score = scores[own_index]
+                best_index = int(np.argmax(scores))
+                best_score = scores[best_index]
+                other_scores = [
+                    score for index, score in enumerate(scores) if index != own_index
+                ]
+                best_other = max(other_scores) if other_scores else own_score
+                own_best_count += int(own_score >= best_score - 1.0e-12)
+                own_scores.append(own_score)
+                margins.append(own_score - best_other)
+                frame_assignments[robot_id] = robot_ids[best_index]
+            assignments[str(int(frame_index))] = frame_assignments
+        comparison_count = len(keyframes) * len(robot_ids)
+        results[modality] = {
+            "own_view_best_count": own_best_count,
+            "comparison_count": comparison_count,
+            "own_view_best_fraction": own_best_count / comparison_count,
+            "mean_own_edge_correlation": float(np.mean(own_scores)),
+            "mean_own_minus_best_other_correlation": float(np.mean(margins)),
+            "best_view_assignments": assignments,
+        }
+    return {
+        "keyframe_indices": [int(index) for index in keyframes],
+        "modalities": results,
+    }
+
+
 class OmniGibsonAdapter(BaseSimulatorAdapter):
     """OmniGibson 3.9 adapter. Imports Kit only when :meth:`start` is called."""
 
@@ -2099,6 +2221,19 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 self._runtime_findings["final_robot_capture_settle_render_ticks"] = (
                     capture_settle_render_ticks
                 )
+                # RGB / depth from the robot-owned mounted sensor are current,
+                # but Replicator AOVs on the movable shared sensor lag by one
+                # observation after a pose change. Render ticks alone do not flush it.
+                self._get_final_robot_capture_observation(observation_sensor)
+                aov_flush_render_ticks = 4
+                for _ in range(aov_flush_render_ticks):
+                    self._og.sim.render()
+                self._runtime_findings["final_robot_per_pose_aov_flush"] = (
+                    "discard_full_observation_then_render"
+                )
+                self._runtime_findings[
+                    "final_robot_per_pose_aov_flush_render_ticks"
+                ] = aov_flush_render_ticks
             if self._using_final_robot:
                 observation, info = self._get_final_robot_capture_observation(
                     observation_sensor
@@ -3164,6 +3299,27 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                     minimum_depth_valid_ratio = min(
                         minimum_depth_valid_ratio, float(valid.mean())
                     )
+            multimodal_alignment = robot_multimodal_alignment_metrics(
+                robot_frames,
+                keyframe_count=int(
+                    self.config["camera"].get(
+                        "multimodal_alignment_keyframe_count", 7
+                    )
+                ),
+            )
+            minimum_multimodal_alignment_fraction = float(
+                self.config["camera"].get(
+                    "minimum_multimodal_alignment_fraction", 0.75
+                )
+            )
+            multimodal_alignment_passed = all(
+                metrics["own_view_best_fraction"]
+                >= minimum_multimodal_alignment_fraction
+                for metrics in multimodal_alignment["modalities"].values()
+            )
+            self._runtime_findings["robot_multimodal_view_alignment"] = (
+                multimodal_alignment
+            )
             flip_candidates = {
                 "identity": (),
                 "horizontal": (1,),
@@ -3238,6 +3394,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 "camera_pose_matches_trajectory": maximum_camera_pose_error <= position_tolerance,
                 "collision_free": not collision_frames,
                 "valid_depth": minimum_depth_valid_ratio >= 0.50,
+                "robot_multimodal_view_alignment": multimodal_alignment_passed,
                 "world_bev_each_robot_visible": minimum_robot_pixels >= 4,
                 "world_bev_robot_mask_projection": maximum_robot_mask_error <= mask_tolerance,
                 "world_bev_camera_pose_stable": (
@@ -3259,6 +3416,10 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                         "maximum_camera_pose_error": maximum_camera_pose_error,
                         "collision_frames": sorted(set(collision_frames)),
                         "minimum_depth_valid_ratio": minimum_depth_valid_ratio,
+                        "robot_multimodal_alignment": multimodal_alignment,
+                        "minimum_multimodal_alignment_fraction": (
+                            minimum_multimodal_alignment_fraction
+                        ),
                         "minimum_robot_pixels": minimum_robot_pixels,
                         "maximum_robot_mask_error_m": maximum_robot_mask_error,
                         "maximum_world_bev_camera_pose_error": (
@@ -3305,6 +3466,10 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                     "maximum_base_pose_error": maximum_base_pose_error,
                     "maximum_camera_pose_error": maximum_camera_pose_error,
                     "minimum_depth_valid_ratio": minimum_depth_valid_ratio,
+                    "robot_multimodal_alignment": multimodal_alignment,
+                    "minimum_multimodal_alignment_fraction": (
+                        minimum_multimodal_alignment_fraction
+                    ),
                     "minimum_robot_pixels": int(minimum_robot_pixels),
                     "maximum_robot_mask_error_m": maximum_robot_mask_error,
                     "maximum_world_bev_camera_pose_error": (
