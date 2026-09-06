@@ -2635,6 +2635,27 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 self._og.sim.render()
             self._runtime_findings["bev_render_ticks_per_capture"] = render_ticks
             if self._using_final_robot:
+                # OmniGibson 3.9.2 does not flush a projection / pose change on
+                # this persistent Replicator render product through bare render
+                # ticks. The first observation can therefore still be the prior
+                # robot-perspective view even though USD reports orthographic.
+                # Consume that stale observation, then render the authoritative
+                # top-down frame before saving any modality.
+                self._get_final_robot_capture_observation(camera)
+                projection_flush_render_ticks = 4
+                for _ in range(projection_flush_render_ticks):
+                    self._og.sim.render()
+                flushes = int(
+                    self._runtime_findings.get(
+                        "environment_bev_projection_flush_count", 0
+                    )
+                )
+                self._runtime_findings["environment_bev_projection_flush_count"] = (
+                    flushes + 1
+                )
+                self._runtime_findings[
+                    "environment_bev_projection_flush_render_ticks"
+                ] = projection_flush_render_ticks
                 observation, info = self._get_final_robot_capture_observation(
                     camera
                 )
@@ -3225,7 +3246,8 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 ),
                 "world_bev_projection_orthographic": world_bev_projection_orthographic,
                 "world_bev_occupancy_not_saturated": (
-                    maximum_world_bev_occupancy_fraction < 0.98
+                    maximum_world_bev_occupancy_fraction
+                    < float(self.config["bev"]["maximum_occupancy_fraction"])
                 ),
             }
             if not all(checks.values()):
@@ -3331,4 +3353,3 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
 
     def runtime_report(self) -> dict[str, Any]:
         return dict(self._runtime_findings)
-

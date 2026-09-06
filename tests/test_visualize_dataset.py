@@ -1,10 +1,12 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from visualize_dataset import (
     Source,
     _categorical,
+    _validate_bev,
     convert_source,
     discover_episodes,
     discover_sources,
@@ -29,6 +31,17 @@ def test_visualizers_handle_each_modality_deterministically():
 
     normals = np.array([[[-1.0, 0.0, 1.0, 1.0]]], dtype=np.float32)
     assert np.array_equal(visualize_frame("normal", normals)[0, 0], [0, 127, 255])
+
+
+def test_static_environment_bev_rejects_stale_perspective_capture(tmp_path: Path):
+    path = tmp_path / "environment_base.npz"
+    np.savez_compressed(
+        path,
+        **{"floor_00/occupancy": np.ones((12, 16), dtype=np.uint8)},
+    )
+    with np.load(path, allow_pickle=False) as data:
+        with pytest.raises(ValueError, match="stale perspective-camera capture bug"):
+            _validate_bev(data, 0.98, temporal=False)
 
 
 def test_episode_and_source_discovery_includes_environment_and_all_views(tmp_path: Path):

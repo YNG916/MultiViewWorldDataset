@@ -36,6 +36,7 @@ bev:
   environment_meters_per_pixel: 0.02
   world_meters_per_pixel: 0.04
   bounds_margin_m: 0.5
+  maximum_occupancy_fraction: 0.98
   robot_mask_projection_tolerance_m: 0.75
   modalities: [rgb, depth_linear, height, normal, semantic, instance, instance_id, occupancy]
   world_modalities: [rgb, depth_linear, height, semantic, instance, instance_id, occupancy]
@@ -113,4 +114,3 @@ robot:
   development_model: turtlebot
   final_model: mobile_sensor_robot_v1
   use_final_robot: true
-

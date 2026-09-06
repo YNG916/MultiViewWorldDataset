@@ -84,11 +84,25 @@ def discover_sources(episode: Path) -> list[Source]:
             dataset_root / "configurations" / scene_id / configuration_id / "bev" / "environment_base.npz"
         )
         if environment_base.is_file():
-            sources.append(Source("environment_base", environment_base, temporal=False))
+            sources.append(
+                Source(
+                    "environment_base",
+                    environment_base,
+                    temporal=False,
+                    validate_bev=True,
+                )
+            )
 
     environment_after = episode / "bev" / "environment_after.npz"
     if environment_after.is_file():
-        sources.append(Source("environment_after", environment_after, temporal=False))
+        sources.append(
+            Source(
+                "environment_after",
+                environment_after,
+                temporal=False,
+                validate_bev=True,
+            )
+        )
 
     for state in ("before", "after"):
         world = episode / "bev" / f"world_{state}.npz"
@@ -199,20 +213,36 @@ def _modality_name(key: str) -> str | None:
     return leaf if leaf in IMAGE_MODALITIES else None
 
 
-def _validate_world_bev(data: Any, maximum_fraction: float) -> None:
-    if "occupancy" not in data:
-        raise ValueError("world BEV has no occupancy array")
-    occupancy = np.asarray(data["occupancy"])
-    if occupancy.ndim < 3:
-        raise ValueError(f"world BEV occupancy must be TxHxW, got {occupancy.shape}")
-    fractions = np.mean(occupancy > 0, axis=tuple(range(1, occupancy.ndim)))
-    bad = np.flatnonzero(fractions >= maximum_fraction)
-    if bad.size:
-        raise ValueError(
-            "suspicious world BEV: nearly full-frame occupancy at frames "
-            f"{bad[:10].tolist()} (maximum fraction {float(fractions.max()):.4f}); "
-            "this matches the stale perspective-camera capture bug"
-        )
+def _validate_bev(data: Any, maximum_fraction: float, *, temporal: bool) -> None:
+    occupancy_keys = [
+        key for key in data.files if key.rsplit("/", 1)[-1] == "occupancy"
+    ]
+    if not occupancy_keys:
+        raise ValueError("BEV has no occupancy array")
+    for key in occupancy_keys:
+        occupancy = np.asarray(data[key])
+        if occupancy.ndim < 2:
+            raise ValueError(f"BEV occupancy must be HxW or TxHxW, got {occupancy.shape}")
+        if temporal:
+            if occupancy.ndim < 3:
+                raise ValueError(f"temporal BEV occupancy must be TxHxW, got {occupancy.shape}")
+            fractions = np.mean(
+                occupancy > 0, axis=tuple(range(1, occupancy.ndim))
+            )
+        else:
+            fractions = np.asarray([np.mean(occupancy > 0)])
+        bad = np.flatnonzero(fractions >= maximum_fraction)
+        if bad.size:
+            location = (
+                f"frames {bad[:10].tolist()}"
+                if temporal
+                else f"static layer {key}"
+            )
+            raise ValueError(
+                f"suspicious BEV: nearly full-frame occupancy at {location} "
+                f"(maximum fraction {float(fractions.max()):.4f}); this matches "
+                "the stale perspective-camera capture bug"
+            )
 
 
 def _write_png(path: Path, rgb: np.ndarray) -> None:
@@ -389,7 +419,11 @@ def convert_source(
     }
     with np.load(source.path, allow_pickle=False) as data:
         if source.validate_bev and not allow_suspicious_bev:
-            _validate_world_bev(data, maximum_occupancy_fraction)
+            _validate_bev(
+                data,
+                maximum_occupancy_fraction,
+                temporal=source.temporal,
+            )
         keys = [key for key in data.files if _modality_name(key) is not None]
         for key in keys:
             modality = _modality_name(key)

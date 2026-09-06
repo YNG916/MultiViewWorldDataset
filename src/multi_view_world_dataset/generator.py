@@ -62,6 +62,20 @@ def _render_environment_floors(
                 "environment_bev_geometry_failed",
                 {"floor_index": floor_index, "geometry": geometry},
             )
+        occupancy = np.asarray(render.modalities["occupancy"])
+        occupancy_fraction = float(np.mean(occupancy > 0))
+        maximum_occupancy_fraction = float(
+            bev_config["maximum_occupancy_fraction"]
+        )
+        if occupancy_fraction >= maximum_occupancy_fraction:
+            raise SampleRejected(
+                "environment_bev_occupancy_saturated",
+                {
+                    "floor_index": floor_index,
+                    "occupancy_fraction": occupancy_fraction,
+                    "maximum_occupancy_fraction": maximum_occupancy_fraction,
+                },
+            )
         instance_info = render.metadata.get("segmentation_info", {}).get("seg_instance_id", {})
         robot_raw_ids = [
             int(raw_id)
@@ -870,4 +884,3 @@ def generate_dataset(
         raise
     finally:
         adapter.close()
-
