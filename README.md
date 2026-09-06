@@ -47,6 +47,18 @@ Generation writes `generation_status.json` while running, appends structured rej
 atomically finalizes accepted configurations and episodes. Re-running the same command resumes finalized work.
 Pilot/default profiles are refused unless `--allow-large` is supplied; this workflow stops after integration.
 
+Visualize every stored image modality for one episode in a single command:
+
+    source /path/to/behavior_world/activate.sh
+    python visualize_dataset.py /path/to/dataset/episodes/Rs_int/config_000/episode_000
+
+The default output is episode_000/inspection/all_modalities/index.md, which can be opened with VS Code Markdown
+Preview. It contains browser-compatible H.264 MP4 videos and contact-sheet PNGs
+for every temporal world / robot RGB, depth, height, semantic, instance, occupancy, and normal array, plus PNGs for
+the static environment BEVs. Pass the dataset root instead to process every episode recursively. Use
+--output-kind frames for PNG frames only, or --output-kind both for videos and every PNG frame. World-BEV occupancy
+is validated by default so the known stale perspective-camera capture failure is not silently visualized.
+
 The full profile is never started automatically. See [the environment guide](docs/environment_setup.md),
 [dataset v1 specification](docs/dataset_v1_spec.md), [pipeline gates](docs/pipeline.md), and the
 
@@ -57,4 +69,3 @@ The full profile is never started automatically. See [the environment guide](doc
 - Dense arrays are derived products; structured state, snapshots, trajectories, and events are canonical.
 - Each floor has its own calibrated true-orthographic BEV.
 - Scene-family-disjoint splits are assigned before configuration generation.
-
