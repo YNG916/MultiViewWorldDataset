@@ -1,49 +1,30 @@
-import cv2
-import numpy as np
+"""Convert a generated per-robot NPZ rollout to a video."""
+
+from __future__ import annotations
+
+import argparse
 from pathlib import Path
 
-npz_path = "/cvhci/temp/yyang/behavior_world/output/mvwd/integration_1x5x3_20260902/episodes/Rs_int/config_002/episode_002/robot_views/before/robot_02.npz"
-output_path = "robot_02.avi"
+from npz2video_bev import load_rgb_frames, write_video
 
-with np.load(npz_path) as data:
-    rgb = data["rgb"]
 
-print("shape:", rgb.shape)
-print("dtype:", rgb.dtype)
-print("range:", rgb.min(), rgb.max())
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("npz_path", type=Path, help="Path to a robot_XX.npz rollout")
+    parser.add_argument("-o", "--output", type=Path, help="Output video (default: NPZ path with .avi)")
+    parser.add_argument("--fps", type=float, default=10.0)
+    parser.add_argument("--codec", default="MJPG")
+    return parser.parse_args()
 
-assert rgb.ndim == 4
-assert rgb.shape[-1] == 3
 
-T, H, W, C = rgb.shape
+def main() -> None:
+    args = parse_args()
+    output_path = args.output or args.npz_path.with_suffix(".avi")
+    frames = load_rgb_frames(args.npz_path, validate_bev=False)
+    write_video(frames, output_path, fps=args.fps, codec=args.codec)
+    print(f"Saved: {output_path.resolve()}")
+    print(f"Frames: {frames.shape[0]}, resolution: {frames.shape[2]}x{frames.shape[1]}")
 
-# 确保是 uint8 [0, 255]
-if rgb.dtype != np.uint8:
-    if rgb.max() <= 1.0:
-        rgb = rgb * 255.0
-    rgb = np.clip(rgb, 0, 255).astype(np.uint8)
 
-writer = cv2.VideoWriter(
-    output_path,
-    cv2.VideoWriter_fourcc(*"MJPG"),
-    10,      # FPS
-    (W, H),
-)
-
-if not writer.isOpened():
-    raise RuntimeError("Failed to open MJPG VideoWriter")
-
-for frame in rgb:
-    frame = np.ascontiguousarray(frame)
-
-    # NPZ 是 RGB，OpenCV 写视频使用 BGR
-    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-
-    writer.write(frame_bgr)
-
-writer.release()
-
-path = Path(output_path)
-
-print("Saved:", path.resolve())
-print("Size:", path.stat().st_size / 1024 / 1024, "MB")
+if __name__ == "__main__":
+    main()

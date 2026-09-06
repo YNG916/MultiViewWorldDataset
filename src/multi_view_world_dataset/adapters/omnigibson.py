@@ -2767,6 +2767,9 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         }
         instance_label_samples: set[str] = set()
         collision_frames: list[int] = []
+        maximum_world_bev_camera_pose_error = 0.0
+        world_bev_projection_orthographic = True
+        maximum_world_bev_occupancy_fraction = 0.0
         camera: Any = None
         created_camera = False
         simulator_owned_camera = False
@@ -2785,14 +2788,21 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             top_z = max((obj.bbox_max_world[2] for obj in catalog), default=calibration.floor_z + 3.0)
             camera_z = top_z + 2.0
             xmin, ymin, xmax, ymax = calibration.world_bounds
+            world_bev_capture_position = self._th.tensor(
+                [(xmin + xmax) / 2, (ymin + ymax) / 2, camera_z]
+            )
+            world_bev_capture_orientation = self._th.tensor(
+                [0.0, 0.0, 0.0, 1.0]
+            )
             camera.set_position_orientation(
-                position=self._th.tensor([(xmin + xmax) / 2, (ymin + ymax) / 2, camera_z]),
-                orientation=self._th.tensor([0.0, 0.0, 0.0, 1.0]),
+                position=world_bev_capture_position,
+                orientation=world_bev_capture_orientation,
             )
             hidden = self._set_visible(ceilings, False)
             if created_camera:
                 camera.initialize()
                 self._refresh_physics_handles_after_sensor_edit()
+            intended_world_bev_camera_to_world = self._pose_matrix(camera)
             # Prime Replicator with trajectory frame 0, not the unrelated
             # placement pose that preceded rollout playback.
             for robot_id, robot in robots.items():
@@ -2850,7 +2860,32 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                         float(np.linalg.norm(actual[:3, 3] - planned[:3, 3])),
                         float(rotation_angle(actual, planned)),
                     )
+                # Keep the shared render product in orthographic mode for the
+                # complete world pass; projection changes are not flushed by
+                # render ticks alone in OmniGibson 3.9.2.
                 self._og.sim.render()
+                actual_world_bev_camera_to_world = self._pose_matrix(camera)
+                maximum_world_bev_camera_pose_error = max(
+                    maximum_world_bev_camera_pose_error,
+                    float(
+                        np.linalg.norm(
+                            actual_world_bev_camera_to_world[:3, 3]
+                            - intended_world_bev_camera_to_world[:3, 3]
+                        )
+                    ),
+                    float(
+                        rotation_angle(
+                            actual_world_bev_camera_to_world,
+                            intended_world_bev_camera_to_world,
+                        )
+                    ),
+                )
+                projection = str(
+                    self._lazy.pxr.UsdGeom.Camera(camera.prim)
+                    .GetProjectionAttr()
+                    .Get()
+                )
+                world_bev_projection_orthographic &= projection == "orthographic"
                 if self._using_final_robot:
                     world_observation, world_info = (
                         self._get_final_robot_capture_observation(camera)
@@ -2894,6 +2929,10 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                     frame_arrays["occupancy"] = (
                         np.isfinite(height) & (height > 0.10)
                     ).astype(np.uint8)
+                    maximum_world_bev_occupancy_fraction = max(
+                        maximum_world_bev_occupancy_fraction,
+                        float(np.mean(frame_arrays["occupancy"])),
+                    )
                 instance_labels = np.asarray(frame_arrays["instance_id"]).squeeze()
                 instance_info = world_info.get("seg_instance_id", {})
                 frame_robot_instance_ids: dict[str, set[int]] = {
@@ -3038,6 +3077,35 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                             maximum_robot_mask_error,
                             nearest_mask_distance,
                         )
+            # Switch projection only once, between the complete world and ego
+            # passes. A full observation read is required to flush Replicator's
+            # cached orthographic render product; bare render ticks are insufficient.
+            if self._using_final_robot:
+                self.robot_observations()
+            self._runtime_findings["rollout_capture_schedule"] = (
+                "all_world_bev_frames_then_all_robot_view_frames"
+            )
+            for frame_index in range(frames):
+                for robot_id, robot in robots.items():
+                    planned_base = by_id[robot_id].base_to_world[frame_index]
+                    position, orientation = self._transform_utils.mat2pose(
+                        self._th.as_tensor(planned_base, dtype=self._th.float32)
+                    )
+                    robot.set_position_orientation(
+                        position=position, orientation=orientation
+                    )
+                    robot.keep_still()
+                self._og.sim.step_physics()
+                for robot_id, robot in robots.items():
+                    planned_base = by_id[robot_id].base_to_world[frame_index]
+                    position, orientation = self._transform_utils.mat2pose(
+                        self._th.as_tensor(planned_base, dtype=self._th.float32)
+                    )
+                    robot.set_position_orientation(
+                        position=position, orientation=orientation
+                    )
+                    self._restore_final_robot_mast_mount(robot)
+                    robot.keep_still()
                 self._og.sim.render()
                 observations = self.robot_observations()
                 for robot_id, record in observations.items():
@@ -3072,7 +3140,9 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                         & (depth >= float(self.config["camera"]["near_m"]))
                         & (depth <= float(self.config["camera"]["far_m"]))
                     )
-                    minimum_depth_valid_ratio = min(minimum_depth_valid_ratio, float(valid.mean()))
+                    minimum_depth_valid_ratio = min(
+                        minimum_depth_valid_ratio, float(valid.mean())
+                    )
             flip_candidates = {
                 "identity": (),
                 "horizontal": (1,),
@@ -3149,6 +3219,14 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 "valid_depth": minimum_depth_valid_ratio >= 0.50,
                 "world_bev_each_robot_visible": minimum_robot_pixels >= 4,
                 "world_bev_robot_mask_projection": maximum_robot_mask_error <= mask_tolerance,
+                "world_bev_camera_pose_stable": (
+                    maximum_world_bev_camera_pose_error
+                    <= max(position_tolerance, rotation_tolerance)
+                ),
+                "world_bev_projection_orthographic": world_bev_projection_orthographic,
+                "world_bev_occupancy_not_saturated": (
+                    maximum_world_bev_occupancy_fraction < 0.98
+                ),
             }
             if not all(checks.values()):
                 raise SampleRejected(
@@ -3161,6 +3239,15 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                         "minimum_depth_valid_ratio": minimum_depth_valid_ratio,
                         "minimum_robot_pixels": minimum_robot_pixels,
                         "maximum_robot_mask_error_m": maximum_robot_mask_error,
+                        "maximum_world_bev_camera_pose_error": (
+                            maximum_world_bev_camera_pose_error
+                        ),
+                        "world_bev_projection_orthographic": (
+                            world_bev_projection_orthographic
+                        ),
+                        "maximum_world_bev_occupancy_fraction": (
+                            maximum_world_bev_occupancy_fraction
+                        ),
                         "world_bev_axis_calibration": self._runtime_findings[
                             "world_bev_axis_calibration"
                         ],
@@ -3198,6 +3285,15 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                     "minimum_depth_valid_ratio": minimum_depth_valid_ratio,
                     "minimum_robot_pixels": int(minimum_robot_pixels),
                     "maximum_robot_mask_error_m": maximum_robot_mask_error,
+                    "maximum_world_bev_camera_pose_error": (
+                        maximum_world_bev_camera_pose_error
+                    ),
+                    "world_bev_projection_orthographic": (
+                        world_bev_projection_orthographic
+                    ),
+                    "maximum_world_bev_occupancy_fraction": (
+                        maximum_world_bev_occupancy_fraction
+                    ),
                 },
             }
         finally:
