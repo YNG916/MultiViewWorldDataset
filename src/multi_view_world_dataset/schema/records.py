@@ -97,6 +97,16 @@ class CameraState:
     far_m: float
     camera_height_m: float
     projection: str = "perspective"
+    geometry_width: int | None = None
+    geometry_height: int | None = None
+    geometry_pixel_intrinsics: FloatArray | None = None
+    geometry_normalized_intrinsics: FloatArray | None = None
+    mounted_camera_to_world: FloatArray | None = None
+    capture_camera_to_world: FloatArray | None = None
+    modality_camera_to_world: dict[str, FloatArray] = field(default_factory=dict)
+    capture_pose_translation_error_m: float = 0.0
+    capture_pose_rotation_error_rad: float = 0.0
+    mast_joint_value_m: float | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -111,6 +121,21 @@ class CameraState:
             if matrix.shape != (3, 3) or not np.isfinite(matrix).all():
                 raise ValueError(f"{name} must be a finite 3x3 matrix")
             object.__setattr__(self, name, matrix)
+        for name in ("geometry_pixel_intrinsics", "geometry_normalized_intrinsics"):
+            value = getattr(self, name)
+            if value is not None:
+                matrix = np.asarray(value, dtype=np.float64)
+                if matrix.shape != (3, 3) or not np.isfinite(matrix).all():
+                    raise ValueError(f"{name} must be a finite 3x3 matrix")
+                object.__setattr__(self, name, matrix)
+        for name in ("mounted_camera_to_world", "capture_camera_to_world"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _matrix4(value, name))
+        for modality, transform in self.modality_camera_to_world.items():
+            self.modality_camera_to_world[modality] = _matrix4(
+                transform, f"modality_camera_to_world[{modality}]"
+            )
         if not (0 < self.near_m < self.far_m):
             raise ValueError("Camera clipping range must satisfy 0 < near < far")
 
@@ -136,6 +161,7 @@ class DynamicConfiguration:
     environment_bev_ref: str
     simulator_snapshot_ref: str
     accepted_attempt: int
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

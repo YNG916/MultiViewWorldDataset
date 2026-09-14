@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 from pathlib import Path
 from typing import Any
 
@@ -88,11 +89,19 @@ def save_trajectory_inspection(
 
     connected_fraction = float(temporal_overlap["connected_fraction"])
     maximum_isolation = temporal_overlap["maximum_consecutive_isolated_keyframes"]
+    requested_regime = temporal_overlap["requested_regime"]
+    realized_regime = temporal_overlap["realized_regime"]
+    union_edges = temporal_overlap["union_edges"]
     draw.text((10, 8), "Robot-eroded traversability (not RGB BEV) | +X right, +Y up", fill=(0, 0, 0))
     draw.text((10, 29), "circle=start square=end yellow=intermediate waypoint arrows=planned heading", fill=(0, 0, 0))
     draw.text(
         (10, 50),
-        f"temporal overlap connected: {temporal_overlap['connected_keyframe_count']}/{temporal_overlap['keyframe_count']} ({connected_fraction:.3f})",
+        f"G_t connected: {temporal_overlap['connected_keyframe_count']}/{temporal_overlap['keyframe_count']} ({connected_fraction:.3f}, soft target {temporal_overlap['connected_fraction_target']:.3f})",
+        fill=(0, 0, 0),
+    )
+    draw.text(
+        (10, 92),
+        f"G_union edges: {union_edges} | requested={requested_regime}, realized={realized_regime}",
         fill=(0, 0, 0),
     )
     draw.text((10, 71), f"maximum consecutive isolated keyframes: {maximum_isolation}", fill=(0, 0, 0))
@@ -100,15 +109,48 @@ def save_trajectory_inspection(
     canvas.save(path)
 
 
-def write_html_summary(output_dir: Path, title: str, findings: dict[str, Any], image_names: list[str]) -> Path:
+def write_html_summary(
+    output_dir: Path,
+    title: str,
+    findings: dict[str, Any],
+    image_names: list[str],
+) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    dump_json(output_dir / "summary.json", findings)
+    summary_path = output_dir / "summary.json"
+    dump_json(summary_path, findings)
+    serializable = json.loads(summary_path.read_text(encoding="utf-8"))
     rows = "".join(
-        f"<tr><th>{html.escape(str(key))}</th><td><pre>{html.escape(str(value))}</pre></td></tr>"
-        for key, value in findings.items()
+        (
+            f"<details><summary>{html.escape(str(key))}</summary>"
+            f"<pre>{html.escape(json.dumps(value, indent=2, sort_keys=True))}</pre>"
+            "</details>"
+        )
+        for key, value in serializable.items()
     )
-    images = "".join(f'<figure><img src="{html.escape(name)}"><figcaption>{html.escape(name)}</figcaption></figure>' for name in image_names)
-    document = f"<!doctype html><meta charset='utf-8'><title>{html.escape(title)}</title><h1>{html.escape(title)}</h1><table>{rows}</table>{images}"
+    images = "".join(
+        (
+            f'<figure><img src="{html.escape(name)}">'
+            f"<figcaption>{html.escape(name)}</figcaption></figure>"
+        )
+        for name in image_names
+    )
+    document = (
+        "<!doctype html><meta charset='utf-8'>"
+        f"<title>{html.escape(title)}</title>"
+        "<style>body{font:14px system-ui;margin:24px;color:#181818}"
+        "h1,h2{margin:.5em 0}details{margin:.6em 0;border:1px solid #ddd;padding:.5em}"
+        "summary{font-weight:650;cursor:pointer}"
+        "pre{white-space:pre-wrap;max-height:32em;overflow:auto}"
+        ".gallery{display:grid;grid-template-columns:"
+        "repeat(auto-fit,minmax(360px,1fr));gap:16px}"
+        "figure{margin:0;border:1px solid #ddd;padding:10px;background:#fafafa}"
+        "img{max-width:100%;height:auto;display:block;margin:auto}"
+        "figcaption{margin-top:7px;font-weight:600}</style>"
+        f"<h1>{html.escape(title)}</h1>"
+        f"<h2>Machine-readable QA and metadata</h2>{rows}"
+        f"<h2>Dataset-v1.1 inspection gallery</h2>"
+        f"<div class='gallery'>{images}</div>"
+    )
     target = output_dir / "index.html"
     target.write_text(document, encoding="utf-8")
     return target

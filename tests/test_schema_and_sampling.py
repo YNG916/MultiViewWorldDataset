@@ -6,6 +6,10 @@ import pytest
 from multi_view_world_dataset.adapters.omnigibson import OmniGibsonAdapter
 from multi_view_world_dataset.errors import SampleRejected
 from multi_view_world_dataset.sampling.configurations import exact_state_hash, near_duplicate_configuration
+from multi_view_world_dataset.sampling.placement import (
+    select_local_traversable_heading,
+    soft_anchor_candidate_order,
+)
 from multi_view_world_dataset.sampling.interventions import (
     eligible_intervention_targets,
     propose_articulation,
@@ -13,6 +17,7 @@ from multi_view_world_dataset.sampling.interventions import (
 )
 from multi_view_world_dataset.sampling.splits import assign_scene_family_splits, infer_scene_family
 from multi_view_world_dataset.sampling.trajectories import (
+    _sample_route_controls,
     collision_safe_planner_polyline,
     densify_polyline,
     sample_geodesic_trajectory_set,
@@ -115,9 +120,122 @@ def _sample_parallel_trajectories(seed, minimum_waypoint_trajectories=0):
     )
 
 
+def test_soft_anchor_order_is_deterministic_without_a_hard_radius():
+    candidates = np.column_stack((np.arange(8.0), np.zeros(8)))
+    first = soft_anchor_candidate_order(
+        np.arange(8), candidates, np.zeros(2), 1.5, np.random.default_rng(19),
+    )
+    second = soft_anchor_candidate_order(
+        np.arange(8), candidates, np.zeros(2), 1.5, np.random.default_rng(19),
+    )
+    assert np.array_equal(first, second)
+    assert sorted(first.tolist()) == list(range(8))
+    assert 7 in first
+
+def test_initial_heading_uses_a_directly_traversable_local_exit():
+    candidates = np.asarray([[0.5, 0.0], [0.0, 0.5], [0.4, 0.4]])
+
+    def validator(points):
+        # A wall blocks the desired +X ray, so use a collision-free local tangent.
+        values = np.asarray(points)
+        return not bool(np.any((values[:, 0] > 0.2) & (values[:, 1] < 0.1)))
+
+    yaw, error = select_local_traversable_heading(
+        np.zeros(2), candidates, 0.0, validator,
+        minimum_probe_m=0.1, maximum_probe_m=0.75,
+        validation_spacing_m=0.02,
+    )
+    assert yaw == pytest.approx(np.pi / 4.0)
+    assert error == pytest.approx(np.pi / 4.0)
+
+
+
+def test_joint_sampler_accepts_per_robot_reachable_components():
+    starts = {}
+    mounts = {}
+    reachable = {}
+    for index, y in enumerate((0.0, 2.0, 4.0)):
+        robot_id = f"robot_{index:02d}"
+        starts[robot_id] = np.array(
+            [[1, 0, 0, 0], [0, 1, 0, y], [0, 0, 1, 0], [0, 0, 0, 1]],
+            dtype=float,
+        )
+        mounts[robot_id] = np.eye(4)
+        reachable[robot_id] = np.asarray([[1.0, y]])
+
+    def same_component_planner(start, goal):
+        if abs(float(start[1] - goal[1])) > 1e-9:
+            return None
+        return _straight_planner(start, goal)
+
+    trajectories = sample_geodesic_trajectory_set(
+        starts, mounts, reachable, 0.0, np.random.default_rng(17),
+        frames=60, fps=10, path_length_range_m=(0.99, 1.01),
+        minimum_pairwise_distance_m=0.6, maximum_linear_speed_mps=0.8,
+        maximum_angular_speed_radps=1.2, maximum_acceleration_mps2=1.5,
+        plan_segment=same_component_planner,
+        is_path_traversable=lambda points: True,
+        path_family_weights={"direct": 1.0, "one_waypoint": 0.0, "two_waypoint": 0.0},
+        minimum_waypoint_trajectories=0, initial_heading_tolerance_rad=np.pi,
+        line_validation_spacing_m=0.02, smoothing_validation_spacing_m=0.02,
+        smoothing_strengths=(1.0,), candidate_pool_size=1,
+        maximum_attempts=3, joint_pool_rounds=1,
+    )
+    assert len(trajectories) == 3
+    assert [item.base_to_world[-1, 1, 3] for item in trajectories] == [0.0, 2.0, 4.0]
+
+
 def test_joint_set_enforces_configured_waypoint_minimum():
     with pytest.raises(SampleRejected, match="trajectory_joint_separation_failed"):
         _sample_parallel_trajectories(17, minimum_waypoint_trajectories=1)
+
+
+def test_waypoint_controls_reject_untrackable_direction_reversal():
+    candidates = np.asarray([
+        [1.0, 0.0],
+        [0.5, np.sqrt(3.0) / 2.0],
+        [1.0 + np.cos(np.deg2rad(40.0)), np.sin(np.deg2rad(40.0))],
+    ])
+    controls = _sample_route_controls(
+        np.zeros(2), 0.0, candidates, "one_waypoint", 1.0, 2.1,
+        np.deg2rad(1.0), np.deg2rad(55.0), np.random.default_rng(7),
+    )
+    assert controls is not None
+    assert np.allclose(controls[1], [1.0, 0.0])
+    assert np.allclose(controls[2], candidates[2])
+
+
+def test_waypoint_bearing_is_soft_when_geodesic_must_turn_first():
+    candidates = np.asarray([[0.0, 1.0], [-1.0, 0.0]])
+    controls = _sample_route_controls(
+        np.zeros(2), 0.0, candidates, "direct", 1.0, 1.1,
+        np.deg2rad(10.0), np.deg2rad(55.0), np.random.default_rng(2),
+    )
+    # Neither far-goal bearing matches +X; planning is still attempted.
+    assert controls is not None
+    assert controls.shape == (2, 2)
+
+
+def test_trajectory_tangent_policy_keeps_non_prior_directions_eligible():
+    candidates = np.asarray([[1.0, 0.0], [0.0, 1.0]])
+    hard = _sample_route_controls(
+        np.zeros(2), 0.0, candidates, "direct", 1.0, 1.1,
+        np.deg2rad(10.0), np.deg2rad(55.0), np.random.default_rng(2),
+    )
+    assert hard is not None
+    assert np.allclose(hard[-1], [1.0, 0.0])
+
+    sampled_endpoints = {
+        tuple(_sample_route_controls(
+            np.zeros(2), 0.0, candidates, "direct", 1.0, 1.1,
+            np.deg2rad(10.0), np.deg2rad(55.0), np.random.default_rng(seed),
+            soft_initial_heading=True,
+            initial_heading_probability_floor=1.0,
+        )[-1])
+        for seed in range(12)
+    }
+    assert sampled_endpoints == {(1.0, 0.0), (0.0, 1.0)}
+
 
 
 def test_state_hash_is_order_independent_and_near_duplicate():

@@ -37,6 +37,8 @@ inspection/
 generated_configs/
 reject_logs/
 *.log
+*.orig
+*.rej
 
 # Generated dataset products (images are intentionally not ignored globally)
 dataset/

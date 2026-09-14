@@ -14,20 +14,33 @@ from multi_view_world_dataset.cameras.transforms import invert_transform
 from multi_view_world_dataset.errors import ConfigurationError, SampleRejected
 from multi_view_world_dataset.pipeline import _bev_geometry_metrics
 from multi_view_world_dataset.qa.checks import check_bev_pair, check_paired_trajectories, require_all
-from multi_view_world_dataset.rendering.inspection import save_rgb, save_trajectory_inspection, write_html_summary
+from multi_view_world_dataset.rendering.inspection import (
+    save_rgb,
+    save_trajectory_inspection,
+    write_html_summary,
+)
+from multi_view_world_dataset.rendering.inspection_v11 import (
+    save_environment_room_inspection,
+    save_intervention_target_crops,
+    save_overlap_graph_inspection,
+)
 from multi_view_world_dataset.sampling.configurations import near_duplicate_configuration
+from multi_view_world_dataset.sampling.diversity import stable_seed, temporal_overlap_acceptance
+from multi_view_world_dataset.sampling.interventions import eligible_intervention_targets
 from multi_view_world_dataset.sampling.splits import assign_scene_family_splits
 from multi_view_world_dataset.schema.records import (
     CameraState,
     DynamicConfiguration,
     ObjectState,
     Observation,
+    InterventionType,
     QAResult,
     RobotState,
     WorldEpisode,
     WorldState,
 )
 from multi_view_world_dataset.storage.writer import DatasetWriter
+from multi_view_world_dataset.utils.provenance import generator_source_fingerprint
 from multi_view_world_dataset.utils.runtime import RuntimePaths, generator_git_commit
 from multi_view_world_dataset.utils.serialization import dump_json
 
@@ -92,8 +105,12 @@ def _render_environment_floors(
         prefix = f"floor_{floor_index:02d}"
         for name, value in render.modalities.items():
             arrays[f"{prefix}/{name}"] = np.asarray(value)
+        arrays[f"{prefix}/traversability"] = adapter.traversability_bev(
+            floor_index, calibration
+        )
         arrays[f"{prefix}/calibration_world_bounds"] = np.asarray(calibration.world_bounds)
         arrays[f"{prefix}/calibration_pixel_to_world"] = calibration.pixel_to_world_transform
+        arrays[f"{prefix}/calibration_world_to_pixel"] = calibration.world_to_pixel_transform
         arrays[f"{prefix}/calibration_meters_per_pixel"] = np.asarray(
             calibration.meters_per_pixel
         )
@@ -106,7 +123,7 @@ def _initial_overlap(
     adapter: OmniGibsonAdapter,
     config: dict[str, Any],
 ) -> tuple[Any, dict[str, dict[str, Any]]]:
-    observations = adapter.robot_observations()
+    observations = adapter.robot_depth_observations()
     camera_config = config["camera"]
     calibration = PinholeCalibration(
         int(camera_config["geometry_width"]),
@@ -116,7 +133,7 @@ def _initial_overlap(
         float(camera_config["far_m"]),
     )
     depths = {
-        robot_id: np.asarray(record["modalities"]["depth_linear"]).squeeze()[::2, ::2]
+        robot_id: np.asarray(record["depth_linear"]).squeeze()[::2, ::2]
         for robot_id, record in observations.items()
     }
     overlap_config = config["overlap"]
@@ -130,33 +147,6 @@ def _initial_overlap(
         stride=int(overlap_config["depth_sample_stride"]),
         tolerance_m=float(overlap_config["reprojection_tolerance_m"]),
     )
-    if not graph.connected or graph.near_duplicate_pairs:
-        raise SampleRejected(
-            "initial_overlap_failed",
-            {
-                "connected": graph.connected,
-                "near_duplicate_pairs": graph.near_duplicate_pairs,
-                "overlaps": graph.overlaps,
-                "camera_positions": {
-                    robot_id: record["camera_to_world"][:3, 3].tolist()
-                    for robot_id, record in observations.items()
-                },
-                "capture_pose_translation_error_m": {
-                    robot_id: float(record["capture_pose_translation_error_m"])
-                    for robot_id, record in observations.items()
-                },
-                "capture_pose_rotation_error_rad": {
-                    robot_id: float(record["capture_pose_rotation_error_rad"])
-                    for robot_id, record in observations.items()
-                },
-                "depth_valid_ratio": {
-                    robot_id: float(
-                        np.mean(np.isfinite(depth) & (depth > 0))
-                    )
-                    for robot_id, depth in depths.items()
-                },
-            },
-        )
     return graph, observations
 
 
@@ -191,10 +181,10 @@ def _temporal_overlap_preflight(
     try:
         for frame_index in keyframe_indices:
             adapter.place_robots_at_trajectory_frame(trajectories, int(frame_index))
-            observations = adapter.robot_observations()
+            observations = adapter.robot_depth_observations()
             depths = {}
             for robot_id, record in observations.items():
-                depth = np.asarray(record["modalities"]["depth_linear"]).squeeze()
+                depth = np.asarray(record["depth_linear"]).squeeze()
                 rows = np.rint(np.linspace(0, depth.shape[0] - 1, height)).astype(np.int64)
                 columns = np.rint(np.linspace(0, depth.shape[1] - 1, width)).astype(np.int64)
                 depths[robot_id] = depth[rows[:, None], columns[None, :]]
@@ -227,6 +217,16 @@ def _temporal_overlap_preflight(
                     "connected": bool(graph.connected),
                     "edges": [list(edge) for edge in graph.edges],
                     "isolated_robot_ids": isolated,
+                    "near_duplicate_pairs": [list(pair) for pair in graph.near_duplicate_pairs],
+                    "overlap_matrix": [
+                        [
+                            1.0 if left == right else float(
+                                graph.overlaps.get(tuple(sorted((left, right))), 0.0)
+                            )
+                            for right in robot_ids
+                        ]
+                        for left in robot_ids
+                    ],
                     "overlaps": {
                         f"{left}|{right}": float(value)
                         for (left, right), value in graph.overlaps.items()
@@ -235,24 +235,26 @@ def _temporal_overlap_preflight(
             )
     finally:
         adapter.place_robots_at_trajectory_frame(trajectories, 0)
-    connected_fraction = connected_count / len(keyframe_indices)
-    maximum_allowed_isolation = int(preflight["maximum_consecutive_isolated_keyframes"])
-    passed = (
-        connected_fraction >= float(preflight["connected_fraction_min"])
-        and all(value <= maximum_allowed_isolation for value in maximum_isolation_runs.values())
+    regime = str(trajectories[0].metadata.get("observation_regime", "partial_chain"))
+    metrics = temporal_overlap_acceptance(
+        robot_ids,
+        keyframes,
+        regime=regime,
+        regime_connected_fraction_target=preflight["regime_connected_fraction_target"],
+        regime_shared_keyframe_fraction_target=preflight[
+            "regime_shared_keyframe_fraction_target"
+        ],
+        regime_maximum_consecutive_isolated_keyframes=preflight[
+            "regime_maximum_consecutive_isolated_keyframes"
+        ],
     )
-    metrics = {
+    metrics.update({
         "keyframe_indices": keyframe_indices.tolist(),
-        "connected_keyframe_count": connected_count,
-        "keyframe_count": len(keyframe_indices),
-        "connected_fraction": connected_fraction,
-        "required_connected_fraction": float(preflight["connected_fraction_min"]),
-        "maximum_consecutive_isolated_keyframes": maximum_isolation_runs,
-        "allowed_consecutive_isolated_keyframes": maximum_allowed_isolation,
         "geometry_resolution": [width, height],
+        "robot_ids": list(robot_ids),
         "keyframes": keyframes,
-    }
-    if not passed:
+    })
+    if not metrics["passed"]:
         raise SampleRejected("trajectory_temporal_overlap_failed", metrics)
     return metrics
 def _robot_states(
@@ -282,13 +284,17 @@ def _observation_records(
     trajectories: tuple[Any, ...],
     branch: str,
     view_refs: dict[str, str],
+    capture_metadata: dict[str, dict[str, np.ndarray]],
 ) -> tuple[Observation, ...]:
     camera_config = config["camera"]
-    calibration = PinholeCalibration(
-        int(camera_config["rgb_width"]),
-        int(camera_config["rgb_height"]),
-        float(camera_config["hfov_deg"]),
-        float(camera_config["near_m"]),
+    rgb_calibration = PinholeCalibration(
+        int(camera_config["rgb_width"]), int(camera_config["rgb_height"]),
+        float(camera_config["hfov_deg"]), float(camera_config["near_m"]),
+        float(camera_config["far_m"]),
+    )
+    geometry_calibration = PinholeCalibration(
+        int(camera_config["geometry_width"]), int(camera_config["geometry_height"]),
+        float(camera_config["hfov_deg"]), float(camera_config["near_m"]),
         float(camera_config["far_m"]),
     )
     records: list[Observation] = []
@@ -297,6 +303,9 @@ def _observation_records(
             base_to_world = trajectory.base_to_world[frame_index]
             camera_to_world = trajectory.camera_to_world[frame_index]
             camera_to_base = invert_transform(base_to_world) @ camera_to_world
+            capture = capture_metadata[trajectory.robot_id]
+            mounted_camera_to_world = capture["mounted_camera_to_world"][frame_index]
+            capture_camera_to_world = capture["capture_camera_to_world"][frame_index]
             modality_refs = {
                 modality: f"{view_refs[trajectory.robot_id]}::{modality}[{frame_index}]"
                 for modality in ("rgb", "depth_linear", "semantic", "instance", "normal")
@@ -310,8 +319,8 @@ def _observation_records(
                         robot_id=trajectory.robot_id,
                         width=int(camera_config["rgb_width"]),
                         height=int(camera_config["rgb_height"]),
-                        pixel_intrinsics=calibration.pixel_intrinsics,
-                        normalized_intrinsics=calibration.normalized_intrinsics,
+                        pixel_intrinsics=rgb_calibration.pixel_intrinsics,
+                        normalized_intrinsics=rgb_calibration.normalized_intrinsics,
                         camera_to_world=camera_to_world,
                         world_to_camera=invert_transform(camera_to_world),
                         robot_base_to_world=base_to_world,
@@ -319,6 +328,27 @@ def _observation_records(
                         near_m=float(camera_config["near_m"]),
                         far_m=float(camera_config["far_m"]),
                         camera_height_m=float(camera_to_base[2, 3]),
+                        geometry_width=int(camera_config["geometry_width"]),
+                        geometry_height=int(camera_config["geometry_height"]),
+                        geometry_pixel_intrinsics=geometry_calibration.pixel_intrinsics,
+                        geometry_normalized_intrinsics=geometry_calibration.normalized_intrinsics,
+                        mounted_camera_to_world=mounted_camera_to_world,
+                        capture_camera_to_world=capture_camera_to_world,
+                        modality_camera_to_world={
+                            "rgb": mounted_camera_to_world,
+                            "depth_linear": mounted_camera_to_world,
+                            "semantic": capture_camera_to_world,
+                            "instance": capture_camera_to_world,
+                            "normal": capture_camera_to_world,
+                        },
+                        capture_pose_translation_error_m=float(
+                            capture["capture_pose_translation_error_m"][frame_index]
+                        ),
+                        capture_pose_rotation_error_rad=float(
+                            capture["capture_pose_rotation_error_rad"][frame_index]
+                        ),
+                        mast_joint_value_m=float(camera_to_base[2, 3])
+                        - float(min(camera_config["heights_m"])),
                     ),
                     modality_refs=modality_refs,
                 )
@@ -341,12 +371,225 @@ def _existing_event_targets(root: Path, scene_id: str, configuration_id: str) ->
     return tuple(targets)
 
 
+def _existing_event_types(root: Path, scene_id: str) -> dict[str, int]:
+    counts = {item.value: 0 for item in InterventionType}
+    for path in (root / "episodes" / scene_id).glob("*/*/events.json"):
+        try:
+            events = json.loads(path.read_text(encoding="utf-8"))
+            if events:
+                counts[str(events[0]["intervention_type"])] += 1
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            continue
+    return counts
+
+
+def _choose_quota_intervention_type(
+    weights: dict[str, float], counts: dict[str, int], available: set[InterventionType], seed: int
+) -> InterventionType:
+    if not available:
+        raise SampleRejected("no_visible_target_for_any_intervention_type")
+    total_after = sum(counts.values()) + 1
+    rng = np.random.default_rng(seed)
+    ranked = []
+    for intervention_type in available:
+        deficit = float(weights[intervention_type.value]) * total_after - counts[intervention_type.value]
+        ranked.append((deficit + float(rng.uniform(0, 1e-9)), intervention_type))
+    return max(ranked, key=lambda item: item[0])[1]
+
+
 def _read_configuration_catalog(path: Path) -> tuple[ObjectState, ...]:
     try:
         import pyarrow.parquet as pq
     except ImportError as error:
         raise RuntimeError("Resuming configuration generation requires pyarrow") from error
     return tuple(ObjectState(**row) for row in pq.read_table(path).to_pylist())
+
+
+def _intervention_visibility_table(
+    catalog: tuple[ObjectState, ...],
+    robot_views: dict[str, dict[str, np.ndarray]],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    requirements = config["intervention"]["target_visibility"]
+    minimum_pixels = int(requirements["minimum_pixels"])
+    minimum_frames = int(requirements["minimum_frames"])
+    minimum_robots = int(requirements["minimum_robots"])
+    preferred_robots = int(requirements["preferred_robots"])
+    table: dict[str, Any] = {}
+    eligible: list[tuple[tuple[int, int, int], str]] = []
+    for public_id, obj in enumerate(sorted(catalog, key=lambda item: item.instance_id), start=4):
+        per_robot = {}
+        total_frames = 0
+        peak_pixels = 0
+        participating = 0
+        for robot_id, modalities in sorted(robot_views.items()):
+            masks = np.asarray(modalities["instance"]) == public_id
+            counts = masks.reshape(masks.shape[0], -1).sum(axis=1)
+            qualifying = int(np.count_nonzero(counts >= minimum_pixels))
+            per_robot[robot_id] = {
+                "qualifying_frame_count": qualifying,
+                "maximum_pixels": int(counts.max(initial=0)),
+            }
+            total_frames += qualifying
+            peak_pixels = max(peak_pixels, int(counts.max(initial=0)))
+            participating += int(qualifying > 0)
+        accepted = total_frames >= minimum_frames and participating >= minimum_robots
+        table[obj.instance_id] = {
+            "public_instance_id": public_id,
+            "category": obj.category,
+            "qualifying_frame_count": total_frames,
+            "participating_robot_count": participating,
+            "preferred_multi_robot_visibility": participating >= preferred_robots,
+            "maximum_pixels": peak_pixels,
+            "per_robot": per_robot,
+            "accepted": accepted,
+        }
+        if accepted:
+            eligible.append(((int(participating >= preferred_robots), participating, total_frames), obj.instance_id))
+    eligible.sort(reverse=True)
+    return {
+        "requirements": dict(requirements),
+        "eligible_target_ids": [instance_id for _, instance_id in eligible],
+        "objects": table,
+    }
+
+
+def _post_render_intervention_effect(
+    target_instance_id: str,
+    before_catalog: tuple[ObjectState, ...],
+    before_views: dict[str, dict[str, np.ndarray]],
+    after_views: dict[str, dict[str, np.ndarray]],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    ordered = sorted(before_catalog, key=lambda item: item.instance_id)
+    public_id = 4 + next(index for index, obj in enumerate(ordered) if obj.instance_id == target_instance_id)
+    effect = config["intervention"]["post_render_effect"]
+    delta_threshold = float(effect["minimum_mean_rgb_delta"])
+    changed_pixels = 0
+    union_pixels = 0
+    delta_sum = 0.0
+    per_robot = {}
+    for robot_id in sorted(before_views):
+        before_mask = np.asarray(before_views[robot_id]["instance"]) == public_id
+        after_mask = np.asarray(after_views[robot_id]["instance"]) == public_id
+        before_rgb = np.asarray(before_views[robot_id]["rgb"])[..., :3].astype(np.float32)
+        after_rgb = np.asarray(after_views[robot_id]["rgb"])[..., :3].astype(np.float32)
+        rows = np.rint(np.linspace(0, before_rgb.shape[1] - 1, before_mask.shape[1])).astype(int)
+        cols = np.rint(np.linspace(0, before_rgb.shape[2] - 1, before_mask.shape[2])).astype(int)
+        rgb_delta = np.mean(np.abs(before_rgb[:, rows[:, None], cols[None, :]] - after_rgb[:, rows[:, None], cols[None, :]]), axis=-1)
+        union = before_mask.squeeze() | after_mask.squeeze()
+        silhouette = before_mask.squeeze() ^ after_mask.squeeze()
+        changed = union & ((rgb_delta >= delta_threshold) | silhouette)
+        robot_changed = int(changed.sum())
+        robot_union = int(union.sum())
+        changed_pixels += robot_changed
+        union_pixels += robot_union
+        delta_sum += float(rgb_delta[union].sum())
+        per_robot[robot_id] = {"changed_pixels": robot_changed, "union_pixels": robot_union}
+    mean_delta = delta_sum / max(1, union_pixels)
+    checks = {
+        "minimum_changed_pixels": changed_pixels >= int(effect["minimum_changed_pixels"]),
+        "minimum_mean_rgb_delta": mean_delta >= delta_threshold,
+    }
+    return {
+        "passed": all(checks.values()), "checks": checks,
+        "target_public_instance_id": public_id,
+        "changed_pixels": changed_pixels, "union_pixels": union_pixels,
+        "mean_rgb_delta": mean_delta, "per_robot": per_robot,
+    }
+def _sibling_episode_diversity(
+    root: Path,
+    scene_id: str,
+    configuration_id: str,
+    trajectory_metrics: dict[str, Any],
+    trajectories: tuple[Any, ...],
+    intervention_type: str,
+    target_instance_id: str,
+) -> dict[str, Any]:
+    """Compare an accepted episode with already finalized configuration siblings."""
+    siblings_root = root / "episodes" / scene_id / configuration_id
+    prior_episode_ids: list[str] = []
+    prior_regions: set[str] = set()
+    prior_path_families: set[str] = set()
+    prior_regimes: set[str] = set()
+    prior_targets: set[str] = set()
+    prior_types: list[str] = []
+    layout_distances: list[float] = []
+    current_starts = {
+        trajectory.robot_id: np.asarray(
+            trajectory.base_to_world[0, :2, 3], dtype=np.float64
+        )
+        for trajectory in trajectories
+    }
+    if siblings_root.is_dir():
+        for sibling in sorted(siblings_root.glob("episode_*")):
+            metrics_path = sibling / "generation_metrics.json"
+            events_path = sibling / "events.json"
+            trajectories_path = sibling / "trajectories.npz"
+            if not metrics_path.is_file() or not events_path.is_file():
+                continue
+            try:
+                metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+                events = json.loads(events_path.read_text(encoding="utf-8"))
+                prior_episode_ids.append(sibling.name)
+                sibling_trajectory = metrics["trajectory"]
+                prior_regions.update(
+                    map(str, sibling_trajectory.get("start_region_ids", []))
+                )
+                prior_regimes.add(
+                    str(sibling_trajectory.get("observation_regime", "unknown"))
+                )
+                prior_path_families.update(
+                    str(robot["path_family"])
+                    for robot in sibling_trajectory.get("robots", {}).values()
+                )
+                if events:
+                    prior_targets.add(str(events[0]["target_instance_id"]))
+                    prior_types.append(str(events[0]["intervention_type"]))
+                if trajectories_path.is_file():
+                    with np.load(trajectories_path, allow_pickle=False) as arrays:
+                        errors = [
+                            np.linalg.norm(
+                                current_starts[robot_id]
+                                - np.asarray(
+                                    arrays[f"{robot_id}_base_to_world"][
+                                        0, :2, 3
+                                    ],
+                                    dtype=np.float64,
+                                )
+                            )
+                            for robot_id in sorted(current_starts)
+                        ]
+                    layout_distances.append(
+                        float(np.sqrt(np.mean(np.square(errors))))
+                    )
+            except (KeyError, OSError, ValueError, json.JSONDecodeError):
+                continue
+    current_regions = set(map(str, trajectory_metrics.get("start_region_ids", [])))
+    current_families = {
+        str(robot["path_family"])
+        for robot in trajectory_metrics.get("robots", {}).values()
+    }
+    current_regime = str(
+        trajectory_metrics.get("observation_regime", "unknown")
+    )
+    return {
+        "prior_episode_ids": prior_episode_ids,
+        "prior_episode_count": len(prior_episode_ids),
+        "new_start_region_ids": sorted(current_regions - prior_regions),
+        "start_region_reuse_fraction": (
+            len(current_regions & prior_regions) / max(1, len(current_regions))
+        ),
+        "new_path_families": sorted(current_families - prior_path_families),
+        "realized_regime_novel": current_regime not in prior_regimes,
+        "intervention_target_novel": target_instance_id not in prior_targets,
+        "intervention_type_novel": intervention_type not in prior_types,
+        "minimum_prior_layout_rms_distance_m": (
+            min(layout_distances) if layout_distances else None
+        ),
+    }
+
+
 
 
 def generate_dataset(
@@ -362,23 +605,83 @@ def generate_dataset(
             "Refusing large pilot/default generation without explicit --allow-large"
         )
     root = runtime.require_output()
+    repository_root = Path(__file__).resolve().parents[2]
+    commit = generator_git_commit(repository_root)
+    source_fingerprint = generator_source_fingerprint(repository_root)
     writer = DatasetWriter(root)
     writer.initialize(
         {
             "schema_version": config["dataset"]["schema_version"],
+            "dataset_semantics": "Dataset-v1.1",
             "profile": profile,
             "seed": int(config["seed"]),
+            "generator_git_commit": commit,
+            "generator_source_fingerprint": source_fingerprint,
             "source_of_truth": "world_state+simulator_snapshot+trajectory+event_log",
-        }
+            "coordinate_conventions": {
+                "world": "right-handed Z-up",
+                "camera": "OpenCV x-right y-down z-forward",
+                "poses": "local-to-world homogeneous matrices",
+                "depth_linear": "metric camera-forward depth in meters",
+            },
+            "bev_conventions": {
+                "occupancy": "observed geometry above floor; not traversability",
+                "traversability": "robot-footprint-eroded navigation mask",
+                "environment_resolution_mpp": float(config["bev"]["environment_meters_per_pixel"]),
+                "world_resolution_mpp": float(config["bev"]["world_meters_per_pixel"]),
+            },
+            "intervention_taxonomy": sorted(config["intervention"]["type_weights"]),
+            "robot_count": 3,
+            "physical_frames": int(config["dataset"]["frames"]),
+            "fps": float(config["dataset"]["fps"]),
+            "camera_specification": config["camera"],
+            "bev_specification": config["bev"],
+            "modalities": {
+                "robot_views": [
+                    "rgb",
+                    "depth_linear",
+                    "semantic",
+                    "instance",
+                    "normal",
+                ],
+                "environment_bev": config["bev"]["modalities"],
+                "world_bev": config["bev"]["world_modalities"],
+            },
+            "split_policy": {
+                "unit": "base_scene_or_scene_family",
+                "weights": config["dataset"]["splits"],
+                "seed": int(
+                    config["dataset"]["scene_family_split_seed"]
+                ),
+            },
+            "intervention_policy": config["intervention"],
+            "overlap_policy": {
+                "pairwise": config["overlap"],
+                "temporal_preflight": (
+                    config["trajectory"]["overlap_preflight"]
+                ),
+            },
+            "sampling_regime_configuration": {
+                "weights": (
+                    config["placement"]["observation_regime_weights"]
+                ),
+            },
+        },
+        resolved_config=config,
     )
     adapter = OmniGibsonAdapter(runtime, config)
-    repository_root = Path(__file__).resolve().parents[2]
-    commit = generator_git_commit(repository_root)
     accepted_configurations = 0
     accepted_episodes = 0
     try:
         _write_status(root, status="running", stage="launch_simulator", profile=profile)
         adapter.start()
+        writer.update_dataset_metadata(
+            {
+                "simulator_versions": (
+                    adapter.runtime_report().get("versions", {})
+                )
+            }
+        )
         scenes = adapter.discover_scenes()
         if scene_id is not None:
             if scene_id not in scenes:
@@ -415,6 +718,7 @@ def generate_dataset(
             )
             base_snapshot = adapter.dump_snapshot()
             base_catalog = adapter.object_catalog_with_relations()
+            writer.update_scene_taxonomy(selected_scene, base_catalog)
             scene_root = root / "scenes" / selected_scene
             if not (scene_root / "scene_meta.json").is_file():
                 writer.write_scene(
@@ -425,6 +729,7 @@ def generate_dataset(
             completed_configurations = set(writer.completed_configuration_ids(selected_scene))
             accepted_catalogs: list[tuple[Any, ...]] = []
             accepted_hashes: set[str] = set()
+            accepted_intervention_types = _existing_event_types(root, selected_scene)
             for configuration_id in completed_configurations:
                 meta_path = (
                     root
@@ -455,11 +760,9 @@ def generate_dataset(
                 if configuration_id not in completed_configurations:
                     accepted = None
                     for attempt in range(int(config["generation"]["maximum_configuration_attempts"])):
-                        seed = (
-                            int(config["seed"])
-                            + scene_position * 10_000_000
-                            + configuration_index * 100_000
-                            + attempt
+                        seed = stable_seed(
+                            int(config["seed"]), selected_scene,
+                            configuration_id, "configuration", attempt,
                         )
                         _write_status(
                             root,
@@ -507,6 +810,59 @@ def generate_dataset(
                                 environment_bev_ref="bev/environment_base.npz",
                                 simulator_snapshot_ref="simulator_state.npy",
                                 accepted_attempt=attempt,
+                                metadata={
+                                    "baseline_exact_state_hash": candidate.get(
+                                        "baseline_exact_state_hash"
+                                    ),
+                                    "changed_instance_ids": candidate.get(
+                                        "changed_instance_ids", []
+                                    ),
+                                    "changed_object_count": int(
+                                        candidate.get(
+                                            "changed_object_count",
+                                            len(
+                                                candidate.get(
+                                                    "changed_instance_ids", []
+                                                )
+                                            ),
+                                        )
+                                    ),
+                                    "requested_changed_object_count": int(
+                                        candidate.get(
+                                            "requested_changed_object_count",
+                                            len(
+                                                candidate.get(
+                                                    "changed_instance_ids", []
+                                                )
+                                            ),
+                                        )
+                                    ),
+                                    "changes": candidate.get(
+                                        "changes",
+                                        [candidate.get("relation", {})],
+                                    ),
+                                    "stratification": candidate.get(
+                                        "stratification", {}
+                                    ),
+                                    "configuration_checks": candidate.get(
+                                        "checks", {}
+                                    ),
+                                    "maximum_snapshot_restore_error": (
+                                        candidate.get(
+                                            "maximum_snapshot_restore_error"
+                                        )
+                                    ),
+                                    "randomization_metrics": {
+                                        key: candidate[key]
+                                        for key in (
+                                            "translation_m",
+                                            "rotation_deg",
+                                            "free_traversable_candidates",
+                                            "intervention_target_count",
+                                        )
+                                        if key in candidate
+                                    },
+                                },
                             )
                             writer.write_configuration(
                                 configuration,
@@ -539,15 +895,21 @@ def generate_dataset(
                 used_targets = set(
                     _existing_event_targets(root, selected_scene, configuration_id)
                 )
+                used_regions: set[str] = set()
+                for existing_episode in existing_episodes:
+                    metrics_path = root / "episodes" / selected_scene / configuration_id / existing_episode / "generation_metrics.json"
+                    try:
+                        prior_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+                        used_regions.update(prior_metrics["trajectory"].get("start_region_ids", []))
+                    except (OSError, KeyError, json.JSONDecodeError):
+                        pass
                 for episode_index in range(requested_episodes):
                     episode_id = f"episode_{episode_index:03d}"
                     if episode_id in existing_episodes:
                         continue
-                    episode_seed = (
-                        int(config["seed"])
-                        + scene_position * 10_000_000
-                        + configuration_index * 100_000
-                        + episode_index * 1_000
+                    episode_seed = stable_seed(
+                        int(config["seed"]), selected_scene,
+                        configuration_id, episode_id,
                     )
                     before = None
                     graph = None
@@ -557,6 +919,7 @@ def generate_dataset(
                     w0_catalog = None
                     trajectory_metrics = None
                     temporal_overlap_metrics = None
+                    visibility_table = None
                     for placement_attempt in range(int(config["placement"]["maximum_attempts"])):
                         _write_status(
                             root,
@@ -572,30 +935,119 @@ def generate_dataset(
                         adapter.load_snapshot(configuration_snapshot)
                         try:
                             heights = adapter.place_development_robots(
-                                episode_seed + placement_attempt
+                                stable_seed(episode_seed, "placement", placement_attempt),
+                                discouraged_region_ids=tuple(sorted(used_regions)),
                             )
-                            graph, _ = _initial_overlap(adapter, config)
-                            trajectories, trajectory_metrics = adapter.sample_robot_trajectories(
-                                episode_seed + placement_attempt + 101
+                            base_trajectory_candidates = adapter.sample_robot_trajectory_sets(
+                                stable_seed(episode_seed, "trajectory", placement_attempt)
                             )
-                            w0_snapshot = adapter.dump_snapshot()
-                            temporal_overlap_metrics = _temporal_overlap_preflight(
-                                adapter, config, trajectories
-                            )
-                            trajectory_metrics["temporal_overlap"] = temporal_overlap_metrics
-                            w0_catalog = adapter.object_catalog_with_relations()
-                            world_calibration = adapter.calibrated_floor_bounds(
-                                int(trajectory_metrics["floor_index"]),
-                                float(config["bev"]["world_meters_per_pixel"]),
-                                float(config["bev"]["bounds_margin_m"]),
-                            )
-                            before = adapter.playback_trajectories(
-                                trajectories,
-                                int(trajectory_metrics["floor_index"]),
-                                world_calibration,
-                            )
+                            trajectory_candidates = list(base_trajectory_candidates)
+                            base_candidate_count = len(trajectory_candidates)
+                            candidate_failures: list[dict[str, Any]] = []
+                            candidate_rank = 0
+                            while candidate_rank < len(trajectory_candidates):
+                                candidate_trajectories, candidate_metrics = (
+                                    trajectory_candidates[candidate_rank]
+                                )
+                                try:
+                                    adapter.place_robots_at_trajectory_frame(
+                                        candidate_trajectories, 0
+                                    )
+                                    candidate_graph, _ = _initial_overlap(adapter, config)
+                                    candidate_overlap = _temporal_overlap_preflight(
+                                        adapter, config, candidate_trajectories
+                                    )
+                                    requested_regime = str(
+                                        candidate_overlap["requested_regime"]
+                                    )
+                                    realized_regime = str(
+                                        candidate_overlap["realized_regime"]
+                                    )
+                                    candidate_metrics["requested_observation_regime"] = (
+                                        requested_regime
+                                    )
+                                    candidate_metrics["observation_regime"] = realized_regime
+                                    for candidate_trajectory in candidate_trajectories:
+                                        candidate_trajectory.metadata[
+                                            "requested_observation_regime"
+                                        ] = requested_regime
+                                        candidate_trajectory.metadata[
+                                            "observation_regime"
+                                        ] = realized_regime
+                                    candidate_metrics["temporal_overlap"] = candidate_overlap
+                                    candidate_metrics["temporal_preflight_candidate_rank"] = (
+                                        candidate_rank
+                                    )
+                                    candidate_catalog = adapter.object_catalog_with_relations()
+                                    candidate_calibration = adapter.calibrated_floor_bounds(
+                                        int(candidate_metrics["floor_index"]),
+                                        float(config["bev"]["world_meters_per_pixel"]),
+                                        float(config["bev"]["bounds_margin_m"]),
+                                    )
+                                    candidate_snapshot = adapter.dump_snapshot()
+                                    candidate_before = adapter.playback_trajectories(
+                                        candidate_trajectories,
+                                        int(candidate_metrics["floor_index"]),
+                                        candidate_calibration,
+                                    )
+                                    candidate_visibility = _intervention_visibility_table(
+                                        candidate_catalog,
+                                        candidate_before["robot_views"],
+                                        config,
+                                    )
+                                    if not candidate_visibility["eligible_target_ids"]:
+                                        raise SampleRejected(
+                                            "no_visible_intervention_target",
+                                            candidate_visibility["requirements"],
+                                        )
+                                    trajectories = candidate_trajectories
+                                    trajectory_metrics = candidate_metrics
+                                    graph = candidate_graph
+                                    temporal_overlap_metrics = candidate_overlap
+                                    w0_catalog = candidate_catalog
+                                    world_calibration = candidate_calibration
+                                    w0_snapshot = candidate_snapshot
+                                    before = candidate_before
+                                    visibility_table = candidate_visibility
+                                    break
+                                except SampleRejected as candidate_error:
+                                    before = None
+                                    candidate_failures.append({
+                                        "candidate_rank": candidate_rank,
+                                        "candidate_kind": candidate_metrics.get(
+                                            "nested_trajectory_sets", {}
+                                        ).get("candidate_kind", "base"),
+                                        "reason": candidate_error.reason,
+                                        "details": candidate_error.details,
+                                        "trajectory_summary": {
+                                            "observation_regime": candidate_metrics.get(
+                                                "observation_regime"
+                                            ),
+                                            "joint_diversity": candidate_metrics.get(
+                                                "joint_diversity"
+                                            ),
+                                            "robots": candidate_metrics.get("robots"),
+                                            "nested_trajectory_sets": candidate_metrics.get(
+                                                "nested_trajectory_sets"
+                                            ),
+                                        },
+                                    })
+                                    candidate_rank += 1
+                                    if candidate_rank == base_candidate_count:
+                                        trajectory_candidates.extend(
+                                            adapter.complementary_trajectory_hybrids(
+                                                base_trajectory_candidates,
+                                                candidate_failures,
+                                            )
+                                        )
+                            if before is None:
+                                raise SampleRejected(
+                                    "trajectory_set_candidates_exhausted",
+                                    {"candidate_failures": candidate_failures},
+                                )
                             break
                         except SampleRejected as error:
+                            before = None
                             writer.record_reject(
                                 f"episode-before:{selected_scene}/{configuration_id}/{episode_id}",
                                 error.reason,
@@ -612,7 +1064,27 @@ def generate_dataset(
                     after_catalog = None
                     after_snapshot = None
                     qa_results = None
-                    for event_attempt in range(int(config["intervention"]["maximum_attempts"])):
+                    post_render_effect = None
+                    visible_ids = set(visibility_table["eligible_target_ids"])
+                    available_intervention_types = {
+                        intervention_type
+                        for intervention_type in InterventionType
+                        if any(
+                            obj.instance_id in visible_ids
+                            for obj in eligible_intervention_targets(w0_catalog, intervention_type)
+                        )
+                    }
+                    fixed_intervention_type = _choose_quota_intervention_type(
+                        config["intervention"]["type_weights"],
+                        accepted_intervention_types,
+                        available_intervention_types,
+                        stable_seed(episode_seed, "intervention_type"),
+                    )
+                    event_attempt_count = min(
+                        int(config["intervention"]["maximum_attempts"]),
+                        int(config["intervention"]["post_render_effect"]["maximum_resample_attempts"]),
+                    )
+                    for event_attempt in range(event_attempt_count):
                         _write_status(
                             root,
                             status="running",
@@ -627,8 +1099,10 @@ def generate_dataset(
                         adapter.load_snapshot(w0_snapshot)
                         try:
                             intervention = adapter.apply_atomic_intervention(
-                                episode_seed + 500 + event_attempt,
+                                stable_seed(episode_seed, "intervention", event_attempt),
+                                forced_type=fixed_intervention_type,
                                 excluded_target_ids=tuple(sorted(used_targets)),
+                                visible_target_ids=tuple(visibility_table["eligible_target_ids"]),
                             )
                             environment_after, _ = _render_environment_floors(adapter, config)
                             after = adapter.playback_trajectories(
@@ -636,6 +1110,16 @@ def generate_dataset(
                                 int(trajectory_metrics["floor_index"]),
                                 world_calibration,
                             )
+                            post_render_effect = _post_render_intervention_effect(
+                                intervention["event"].target_instance_id,
+                                w0_catalog,
+                                before["robot_views"], after["robot_views"], config,
+                            )
+                            if not post_render_effect["passed"]:
+                                raise SampleRejected(
+                                    "post_render_intervention_effect_failed",
+                                    post_render_effect,
+                                )
                             paired = check_paired_trajectories(
                                 before["actual_trajectories"],
                                 after["actual_trajectories"],
@@ -655,7 +1139,7 @@ def generate_dataset(
                             qa_results = (
                                 QAResult(
                                     "initial_overlap",
-                                    bool(graph.connected and not graph.near_duplicate_pairs),
+                                    bool(not graph.near_duplicate_pairs),
                                     metrics={
                                         "minimum_overlap": float(min(graph.overlaps.values())),
                                         "maximum_overlap": float(max(graph.overlaps.values())),
@@ -663,7 +1147,7 @@ def generate_dataset(
                                 ),
                                 QAResult(
                                     "temporal_overlap_connectivity",
-                                    True,
+                                    bool(temporal_overlap_metrics["passed"]),
                                     metrics={
                                         "connected_fraction": float(
                                             temporal_overlap_metrics["connected_fraction"]
@@ -671,6 +1155,13 @@ def generate_dataset(
                                         "maximum_isolated_run": max(
                                             temporal_overlap_metrics["maximum_consecutive_isolated_keyframes"].values()
                                         ),
+                                        "union_edges": temporal_overlap_metrics["union_edges"],
+                                        "requested_regime": temporal_overlap_metrics[
+                                            "requested_regime"
+                                        ],
+                                        "realized_regime": temporal_overlap_metrics[
+                                            "realized_regime"
+                                        ],
                                     },
                                 ),
                                 QAResult(
@@ -694,12 +1185,22 @@ def generate_dataset(
                                         )
                                     },
                                 ),
+                                QAResult(
+                                    "post_render_intervention_effect",
+                                    bool(post_render_effect["passed"]),
+                                    metrics={
+                                        "changed_pixels": int(post_render_effect["changed_pixels"]),
+                                        "mean_rgb_delta": float(post_render_effect["mean_rgb_delta"]),
+                                    },
+                                ),
                             )
                             require_all(qa_results)
                             after_catalog = intervention["catalog"]
                             after_snapshot = intervention["snapshot"]
                             break
                         except SampleRejected as error:
+                            after = None
+                            intervention = None
                             writer.record_reject(
                                 f"event:{selected_scene}/{configuration_id}/{episode_id}",
                                 error.reason,
@@ -730,6 +1231,15 @@ def generate_dataset(
                         objects=after_catalog,
                         robots=robot_states,
                         simulator_snapshot_ref="simulator_after.npy",
+                    )
+                    sibling_diversity = _sibling_episode_diversity(
+                        root,
+                        selected_scene,
+                        configuration_id,
+                        trajectory_metrics,
+                        trajectories,
+                        fixed_intervention_type.value,
+                        intervention["event"].target_instance_id,
                     )
                     with writer.begin_episode(
                         selected_scene, configuration_id, episode_id
@@ -784,12 +1294,14 @@ def generate_dataset(
                                 before["actual_trajectories"],
                                 "before",
                                 before_view_refs,
+                                before["camera_capture_metadata"],
                             ),
                             observations_after=_observation_records(
                                 config,
                                 after["actual_trajectories"],
                                 "after",
                                 after_view_refs,
+                                after["camera_capture_metadata"],
                             ),
                             qa=qa_results,
                         )
@@ -802,10 +1314,53 @@ def generate_dataset(
                                 "before": before["metrics"],
                                 "after": after["metrics"],
                                 "intervention_attempt": intervention["attempt"],
+                                "fixed_intervention_type": fixed_intervention_type.value,
+                                "intervention_visibility": visibility_table,
+                                "post_render_intervention_effect": post_render_effect,
+                                "sibling_episode_diversity": sibling_diversity,
                             },
                         )
                         inspection_root = transaction.staging / "inspection"
                         image_names = []
+                        floor_id = (
+                            f"floor_{int(trajectory_metrics['floor_index']):02d}"
+                        )
+                        environment_image_name = (
+                            "environment_base_rooms_and_target.png"
+                        )
+                        with np.load(
+                            configuration_root
+                            / "bev"
+                            / "environment_base.npz",
+                            allow_pickle=False,
+                        ) as environment_base:
+                            save_environment_room_inspection(
+                                inspection_root / environment_image_name,
+                                environment_base,
+                                w0_catalog,
+                                intervention["event"],
+                                floor_id=floor_id,
+                            )
+                        image_names.append(environment_image_name)
+
+                        trajectory_image_name = "trajectory_inspection.png"
+                        save_trajectory_inspection(
+                            inspection_root / trajectory_image_name,
+                            adapter.trajectory_traversability_inspection(
+                                int(trajectory_metrics["floor_index"])
+                            ),
+                            trajectories,
+                            temporal_overlap_metrics,
+                        )
+                        image_names.append(trajectory_image_name)
+
+                        overlap_image_name = "overlap_keyframes.png"
+                        save_overlap_graph_inspection(
+                            inspection_root / overlap_image_name,
+                            temporal_overlap_metrics,
+                        )
+                        image_names.append(overlap_image_name)
+
                         save_rgb(
                             inspection_root / "world_before_t000.png",
                             before["world_bev"]["rgb"][0],
@@ -817,16 +1372,20 @@ def generate_dataset(
                         image_names.extend(
                             ["world_before_t000.png", "world_after_t000.png"]
                         )
-                        trajectory_image_name = "trajectory_inspection.png"
-                        save_trajectory_inspection(
-                            inspection_root / trajectory_image_name,
-                            adapter.trajectory_traversability_inspection(
-                                int(trajectory_metrics["floor_index"])
+
+                        target_crop_name = "intervention_target_crops.png"
+                        if save_intervention_target_crops(
+                            inspection_root / target_crop_name,
+                            before["robot_views"],
+                            after["robot_views"],
+                            int(
+                                post_render_effect[
+                                    "target_public_instance_id"
+                                ]
                             ),
-                            trajectories,
-                            temporal_overlap_metrics,
-                        )
-                        image_names.append(trajectory_image_name)
+                        ):
+                            image_names.append(target_crop_name)
+
                         for robot_id in sorted(before["robot_views"]):
                             name = f"{robot_id}_before_t000.png"
                             save_rgb(
@@ -841,11 +1400,16 @@ def generate_dataset(
                                 "qa": qa_results,
                                 "event": intervention["event"],
                                 "trajectory": trajectory_metrics,
+                                "sibling_episode_diversity": sibling_diversity,
                             },
                             image_names,
                         )
                         transaction.finalize()
                     used_targets.add(intervention["event"].target_instance_id)
+                    accepted_intervention_types[fixed_intervention_type.value] += 1
+                    used_regions.update(trajectory_metrics.get("start_region_ids", []))
+                    for region_ids in trajectory_metrics.get("traversed_region_ids", {}).values():
+                        used_regions.update(region_ids)
                     accepted_episodes += 1
                     _write_status(
                         root,

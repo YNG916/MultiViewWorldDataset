@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from multi_view_world_dataset.diagnostics import run_sampling_diagnostics
+from multi_view_world_dataset.dataset_diagnostics import summarize_generated_dataset
 from multi_view_world_dataset.generator import generate_dataset
 from multi_view_world_dataset.pipeline import inspect_simulator_runtime, run_simulator_probe
 from multi_view_world_dataset.utils.config import load_yaml_config
@@ -47,6 +49,27 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--scene", help="Installed scene ID; defaults to first dynamically discovered scene")
     _machine_arguments(smoke, output=True)
 
+    diagnostics = subparsers.add_parser(
+        "sampling-diagnostics",
+        help="Sample placement/path distributions without dense episode rendering",
+    )
+    diagnostics.add_argument("--config", required=True)
+    diagnostics.add_argument("--scene")
+    diagnostics.add_argument("--samples", type=int)
+    diagnostics.add_argument(
+        "--with-overlap-preflight", action="store_true",
+        help="Also render sparse GT-depth keyframes and report temporal overlap topology",
+    )
+    _machine_arguments(diagnostics, output=True)
+    dataset_diagnostics = subparsers.add_parser(
+        "dataset-diagnostics",
+        help="Aggregate finalized Dataset-v1.1 episodes without the simulator",
+    )
+    dataset_diagnostics.add_argument("--dataset-root", required=True)
+    dataset_diagnostics.add_argument(
+        "--output", help="Optional JSON path; defaults inside the dataset root"
+    )
+
     generate = subparsers.add_parser(
         "generate",
         help="Generate or safely resume an accepted smoke/integration dataset",
@@ -68,6 +91,15 @@ def main(argv: list[str] | None = None) -> int:
         config = load_yaml_config(args.config)
         print(json.dumps({"status": "ok", "profile": config["profile"]}, indent=2))
         return 0
+    if args.command == "dataset-diagnostics":
+        output, report = summarize_generated_dataset(
+            args.dataset_root, output_path=args.output
+        )
+        print(json.dumps(
+            {"status": "pass", "output": str(output), **report},
+            indent=2, sort_keys=True,
+        ))
+        return 0
     config, runtime = _load(args)
     if args.command == "inspect-runtime":
         report = inspect_simulator_runtime(runtime, config, verify_assets=not args.skip_asset_stat)
@@ -77,6 +109,13 @@ def main(argv: list[str] | None = None) -> int:
         output, findings = run_simulator_probe(runtime, config, scene_id=args.scene)
         print(json.dumps({"status": findings["status"], "output": str(output)}, indent=2))
         return 0 if findings["status"] == "pass" else 2
+    if args.command == "sampling-diagnostics":
+        output, report = run_sampling_diagnostics(
+            runtime, config, scene_id=args.scene, samples=args.samples,
+            include_overlap_preflight=bool(args.with_overlap_preflight),
+        )
+        print(json.dumps({"status": "pass", "output": str(output), **report}, indent=2, sort_keys=True))
+        return 0
     if args.command == "generate":
         output, result = generate_dataset(
             runtime,

@@ -57,6 +57,10 @@ class BEVCalibration:
         m = self.meters_per_pixel
         return np.array([[m, 0, 0, xmin + 0.5 * m], [0, -m, 0, ymax - 0.5 * m], [0, 0, 1, self.floor_z], [0, 0, 0, 1]])
 
+    @property
+    def world_to_pixel_transform(self) -> FloatArray:
+        return np.linalg.inv(self.pixel_to_world_transform)
+
     def pixel_to_world(self, pixels_uv: ArrayLike) -> FloatArray:
         pixels = np.asarray(pixels_uv, dtype=np.float64)
         if pixels.shape[-1] != 2:

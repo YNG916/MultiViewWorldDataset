@@ -41,11 +41,50 @@ Generate or resume an accepted development dataset with an explicit output root:
 ```bash
 mvwd generate --config configs/smoke.yaml --scene Rs_int --output-root /path/to/smoke-output
 mvwd generate --config configs/integration.yaml --scene Rs_int --output-root /path/to/integration-output
+# Required final-robot integration gate after the 1x1x1 preview passes:
+mvwd generate --config configs/integration_final_robot.yaml --scene Rs_int \
+  --output-root /path/to/new-final-robot-integration-output
 ```
 
 Generation writes `generation_status.json` while running, appends structured rejects to `rejects.jsonl`, and
-atomically finalizes accepted configurations and episodes. Re-running the same command resumes finalized work.
-Pilot/default profiles are refused unless `--allow-large` is supplied; this workflow stops after integration.
+atomically finalizes accepted configurations and episodes. Dataset-v1.1 also writes the resolved configuration,
+a configuration fingerprint, a non-empty public semantic/instance taxonomy, per-frame observation calibration, and
+full temporal overlap graph metadata. Resume is allowed only when the fingerprint is identical; a changed config is
+refused instead of being mixed into an existing root. Pilot/default profiles are refused unless `--allow-large` is
+supplied; this workflow stops after integration.
+
+Before rendering a dataset, inspect stochastic sampling distributions without a dense RGB rollout:
+
+```bash
+mvwd sampling-diagnostics --config configs/final_robot_preview.yaml --scene Rs_int \
+  --samples 100 --output-root /path/to/diagnostics
+
+# Optional: also render sparse GT-depth keyframes and aggregate overlap topology.
+mvwd sampling-diagnostics --config configs/final_robot_preview.yaml --scene Rs_int \
+  --samples 20 --with-overlap-preflight --output-root /path/to/overlap-diagnostics
+```
+
+After generation, aggregate every finalized configuration/episode (including
+room coverage, trajectory distributions, overlap topology, intervention
+visibility/effect, stable IDs, calibration evidence, rejects, and storage):
+
+```bash
+mvwd dataset-diagnostics --dataset-root /path/to/generated-dataset
+```
+
+The command writes `dataset_diagnostics.json` in the dataset root. Sampling
+collapse thresholds and their minimum evaluation sample count are resolved
+from `sampling_diagnostics` in the dataset's own `resolved_config.yaml`;
+small smoke runs report that warning evaluation is deferred.
+
+The generator samples OG room-instance (or explicitly named conceptual fallback) observation regions, three
+independent traversability-aware geodesic paths, and a configurable `dense_shared` / `partial_chain` / `exploratory`
+regime. It does not optimize for the most compact or most parallel three-robot formation. Each fixed placement owns a
+nested pool of trajectory sets; temporal acceptance uses the union overlap graph, meaningful shared moments, robot
+participation, regime-aware isolation-run limits, and near-duplicate rejection as hard constraints. Per-keyframe graph
+connectivity and shared-keyframe fractions are soft regime targets used to label both the requested and realized
+regime; they are persisted for QA but do not recreate a compact-formation gate. Before and after branches still use the
+exact same accepted trajectory bytes.
 
 Visualize every stored image modality for one episode in a single command:
 
@@ -60,12 +99,14 @@ the static environment BEVs. Pass the dataset root instead to process every epis
 is validated by default so the known stale perspective-camera capture failure is not silently visualized.
 
 The full profile is never started automatically. See [the environment guide](docs/environment_setup.md),
-[dataset v1 specification](docs/dataset_v1_spec.md), [pipeline gates](docs/pipeline.md), and the
+[dataset v1 specification](docs/dataset_v1_spec.md), [pipeline gates](docs/pipeline.md).
 
 ## Repository boundaries
 
 - Dataset records and training-facing code contain no OmniGibson objects.
 - All machine paths are resolved centrally from CLI overrides and environment variables.
 - Dense arrays are derived products; structured state, snapshots, trajectories, and events are canonical.
-- Each floor has its own calibrated true-orthographic BEV.
+- Each floor has one static canonical extent shared by all environment/world BEVs; resolution may differ.
+- BEV occupancy and robot-eroded traversability are distinct stored modalities.
+- Renderer IDs are remapped through native paths and stable ObjectState IDs into documented public integers.
 - Scene-family-disjoint splits are assigned before configuration generation.

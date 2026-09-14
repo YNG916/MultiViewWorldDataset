@@ -7,7 +7,7 @@ machine:
   cache_root_env: DATASET_CACHE_ROOT
 
 dataset:
-  schema_version: "1.0.0"
+  schema_version: "1.1.0"
   scene_limit: null
   accepted_configurations_per_scene: 150
   accepted_episodes_per_configuration: 3
@@ -33,6 +33,8 @@ camera:
   heights_m: [0.8, 1.0, 1.2, 1.4]
   multimodal_alignment_keyframe_count: 7
   minimum_multimodal_alignment_fraction: 0.75
+  maximum_capture_translation_error_m: 0.005
+  maximum_capture_rotation_error_rad: 0.0087266463
 
 bev:
   environment_meters_per_pixel: 0.02
@@ -40,17 +42,39 @@ bev:
   bounds_margin_m: 0.5
   maximum_occupancy_fraction: 0.98
   robot_mask_projection_tolerance_m: 0.75
-  modalities: [rgb, depth_linear, height, normal, semantic, instance, instance_id, occupancy]
+  modalities: [rgb, depth_linear, height, normal, semantic, instance, instance_id, occupancy, traversability]
   world_modalities: [rgb, depth_linear, height, semantic, instance, instance_id, occupancy]
 
 placement:
-  cluster_radius_m: 3.0
-  preferred_cluster_radius_m: 0.8
-  heading_jitter_deg: 5.0
-  common_view_focus_distance_m: 1.5
-  trajectory_separation_headroom_m: 0.10
   minimum_pairwise_distance_m: 0.6
+  trajectory_separation_headroom_m: 0.50
   maximum_attempts: 200
+  region_adjacency_distance_m: 0.5
+  # Covers the final robot footprint around current movable-object AABBs.
+  dynamic_object_start_clearance_m: 0.55
+  initial_heading_probe_min_m: 0.15
+  initial_heading_probe_max_m: 0.75
+  sibling_region_reuse_penalty: 1.0
+  spatial_soft_probability_floor: 0.05
+  regime_spatial_soft_scale_m:
+    dense_shared: 1.75
+    partial_chain: 2.25
+    exploratory: null
+  dense_shared_focus_distance_m: 4.0
+  observation_regime_weights:
+    dense_shared: 0.30
+    partial_chain: 0.50
+    exploratory: 0.20
+  formation_degeneracy:
+    minimum_mean_heading_difference_deg: 8.0
+    maximum_mean_path_similarity: 0.96
+    minimum_spatial_coverage_m2: 1.0
+
+configuration_sampling:
+  movable_fraction: 0.15
+  minimum_changed_objects: 2
+  maximum_changed_objects: 6
+  stratify_by: [size, category, room, relation]
 
 overlap:
   edge_threshold: 0.20
@@ -72,18 +96,46 @@ trajectory:
     two_waypoint: 0.20
   minimum_waypoint_trajectories: 1
   initial_heading_tolerance_deg: 35.0
+  initial_heading_policy: trajectory_tangent
+  # Preserve a scene-view direction as a soft prior without forcing convergence.
+  initial_heading_soft_probability_floor: 0.25
+  maximum_control_turn_deg: 55.0
   line_validation_spacing_m: 0.025
   smoothing_validation_spacing_m: 0.025
   smoothing_strengths: [1.0, 0.5, 0.25]
   candidate_pool_size: 6
   joint_pool_rounds: 5
+  trajectory_sets_per_placement: 8
+  maximum_complementary_hybrid_candidates: 8
   sampling_maximum_attempts: 200
+  regime_coverage_saturation_m2:
+    dense_shared: 8.0
+    partial_chain: 16.0
+    exploratory: 30.0
+  # Softly preserve each robot's own regime view direction. This score never
+  # compares robot headings, so it cannot reward parallel/compact formations.
+  regime_initial_heading_prior_weights:
+    dense_shared: 1.00
+    partial_chain: 0.75
+    exploratory: 0.00
   overlap_preflight:
     keyframe_count: 7
     geometry_width: 224
     geometry_height: 128
-    connected_fraction_min: 0.60
-    maximum_consecutive_isolated_keyframes: 2
+    # Soft topology targets used for regime QA / realized-regime labeling.
+    # G_union connectivity remains the hard episode-level requirement.
+    regime_connected_fraction_target:
+      dense_shared: 0.60
+      partial_chain: 0.30
+      exploratory: 0.15
+    regime_shared_keyframe_fraction_target:
+      dense_shared: 0.60
+      partial_chain: 0.30
+      exploratory: 0.15
+    regime_maximum_consecutive_isolated_keyframes:
+      dense_shared: 2
+      partial_chain: 4
+      exploratory: 5
     depth_sample_stride: 4
   validation_position_tolerance_m: 1.0e-5
   validation_rotation_tolerance_rad: 1.0e-5
@@ -99,6 +151,35 @@ intervention:
   rotation_max_deg: 120.0
   maximum_attempts: 100
   application_mode: pre_rollout
+  target_visibility:
+    minimum_pixels: 64
+    minimum_frames: 2
+    minimum_robots: 1
+    preferred_robots: 2
+  post_render_effect:
+    minimum_changed_pixels: 32
+    minimum_mean_rgb_delta: 3.0
+    maximum_resample_attempts: 8
+
+sampling_diagnostics:
+  sample_count: 100
+  include_overlap_preflight: false
+  collapse_warning_rate: 0.20
+  output_name: sampling_diagnostics.json
+  minimum_samples_for_distribution_warnings: 10
+  collapse_thresholds:
+    dominant_start_region_fraction_max: 0.90
+    direct_path_fraction_max: 0.90
+    parallel_episode_fraction_max: 0.80
+    compact_start_episode_fraction_max: 0.90
+    complete_triangle_keyframe_fraction_max: 0.90
+    zero_visible_intervention_fraction_max: 0.00
+    dominant_intervention_room_fraction_max: 0.90
+    dominant_intervention_category_fraction_max: 0.90
+    single_changed_object_configuration_fraction_max: 0.00
+    temporal_union_connected_fraction_min: 0.10
+  parallel_path_direction_similarity_min: 0.90
+  compact_start_max_pairwise_distance_m: 3.0
 
 generation:
   settle_steps: 30

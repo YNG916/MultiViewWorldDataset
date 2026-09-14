@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -110,25 +111,158 @@ def validate_config(config: dict[str, Any]) -> None:
         "smoothing_validation_spacing_m",
         "candidate_pool_size",
         "joint_pool_rounds",
+        "trajectory_sets_per_placement",
         "sampling_maximum_attempts",
     ):
         value = trajectory.get(key)
         if not isinstance(value, (int, float)) or value <= 0:
             errors.append(f"Trajectory setting {key} must be positive")
+    if trajectory.get("initial_heading_policy") not in {"trajectory_tangent", "fixed_prior"}:
+        errors.append("Trajectory initial_heading_policy must be trajectory_tangent or fixed_prior")
+    heading_floor = trajectory.get("initial_heading_soft_probability_floor")
+    if (
+        not isinstance(heading_floor, (int, float))
+        or not 0.0 < float(heading_floor) <= 1.0
+    ):
+        errors.append("Trajectory initial_heading_soft_probability_floor must lie in (0,1]")
+    trajectory_set_count = trajectory.get("trajectory_sets_per_placement")
+    if not isinstance(trajectory_set_count, int) or not 8 <= trajectory_set_count <= 16:
+        errors.append("trajectory_sets_per_placement must be an integer in [8,16]")
+    hybrid_count = trajectory.get("maximum_complementary_hybrid_candidates")
+    if (
+        not isinstance(hybrid_count, int)
+        or hybrid_count < 0
+        or isinstance(trajectory_set_count, int)
+        and trajectory_set_count + hybrid_count > 16
+    ):
+        errors.append(
+            "base trajectory sets plus complementary hybrids must total at most 16"
+        )
+
     strengths = trajectory.get("smoothing_strengths", ())
     if not strengths or any(not 0.0 < float(value) <= 1.0 for value in strengths):
         errors.append("Trajectory smoothing_strengths must lie in (0,1]")
     preflight = trajectory.get("overlap_preflight", {})
-    connected_fraction = preflight.get("connected_fraction_min")
-    if not isinstance(connected_fraction, (int, float)) or not 0.0 <= connected_fraction <= 1.0:
-        errors.append("Trajectory overlap connected_fraction_min must lie in [0,1]")
+    regimes = config.get("placement", {}).get("observation_regime_weights", {})
+    required_regimes = {"dense_shared", "partial_chain", "exploratory"}
+    coverage_saturations = trajectory.get("regime_coverage_saturation_m2", {})
+    if set(coverage_saturations) != required_regimes or any(
+        not isinstance(value, (int, float)) or float(value) <= 0.0
+        for value in coverage_saturations.values()
+    ):
+        errors.append("Trajectory regime_coverage_saturation_m2 must define positive values for all regimes")
+    heading_prior_weights = trajectory.get("regime_initial_heading_prior_weights", {})
+    if set(heading_prior_weights) != required_regimes or any(
+        not isinstance(value, (int, float))
+        or not isfinite(float(value))
+        or float(value) < 0.0
+        for value in heading_prior_weights.values()
+    ):
+        errors.append(
+            "Trajectory regime_initial_heading_prior_weights must define finite "
+            "non-negative values for all regimes"
+        )
+    if set(regimes) != required_regimes or abs(sum(float(v) for v in regimes.values()) - 1.0) > 1e-8:
+        errors.append("Placement observation_regime_weights must define the three regimes and sum to 1")
+    connected_fractions = preflight.get("regime_connected_fraction_target", {})
+    if set(connected_fractions) != required_regimes or any(
+        not 0.0 <= float(value) <= 1.0 for value in connected_fractions.values()
+    ):
+        errors.append("Trajectory regime_connected_fraction_target must define [0,1] values for all regimes")
+    shared_fractions = preflight.get("regime_shared_keyframe_fraction_target", {})
+    if set(shared_fractions) != required_regimes or any(
+        not 0.0 <= float(value) <= 1.0 for value in shared_fractions.values()
+    ):
+        errors.append(
+            "Trajectory regime_shared_keyframe_fraction_target must define "
+            "[0,1] values for all regimes"
+        )
+    isolation_limits = preflight.get(
+        "regime_maximum_consecutive_isolated_keyframes", {}
+    )
+    if set(isolation_limits) != required_regimes or any(
+        not isinstance(value, int) or value < 0 for value in isolation_limits.values()
+    ):
+        errors.append(
+            "Trajectory regime_maximum_consecutive_isolated_keyframes must "
+            "define non-negative integer values for all regimes"
+        )
+    placement = config.get("placement", {})
+    probe_min = placement.get("initial_heading_probe_min_m")
+    probe_max = placement.get("initial_heading_probe_max_m")
+    if (
+        not isinstance(probe_min, (int, float))
+        or not isinstance(probe_max, (int, float))
+        or not 0.0 < float(probe_min) <= float(probe_max)
+    ):
+        errors.append("placement heading probe bounds must satisfy 0 < min <= max")
+
+    configuration_sampling = config.get("configuration_sampling", {})
+    minimum_changed = configuration_sampling.get("minimum_changed_objects")
+    maximum_changed = configuration_sampling.get("maximum_changed_objects")
+    fraction = configuration_sampling.get("movable_fraction")
+    if not isinstance(fraction, (int, float)) or not 0.0 < fraction <= 1.0:
+        errors.append("configuration_sampling.movable_fraction must lie in (0,1]")
+    if not isinstance(minimum_changed, int) or not isinstance(maximum_changed, int) or not 1 <= minimum_changed <= maximum_changed:
+        errors.append("configuration changed-object bounds must satisfy 1 <= minimum <= maximum")
     for key in (
         "keyframe_count", "geometry_width", "geometry_height",
-        "maximum_consecutive_isolated_keyframes", "depth_sample_stride",
     ):
         value = preflight.get(key)
         if not isinstance(value, int) or value < 1:
             errors.append(f"Trajectory overlap setting {key} must be a positive integer")
+    sampling_diagnostics = config.get("sampling_diagnostics", {})
+    warning_minimum = sampling_diagnostics.get(
+        "minimum_samples_for_distribution_warnings"
+    )
+    if not isinstance(warning_minimum, int) or warning_minimum < 1:
+        errors.append(
+            "sampling_diagnostics minimum warning sample count must be positive"
+        )
+    collapse_thresholds = sampling_diagnostics.get(
+        "collapse_thresholds", {}
+    )
+    required_collapse_thresholds = {
+        "dominant_start_region_fraction_max",
+        "direct_path_fraction_max",
+        "parallel_episode_fraction_max",
+        "compact_start_episode_fraction_max",
+        "complete_triangle_keyframe_fraction_max",
+        "zero_visible_intervention_fraction_max",
+        "dominant_intervention_room_fraction_max",
+        "dominant_intervention_category_fraction_max",
+        "single_changed_object_configuration_fraction_max",
+        "temporal_union_connected_fraction_min",
+    }
+    if set(collapse_thresholds) != required_collapse_thresholds or any(
+        not isinstance(value, (int, float))
+        or not 0.0 <= float(value) <= 1.0
+        for value in collapse_thresholds.values()
+    ):
+        errors.append(
+            "sampling_diagnostics collapse_thresholds must define all "
+            "Dataset-v1.1 warning fractions in [0,1]"
+        )
+    parallel_similarity = sampling_diagnostics.get(
+        "parallel_path_direction_similarity_min"
+    )
+    if (
+        not isinstance(parallel_similarity, (int, float))
+        or not -1.0 <= float(parallel_similarity) <= 1.0
+    ):
+        errors.append(
+            "sampling_diagnostics parallel similarity must lie in [-1,1]"
+        )
+    compact_distance = sampling_diagnostics.get(
+        "compact_start_max_pairwise_distance_m"
+    )
+    if (
+        not isinstance(compact_distance, (int, float))
+        or float(compact_distance) <= 0.0
+    ):
+        errors.append(
+            "sampling_diagnostics compact start distance must be positive"
+        )
     if errors:
         raise ConfigurationError("Invalid dataset configuration:\n- " + "\n- ".join(errors))
 

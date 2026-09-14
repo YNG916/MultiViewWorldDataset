@@ -9,8 +9,12 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import yaml
 
+from multi_view_world_dataset.errors import ConfigurationError
 from multi_view_world_dataset.schema.records import DynamicConfiguration, ObjectState, Trajectory, WorldEpisode
+from multi_view_world_dataset.rendering.labels import stable_semantic_id
+from multi_view_world_dataset.utils.provenance import configuration_fingerprint, default_taxonomy
 from multi_view_world_dataset.utils.serialization import dump_json, to_jsonable
 
 
@@ -92,9 +96,82 @@ class DatasetWriter:
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
 
-    def initialize(self, dataset_meta: dict[str, Any], taxonomy: dict[str, Any] | None = None) -> None:
-        dump_json(self.root / "dataset_meta.json", dataset_meta)
-        dump_json(self.root / "taxonomy.json", taxonomy or {})
+    def initialize(
+        self,
+        dataset_meta: dict[str, Any],
+        taxonomy: dict[str, Any] | None = None,
+        *,
+        resolved_config: dict[str, Any] | None = None,
+    ) -> None:
+        metadata = dict(dataset_meta)
+        if resolved_config is not None:
+            metadata["configuration_fingerprint"] = configuration_fingerprint({
+                "resolved_config": resolved_config,
+                "generator_source_fingerprint": metadata.get("generator_source_fingerprint"),
+            })
+            metadata["resolved_config_ref"] = "resolved_config.yaml"
+        meta_path = self.root / "dataset_meta.json"
+        if meta_path.is_file():
+            existing = json.loads(meta_path.read_text(encoding="utf-8"))
+            old_fingerprint = existing.get("configuration_fingerprint")
+            new_fingerprint = metadata.get("configuration_fingerprint")
+            if old_fingerprint != new_fingerprint:
+                raise ConfigurationError(
+                    "Refusing unsafe resume: resolved configuration / generator fingerprint differs "
+                    f"({old_fingerprint!r} != {new_fingerprint!r})"
+                )
+            dump_json(meta_path, {**metadata, **existing})
+        else:
+            dump_json(meta_path, metadata)
+        taxonomy_path = self.root / "taxonomy.json"
+        if not taxonomy_path.is_file():
+            dump_json(taxonomy_path, taxonomy or default_taxonomy())
+        if resolved_config is not None and not (self.root / "resolved_config.yaml").is_file():
+            target = self.root / "resolved_config.yaml"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                yaml.safe_dump(to_jsonable(resolved_config), sort_keys=True),
+                encoding="utf-8",
+            )
+
+    def update_dataset_metadata(self, updates: dict[str, Any]) -> None:
+        """Atomically merge runtime facts without changing dataset semantics."""
+        path = self.root / "dataset_meta.json"
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            "configuration_fingerprint" in updates
+            and updates["configuration_fingerprint"]
+            != existing.get("configuration_fingerprint")
+        ):
+            raise ConfigurationError(
+                "Refusing to change configuration_fingerprint after initialization"
+            )
+        dump_json(path, {**existing, **updates})
+
+    def update_scene_taxonomy(
+        self, scene_id: str, catalog: tuple[ObjectState, ...]
+    ) -> dict[str, Any]:
+        path = self.root / "taxonomy.json"
+        taxonomy = json.loads(path.read_text(encoding="utf-8"))
+        semantic = taxonomy.setdefault("semantic_labels", {})
+        entries = []
+        for public_id, obj in enumerate(sorted(catalog, key=lambda item: item.instance_id), start=4):
+            # A stable category hash avoids renumbering when later scenes are appended.
+            semantic_id = stable_semantic_id(obj.category)
+            semantic.setdefault(str(semantic_id), {"name": obj.category, "reserved": False})
+            entries.append({
+                "public_instance_id": public_id,
+                "object_state_id": obj.instance_id,
+                "native_path": obj.native_path,
+                "asset_uid": obj.asset_uid,
+                "category": obj.category,
+                "public_semantic_id": semantic_id,
+            })
+        taxonomy.setdefault("instance_catalogs", {})[scene_id] = entries
+        dump_json(path, taxonomy)
+        return taxonomy
 
     def write_scene(self, scene_id: str, scene_meta: Any, catalog: tuple[ObjectState, ...]) -> Path:
         target = self.root / "scenes" / scene_id
@@ -191,5 +268,7 @@ class DatasetWriter:
         transaction.write_json("state_before.json", episode.state_before)
         transaction.write_json("state_after.json", episode.state_after)
         transaction.write_json("qa.json", episode.qa)
+        transaction.write_json("observations_before.json", episode.observations_before)
+        transaction.write_json("observations_after.json", episode.observations_after)
         transaction.write_trajectories(episode.trajectories)
 

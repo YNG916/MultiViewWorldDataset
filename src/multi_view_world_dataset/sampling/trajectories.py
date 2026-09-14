@@ -8,6 +8,11 @@ from numpy.typing import ArrayLike, NDArray
 
 from multi_view_world_dataset.cameras.transforms import compose_transforms, pose_from_xy_yaw
 from multi_view_world_dataset.errors import SampleRejected
+from multi_view_world_dataset.sampling.diversity import (
+    formation_degenerate,
+    joint_trajectory_metrics,
+    regime_trajectory_soft_score,
+)
 from multi_view_world_dataset.schema.records import Trajectory
 
 FloatArray = NDArray[np.float64]
@@ -179,7 +184,20 @@ def resample_path_by_arc_length(points: ArrayLike, frames: int) -> FloatArray:
     if len(values) < 2:
         raise ValueError("path has zero arc length")
     cumulative = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(values, axis=0), axis=1))))
-    targets = np.linspace(0.0, cumulative[-1], frames)
+    # Symmetric sinusoidal acceleration/deceleration ramps preserve most of the
+    # clip at cruise speed without the unrealistic instantaneous start/stop of
+    # uniform frame spacing.
+    intervals = frames - 1
+    phase = (np.arange(intervals, dtype=np.float64) + 0.5) / intervals
+    ramp_fraction = 0.12
+    weights = np.ones(intervals, dtype=np.float64)
+    leading = phase < ramp_fraction
+    trailing = phase > 1.0 - ramp_fraction
+    weights[leading] = np.sin(0.5 * np.pi * phase[leading] / ramp_fraction)
+    weights[trailing] = np.sin(0.5 * np.pi * (1.0 - phase[trailing]) / ramp_fraction)
+    progress = np.concatenate(([0.0], np.cumsum(weights)))
+    progress /= progress[-1]
+    targets = progress * cumulative[-1]
     return np.column_stack(
         [np.interp(targets, cumulative, values[:, dimension]) for dimension in range(2)]
     )
@@ -227,7 +245,7 @@ def trajectory_from_spatial_path(
         control_waypoints_xy=empty if control_waypoints_xy is None else control_waypoints_xy,
         planner_path_xy=empty if planner_path_xy is None else planner_path_xy,
         smoothed_path_xy=np.asarray(path_xy if smoothed_path_xy is None else smoothed_path_xy),
-        metadata=dict(metadata or {}),
+        metadata={"velocity_profile": "symmetric_sinusoidal_ramp", **dict(metadata or {})},
     )
 
 
@@ -296,23 +314,56 @@ def _sample_route_controls(
     minimum_length_m: float,
     maximum_length_m: float,
     initial_heading_tolerance_rad: float,
+    maximum_control_turn_rad: float,
     rng: np.random.Generator,
+    *,
+    soft_initial_heading: bool = False,
+    initial_heading_probability_floor: float = 0.20,
 ) -> FloatArray | None:
     segment_count = _PATH_FAMILY_SEGMENTS[family]
     controls = [start_xy]
     current = start_xy
+    previous_bearing = start_yaw
     for segment_index in range(segment_count):
         distances = np.linalg.norm(candidates - current, axis=1)
         minimum_step = 0.75 * minimum_length_m / segment_count
         maximum_step = maximum_length_m / segment_count
         eligible = (distances >= max(0.10, minimum_step)) & (distances <= maximum_step)
-        if segment_index == 0:
-            bearings = np.arctan2(candidates[:, 1] - current[1], candidates[:, 0] - current[0])
-            eligible &= np.abs(_wrap_angles(bearings - start_yaw)) <= initial_heading_tolerance_rad
+        bearings = np.arctan2(
+            candidates[:, 1] - current[1], candidates[:, 0] - current[0]
+        )
+        if segment_index == 0 and not soft_initial_heading:
+            # A far waypoint bearing is only a proxy for the native geodesic
+            # initial tangent. Prefer it when topology permits, but do not make
+            # a curved corridor impossible before planning. The actual smoothed
+            # first tangent is checked against the same hard tolerance below.
+            heading_eligible = (
+                np.abs(_wrap_angles(bearings - start_yaw))
+                <= initial_heading_tolerance_rad
+            )
+            if np.any(eligible & heading_eligible):
+                eligible &= heading_eligible
+        elif segment_index > 0:
+            # Control points are a spatial prior, not permission for an
+            # instantaneous U-turn. Consecutive route bearings constrain the
+            # subsequently smoothed curve to physically trackable turns.
+            eligible &= np.abs(_wrap_angles(bearings - previous_bearing)) <= maximum_control_turn_rad
         indices = np.flatnonzero(eligible)
         if not len(indices):
             return None
-        current = candidates[int(indices[int(rng.integers(len(indices)))])]
+        if segment_index == 0 and soft_initial_heading:
+            if not 0.0 < initial_heading_probability_floor <= 1.0:
+                raise ValueError("initial heading probability floor must lie in (0,1]")
+            heading_errors = np.abs(_wrap_angles(bearings[indices] - start_yaw))
+            scale = max(float(initial_heading_tolerance_rad), 1.0e-6)
+            weights = initial_heading_probability_floor + (
+                1.0 - initial_heading_probability_floor
+            ) * np.exp(-0.5 * (heading_errors / scale) ** 2)
+            selected_index = int(rng.choice(indices, p=weights / weights.sum()))
+        else:
+            selected_index = int(indices[int(rng.integers(len(indices)))])
+        previous_bearing = float(bearings[selected_index])
+        current = candidates[selected_index]
         controls.append(current)
     return np.asarray(controls, dtype=np.float64)
 
@@ -373,6 +424,9 @@ def _sample_robot_pool(
     is_path_traversable: PathValidator,
     path_family_weights: Mapping[str, float],
     initial_heading_tolerance_rad: float,
+    derive_initial_heading_from_tangent: bool,
+    initial_heading_probability_floor: float,
+    maximum_control_turn_rad: float,
     line_validation_spacing_m: float,
     smoothing_validation_spacing_m: float,
     smoothing_strengths: Sequence[float],
@@ -407,7 +461,10 @@ def _sample_robot_pool(
             minimum_length,
             maximum_length,
             initial_heading_tolerance_rad,
+            maximum_control_turn_rad,
             rng,
+            soft_initial_heading=derive_initial_heading_from_tangent,
+            initial_heading_probability_floor=initial_heading_probability_floor,
         )
         if controls is None:
             rejection_counts["no_control_candidates"] += 1
@@ -454,7 +511,11 @@ def _sample_robot_pool(
             },
         )
         first_yaw = float(np.arctan2(candidate.base_to_world[0, 1, 0], candidate.base_to_world[0, 0, 0]))
-        heading_error = abs(float(_wrap_angles(first_yaw - start_yaw)))
+        prior_heading_error = abs(float(_wrap_angles(first_yaw - start_yaw)))
+        heading_error = (
+            0.0 if derive_initial_heading_from_tangent
+            else prior_heading_error
+        )
         metrics = trajectory_kinematic_metrics(candidate)
         dense_sampled = densify_polyline(
             candidate.base_to_world[:, :2, 3], smoothing_validation_spacing_m
@@ -472,6 +533,10 @@ def _sample_robot_pool(
                 rejection_counts[name] += 1
             continue
         candidate.metadata["initial_heading_error_rad"] = heading_error
+        candidate.metadata["initial_heading_policy"] = (
+            "trajectory_tangent" if derive_initial_heading_from_tangent else "fixed_prior"
+        )
+        candidate.metadata["initial_heading_prior_error_rad"] = prior_heading_error
         pool.append(candidate)
         if len(pool) >= candidate_pool_size:
             return pool
@@ -492,7 +557,7 @@ def _sample_robot_pool(
 def sample_geodesic_trajectory_set(
     starts: Mapping[str, np.ndarray],
     camera_to_robot_bases: Mapping[str, np.ndarray],
-    traversable_xy: np.ndarray,
+    traversable_xy: np.ndarray | Mapping[str, np.ndarray],
     floor_z: float,
     rng: np.random.Generator,
     *,
@@ -514,14 +579,53 @@ def sample_geodesic_trajectory_set(
     candidate_pool_size: int,
     maximum_attempts: int,
     joint_pool_rounds: int,
+    maximum_control_turn_rad: float = np.deg2rad(55.0),
+    observation_regime: str = "partial_chain",
+    formation_degeneracy_limits: Mapping[str, float] | None = None,
+    regime_coverage_saturation_m2: Mapping[str, float] | None = None,
+    regime_initial_heading_prior_weights: Mapping[str, float] | None = None,
+    derive_initial_heading_from_tangent: bool = False,
+    initial_heading_probability_floor: float = 0.20,
 ) -> tuple[Trajectory, ...]:
     """Sample independent robot paths, then jointly enforce temporal separation."""
     robot_ids = tuple(sorted(starts))
     if robot_ids != tuple(sorted(camera_to_robot_bases)):
         raise ValueError("Robot starts and camera mounts must have identical IDs")
-    candidates = np.asarray(traversable_xy, dtype=np.float64)
-    if candidates.ndim != 2 or candidates.shape[1] != 2:
-        raise ValueError("traversable_xy must have shape [K,2]")
+    if isinstance(traversable_xy, Mapping):
+        if tuple(sorted(traversable_xy)) != robot_ids:
+            raise ValueError("Per-robot traversability must have identical robot IDs")
+        candidates_by_robot = {
+            robot_id: np.asarray(traversable_xy[robot_id], dtype=np.float64)
+            for robot_id in robot_ids
+        }
+    else:
+        shared_candidates = np.asarray(traversable_xy, dtype=np.float64)
+        candidates_by_robot = {
+            robot_id: shared_candidates for robot_id in robot_ids
+        }
+    if any(
+        candidates.ndim != 2 or candidates.shape[1] != 2 or not len(candidates)
+        for candidates in candidates_by_robot.values()
+    ):
+        raise ValueError("traversable_xy must provide non-empty [K,2] arrays")
+    initial_positions = np.stack([
+        np.asarray(starts[robot_id], dtype=np.float64)[:2, 3]
+        for robot_id in robot_ids
+    ])
+    initial_pairwise = np.asarray([
+        np.linalg.norm(initial_positions[left] - initial_positions[right])
+        for left in range(len(robot_ids))
+        for right in range(left + 1, len(robot_ids))
+    ])
+    initial_minimum_distance = float(initial_pairwise.min(initial=np.inf))
+    if initial_minimum_distance < minimum_pairwise_distance_m:
+        raise SampleRejected(
+            "trajectory_start_separation_failed",
+            {
+                "minimum_start_distance_m": initial_minimum_distance,
+                "required_minimum_distance_m": minimum_pairwise_distance_m,
+            },
+        )
     if (
         frames < 2
         or candidate_pool_size < 1
@@ -529,6 +633,7 @@ def sample_geodesic_trajectory_set(
         or joint_pool_rounds < 1
         or minimum_waypoint_trajectories < 0
         or minimum_waypoint_trajectories > len(robot_ids)
+        or not 0.0 < maximum_control_turn_rad <= np.pi
     ):
         raise ValueError("invalid trajectory sampling count or waypoint minimum")
 
@@ -540,7 +645,7 @@ def sample_geodesic_trajectory_set(
                     robot_id,
                     np.asarray(starts[robot_id], dtype=np.float64),
                     np.asarray(camera_to_robot_bases[robot_id], dtype=np.float64),
-                    candidates,
+                    candidates_by_robot[robot_id],
                     floor_z,
                     rng,
                     frames=frames,
@@ -553,8 +658,11 @@ def sample_geodesic_trajectory_set(
                     is_path_traversable=is_path_traversable,
                     path_family_weights=path_family_weights,
                     initial_heading_tolerance_rad=initial_heading_tolerance_rad,
+                    maximum_control_turn_rad=maximum_control_turn_rad,
                     line_validation_spacing_m=line_validation_spacing_m,
                     smoothing_validation_spacing_m=smoothing_validation_spacing_m,
+                    derive_initial_heading_from_tangent=derive_initial_heading_from_tangent,
+                    initial_heading_probability_floor=initial_heading_probability_floor,
                     smoothing_strengths=smoothing_strengths,
                     candidate_pool_size=candidate_pool_size,
                     maximum_attempts=maximum_attempts,
@@ -574,7 +682,10 @@ def sample_geodesic_trajectory_set(
         combinations = list(
             product(*(range(len(pools[robot_id])) for robot_id in robot_ids))
         )
-        best: tuple[tuple[float, float, float], tuple[Trajectory, ...]] | None = None
+        valid: list[tuple[tuple[Trajectory, ...], dict[str, object]]] = []
+        waypoint_rejections = 0
+        separation_rejections = 0
+        maximum_candidate_minimum_distance = 0.0
         for combination_index in rng.permutation(len(combinations)):
             selection = combinations[int(combination_index)]
             trajectories = tuple(
@@ -586,6 +697,7 @@ def sample_geodesic_trajectory_set(
                 for trajectory in trajectories
             )
             if waypoint_count < minimum_waypoint_trajectories:
+                waypoint_rejections += 1
                 continue
             positions = np.stack(
                 [trajectory.base_to_world[:, :2, 3] for trajectory in trajectories]
@@ -597,38 +709,39 @@ def sample_geodesic_trajectory_set(
                     for right in range(left + 1, len(trajectories))
                 ]
             )
-            if np.any(pairwise_distances < minimum_pairwise_distance_m):
+            candidate_minimum_distance = float(pairwise_distances.min())
+            maximum_candidate_minimum_distance = max(
+                maximum_candidate_minimum_distance, candidate_minimum_distance
+            )
+            if candidate_minimum_distance < minimum_pairwise_distance_m:
+                separation_rejections += 1
                 continue
-            yaws = np.stack(
-                [
-                    np.arctan2(
-                        trajectory.base_to_world[:, 1, 0],
-                        trajectory.base_to_world[:, 0, 0],
-                    )
-                    for trajectory in trajectories
-                ]
+            metrics = joint_trajectory_metrics(trajectories)
+            metrics["formation_degenerate"] = bool(
+                formation_degeneracy_limits
+                and formation_degenerate(metrics, formation_degeneracy_limits)
             )
-            maximum_heading_spread = max(
-                float(
-                    np.max(
-                        np.abs(_wrap_angles(yaws[left] - yaws[right]))
-                    )
+            valid.append((trajectories, metrics))
+        if valid:
+            # Regime-aware stochastic soft selection; never minimize compactness
+            # or heading spread as a hidden objective.
+            saturation_by_regime = regime_coverage_saturation_m2 or {
+                observation_regime: max(
+                    float(item[1]["spatial_coverage_bbox_area_m2"]) for item in valid
                 )
-                for left in range(len(trajectories))
-                for right in range(left + 1, len(trajectories))
-            )
-            score = (
-                float(np.max(pairwise_distances)),
-                maximum_heading_spread,
-                float(np.mean(pairwise_distances)),
-            )
-            if best is None or score < best[0]:
-                best = score, trajectories
-        if best is not None:
-            score, trajectories = best
+            }
+            utilities = []
+            for _, metrics in valid:
+                utilities.append(regime_trajectory_soft_score(
+                    metrics, observation_regime, saturation_by_regime,
+                    jitter=float(rng.uniform(0.0, 0.10)),
+                    heading_prior_weights=regime_initial_heading_prior_weights,
+                ))
+            trajectories, joint_metrics = valid[int(np.argmax(utilities))]
             for trajectory in trajectories:
                 trajectory.metadata["joint_pool_round"] = round_index
-                trajectory.metadata["joint_compactness_score"] = list(score)
+                trajectory.metadata["observation_regime"] = observation_regime
+                trajectory.metadata["joint_diversity_metrics"] = dict(joint_metrics)
                 trajectory.metadata["joint_waypoint_trajectory_count"] = sum(
                     item.path_family != "direct" for item in trajectories
                 )
@@ -640,6 +753,9 @@ def sample_geodesic_trajectory_set(
                     robot_id: len(pool) for robot_id, pool in pools.items()
                 },
                 "joint_combination_count": len(combinations),
+                "waypoint_rejection_count": waypoint_rejections,
+                "separation_rejection_count": separation_rejections,
+                "maximum_candidate_minimum_distance_m": maximum_candidate_minimum_distance,
             }
         )
 
@@ -650,5 +766,6 @@ def sample_geodesic_trajectory_set(
             "round_diagnostics": round_diagnostics,
             "minimum_pairwise_distance_m": minimum_pairwise_distance_m,
             "minimum_waypoint_trajectories": minimum_waypoint_trajectories,
+            "minimum_start_distance_m": initial_minimum_distance,
         },
     )

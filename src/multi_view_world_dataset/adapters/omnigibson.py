@@ -12,12 +12,23 @@ from multi_view_world_dataset.assets import materialize_mobile_sensor_robot
 from multi_view_world_dataset.cameras.transforms import rotation_angle, validate_transform
 from multi_view_world_dataset.errors import GeometryError, SampleRejected, SimulatorUnavailableError
 from multi_view_world_dataset.rendering.bev import BEVCalibration
+from multi_view_world_dataset.rendering.labels import remap_public_labels
+from multi_view_world_dataset.sampling.placement import (
+    select_local_traversable_heading,
+    soft_anchor_candidate_order,
+)
 from multi_view_world_dataset.sampling.interventions import (
     choose_intervention_type,
     eligible_intervention_targets,
     propose_articulation,
     propose_rigid_relocation,
     propose_state_change,
+)
+from multi_view_world_dataset.sampling.diversity import (
+    choose_weighted_label,
+    complementary_hybrid_trajectory_sets,
+    joint_trajectory_metrics,
+    regime_trajectory_soft_score,
 )
 from multi_view_world_dataset.sampling.splits import infer_scene_family
 from multi_view_world_dataset.sampling.trajectories import (
@@ -179,6 +190,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         self._syntheticdata_helpers: Any = None
         self._started = False
         self._runtime_findings: dict[str, Any] = {}
+        self._canonical_floor_bounds: dict[int, tuple[float, float, float, float]] = {}
 
     def _configured_bev_sensor_names(self) -> list[str]:
         """Return all Replicator modalities needed by configured BEV captures."""
@@ -289,6 +301,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         self._final_robot_capture_sensor = None
         self._development_camera_mounts.clear()
         self._relation_cache = None
+        self._canonical_floor_bounds.clear()
         if scene_id not in self.discover_scenes():
             raise SimulatorUnavailableError(f"Scene is not installed: {scene_id}")
         camera = self.config["camera"]
@@ -796,14 +809,137 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         return int(self._th.count_nonzero(eroded == 255).item())
 
     def randomize_relation_preserving_configuration(self, seed: int) -> dict[str, Any]:
-        """Create one native-validated dynamic configuration without random XYZ poses."""
+        """Randomize a bounded fraction of distinct movable relation targets."""
+        from multi_view_world_dataset.sampling.configurations import exact_state_hash
+
+        original_snapshot = self.dump_snapshot()
+        baseline = self.object_catalog_with_relations()
+        if self._relation_cache is None:
+            self._relation_cache = self.relation_candidates(self.object_catalog())
+        eligible_ids = sorted({item["target_instance_id"] for item in self._relation_cache})
+        policy = self.config["configuration_sampling"]
+        requested = int(np.ceil(float(policy["movable_fraction"]) * len(eligible_ids)))
+        requested = max(int(policy["minimum_changed_objects"]), requested)
+        requested = min(int(policy["maximum_changed_objects"]), requested, len(eligible_ids))
+        if requested < int(policy["minimum_changed_objects"]):
+            raise SampleRejected(
+                "insufficient_multi_object_configuration_targets",
+                {"eligible_target_count": len(eligible_ids), "required": int(policy["minimum_changed_objects"])},
+            )
+        excluded: set[str] = set()
+        changes: list[dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
+        baseline_by_id = {obj.instance_id: obj for obj in baseline}
+        category_counts: dict[str, int] = {}
+        room_counts: dict[str, int] = {}
+        predicate_counts: dict[str, int] = {}
+        for change_index in range(requested):
+            available = [relation for relation in self._relation_cache if relation["target_instance_id"] not in excluded]
+            novelty = []
+            for relation in available:
+                obj = baseline_by_id[relation["target_instance_id"]]
+                size = float(np.prod(np.asarray(obj.bbox_max_world) - np.asarray(obj.bbox_min_world)))
+                novelty.append((
+                    category_counts.get(obj.category, 0)
+                    + room_counts.get(obj.room_id or "unknown", 0)
+                    + predicate_counts.get(relation["predicate"], 0),
+                    category_counts.get(f"size:{int(np.floor(np.log10(max(size, 1e-6))))}", 0),
+                    relation["target_instance_id"],
+                ))
+            preferred_target = min(novelty)[2] if novelty else None
+            try:
+                result = self._randomize_one_relation_preserving_configuration(
+                    seed + 104729 * (change_index + 1),
+                    excluded_target_ids=tuple(sorted(excluded)),
+                    preferred_target_ids=(() if preferred_target is None else (preferred_target,)),
+                )
+            except SampleRejected:
+                break
+            target_id = str(result["relation"]["target_instance_id"])
+            excluded.add(target_id)
+            changed_obj = baseline_by_id[target_id]
+            size = float(np.prod(np.asarray(changed_obj.bbox_max_world) - np.asarray(changed_obj.bbox_min_world)))
+            size_bin = f"size:{int(np.floor(np.log10(max(size, 1e-6))))}"
+            category_counts[changed_obj.category] = category_counts.get(changed_obj.category, 0) + 1
+            room_key = changed_obj.room_id or "unknown"
+            room_counts[room_key] = room_counts.get(room_key, 0) + 1
+            predicate = str(result["relation"]["predicate"])
+            predicate_counts[predicate] = predicate_counts.get(predicate, 0) + 1
+            category_counts[size_bin] = category_counts.get(size_bin, 0) + 1
+            changes.append({
+                **result["relation"],
+                "translation_m": result["translation_m"],
+                "rotation_deg": result["rotation_deg"],
+            })
+            results.append(result)
+        if len(changes) < int(policy["minimum_changed_objects"]):
+            self.load_snapshot(original_snapshot)
+            raise SampleRejected(
+                "multi_object_configuration_sampling_failed",
+                {"accepted_changes": len(changes), "requested_changes": requested},
+            )
+        accepted_snapshot = self.dump_snapshot()
+        combined_relations = tuple(change for change in changes)
+        catalog = self._attach_relations(self.object_catalog(), combined_relations)
+        self.load_snapshot(accepted_snapshot)
+        restored = self._attach_relations(self.object_catalog(), combined_relations)
+        restored_native = self._native_objects_by_path()
+        relations_preserved = all(
+            bool(
+                restored_native[relation["target_native_path"]].states[
+                    self._on_top_type if relation["predicate"] == "OnTop" else self._inside_type
+                ].get_value(restored_native[relation["reference_native_path"]])
+            )
+            for relation in changes
+        )
+        maximum_restore_error, discrete_equal = self._catalog_restore_metrics(catalog, restored)
+        if (
+            maximum_restore_error > float(self.config["generation"]["snapshot_restore_tolerance"])
+            or not discrete_equal or not relations_preserved
+        ):
+            self.load_snapshot(original_snapshot)
+            raise SampleRejected(
+                "multi_object_configuration_snapshot_restore_mismatch",
+                {"maximum_restore_error": maximum_restore_error, "discrete_equal": discrete_equal, "relations_preserved": relations_preserved},
+            )
+        return {
+            "catalog": restored,
+            "snapshot": accepted_snapshot,
+            "exact_state_hash": exact_state_hash(restored, decimals=int(self.config["generation"]["exact_hash_decimals"])),
+            "baseline_exact_state_hash": exact_state_hash(baseline, decimals=int(self.config["generation"]["exact_hash_decimals"])),
+            "changed_instance_ids": sorted(excluded),
+            "changes": changes,
+            "changed_object_count": len(changes),
+            "requested_changed_object_count": requested,
+            "stratification": {
+                "categories": category_counts,
+                "rooms": room_counts,
+                "relations": predicate_counts,
+            },
+            "accepted_attempt": sum(int(item["accepted_attempt"]) for item in results),
+            "checks": {"minimum_changed_objects": True, "snapshot_restored": True},
+            "maximum_snapshot_restore_error": maximum_restore_error,
+            "free_traversable_candidates": results[-1]["free_traversable_candidates"],
+            "intervention_target_count": results[-1]["intervention_target_count"],
+            "translation_m": float(sum(item["translation_m"] for item in results)),
+            "rotation_deg": float(sum(item["rotation_deg"] for item in results)),
+        }
+
+    def _randomize_one_relation_preserving_configuration(
+        self, seed: int, *, excluded_target_ids: tuple[str, ...] = (),
+        preferred_target_ids: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        """Create one native-validated relation-preserving object change."""
         from multi_view_world_dataset.sampling.configurations import exact_state_hash
 
         baseline_snapshot = self.dump_snapshot()
         baseline_raw_catalog = self.object_catalog()
         if self._relation_cache is None:
             self._relation_cache = self.relation_candidates(baseline_raw_catalog)
-        relations = self._relation_cache
+        relations = tuple(
+            relation for relation in self._relation_cache
+            if relation["target_instance_id"] not in excluded_target_ids
+        )
         baseline_catalog = self._attach_relations(baseline_raw_catalog, relations)
         if not relations:
             raise SampleRejected("no_relation_preserving_configuration_candidate")
@@ -817,6 +953,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         relation_order = sorted(
             range(len(relations)),
             key=lambda index: (
+                bool(preferred_target_ids) and relations[index]["target_instance_id"] not in preferred_target_ids,
                 relations[index]["reference_category"] != "floors",
                 np.prod(
                     np.asarray(baseline_by_id[relations[index]["target_instance_id"]].bbox_max_world)
@@ -975,6 +1112,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         *,
         forced_type: InterventionType | None = None,
         excluded_target_ids: tuple[str, ...] = (),
+        visible_target_ids: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         """Apply and verify exactly one v1 intervention in the currently loaded W0."""
         baseline_snapshot = self.dump_snapshot()
@@ -984,11 +1122,9 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         rng = np.random.default_rng(seed)
         weights = self.config["intervention"]["type_weights"]
         preferred = forced_type or choose_intervention_type(weights, rng)
-        type_order = [preferred] + [
-            intervention_type
-            for intervention_type in InterventionType
-            if intervention_type is not preferred and float(weights.get(intervention_type.value, 0.0)) > 0
-        ]
+        # The accepted type is selected once per episode. Resampling may change
+        # the target/parameters, never silently fall back to another taxonomy.
+        type_order = [preferred]
         maximum_attempts = int(self.config["intervention"]["maximum_attempts"])
         failures: list[dict[str, Any]] = []
         attempt = 0
@@ -997,6 +1133,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 obj
                 for obj in eligible_intervention_targets(baseline_catalog, intervention_type)
                 if obj.instance_id not in excluded_target_ids
+                and (not visible_target_ids or obj.instance_id in visible_target_ids)
             ]
             if intervention_type is InterventionType.RIGID_RELOCATION:
                 candidates = [
@@ -1577,291 +1714,392 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 self._restore_final_robot_mast_mount(robot)
                 robot.keep_still()
 
-    def calibrated_floor_bounds(self, floor_index: int, meters_per_pixel: float, margin_m: float) -> BEVCalibration:
-        catalog = self.object_catalog()
-        floor_id = f"floor_{floor_index:02d}"
-        on_floor = [obj for obj in catalog if obj.floor_id == floor_id]
-        if not on_floor:
-            raise GeometryError(f"No catalog objects assigned to {floor_id}")
-        xmin = min(obj.bbox_min_world[0] for obj in on_floor)
-        ymin = min(obj.bbox_min_world[1] for obj in on_floor)
-        xmax = max(obj.bbox_max_world[0] for obj in on_floor)
-        ymax = max(obj.bbox_max_world[1] for obj in on_floor)
-        return BEVCalibration.from_bounds(
-            floor_id, self._floor_heights()[floor_index], meters_per_pixel, (xmin, ymin, xmax, ymax), margin_m
+    def calibrated_floor_bounds(
+        self, floor_index: int, meters_per_pixel: float, margin_m: float
+    ) -> BEVCalibration:
+        """Return one static scene/floor extent shared by every BEV product."""
+        if floor_index not in self._canonical_floor_bounds:
+            floor_id = f"floor_{floor_index:02d}"
+            catalog = self.object_catalog()
+            structural = [
+                obj for obj in catalog if obj.floor_id == floor_id and obj.structural
+            ]
+            world_xy, _, _, _ = self._trajectory_traversability(
+                floor_index, self._env.robots[0]
+            )
+            xmin, ymin = np.min(world_xy, axis=0)
+            xmax, ymax = np.max(world_xy, axis=0)
+            if structural:
+                xmin = min(float(xmin), min(obj.bbox_min_world[0] for obj in structural))
+                ymin = min(float(ymin), min(obj.bbox_min_world[1] for obj in structural))
+                xmax = max(float(xmax), max(obj.bbox_max_world[0] for obj in structural))
+                ymax = max(float(ymax), max(obj.bbox_max_world[1] for obj in structural))
+            canonical_resolution = max(
+                float(self.config["bev"]["environment_meters_per_pixel"]),
+                float(self.config["bev"]["world_meters_per_pixel"]),
+            )
+            bounds = (
+                np.floor((xmin - margin_m) / canonical_resolution) * canonical_resolution,
+                np.floor((ymin - margin_m) / canonical_resolution) * canonical_resolution,
+                np.ceil((xmax + margin_m) / canonical_resolution) * canonical_resolution,
+                np.ceil((ymax + margin_m) / canonical_resolution) * canonical_resolution,
+            )
+            self._canonical_floor_bounds[floor_index] = tuple(map(float, bounds))
+        return BEVCalibration(
+            f"floor_{floor_index:02d}", self._floor_heights()[floor_index],
+            meters_per_pixel, self._canonical_floor_bounds[floor_index],
         )
 
-    def place_development_robots(self, seed: int) -> dict[str, float]:
-        """Place three robots on one floor and mount their development sensors at frozen v1 camera poses."""
+    def traversability_bev(
+        self, floor_index: int, calibration: BEVCalibration
+    ) -> np.ndarray:
+        """Rasterize robot-eroded navigability in the canonical BEV frame."""
+        rows, columns = np.indices((calibration.height, calibration.width))
+        pixels = np.column_stack((columns.ravel(), rows.ravel()))
+        world = calibration.pixel_to_world(pixels)[:, :2]
+        trav_map = self._require_scene().trav_map
+        eroded = self._robot_eroded_traversability(
+            floor_index, self._env.robots[0]
+        )
+        native = self._native_value(eroded) == 255
+        mapped = self._native_value(
+            trav_map.world_to_map(self._th.as_tensor(world, dtype=self._th.float32))
+        ).astype(int)
+        valid = (
+            (mapped[:, 0] >= 0) & (mapped[:, 0] < native.shape[0])
+            & (mapped[:, 1] >= 0) & (mapped[:, 1] < native.shape[1])
+        )
+        output = np.zeros(len(mapped), dtype=np.uint8)
+        output[valid] = native[mapped[valid, 0], mapped[valid, 1]].astype(np.uint8)
+        return output.reshape(calibration.height, calibration.width)
+
+    def _observation_region_labels(
+        self, floor_index: int, world_xy: np.ndarray
+    ) -> np.ndarray:
+        """Label traversable samples with OG room instances or spatial fallback regions."""
+        scene = self._require_scene()
+        labels = np.full(len(world_xy), "", dtype=object)
+        if floor_index == 0:
+            try:
+                seg_map = scene.seg_map
+                pixels = self._native_value(
+                    seg_map.world_to_map(
+                        self._th.as_tensor(world_xy, dtype=self._th.float32)
+                    )
+                ).astype(int)
+                room_map = self._native_value(seg_map.room_ins_map)
+                mapping = dict(seg_map.room_ins_id_to_ins_name)
+                inside = (
+                    (pixels[:, 0] >= 0) & (pixels[:, 0] < room_map.shape[0])
+                    & (pixels[:, 1] >= 0) & (pixels[:, 1] < room_map.shape[1])
+                )
+                raw = np.zeros(len(world_xy), dtype=int)
+                raw[inside] = room_map[pixels[inside, 0], pixels[inside, 1]].astype(int)
+                labels = np.asarray(
+                    [str(mapping.get(int(value), "")) for value in raw], dtype=object
+                )
+                self._runtime_findings["observation_region_api"] = (
+                    "scene.seg_map.room_ins_map+world_to_map"
+                )
+            except Exception as error:
+                self._runtime_findings["observation_region_api_warning"] = str(error)
+        # OG 3.9.2 only ships floor-0 room segmentation. Keep other floors and
+        # unlabeled doorway pixels scientifically explicit as 2 m conceptual regions.
+        missing = labels == ""
+        if np.any(missing):
+            cells = np.floor(world_xy[missing] / 2.0).astype(int)
+            labels[missing] = [f"conceptual_{x:+04d}_{y:+04d}" for x, y in cells]
+        return labels.astype(str)
+
+    def place_development_robots(
+        self, seed: int, *, discouraged_region_ids: tuple[str, ...] = ()
+    ) -> dict[str, float]:
+        """Sample separated starts from an OG room / conceptual observation region."""
         scene = self._require_scene()
         robots = list(self._env.robots)
         if len(robots) != 3:
             raise SimulatorUnavailableError("Development placement requires exactly three loaded robots")
         rng = np.random.default_rng(seed)
         placement = self.config["placement"]
-        heights = self.config["camera"]["heights_m"]
-        # Installed OG 3.9.2 calls torch.randint without a size when floor=None.
         floor_index = int(rng.integers(int(scene.n_floors)))
-        # Sampling repeatedly with reference_point is uniform over the entire connected
-        # component, not over a neighborhood of the reference point. On large components
-        # that makes the probability of landing inside a 3 m cluster needlessly tiny.
-        # Build the local candidate pool from the installed traversability map instead.
-        world_xy, is_path_traversable, _ = self._trajectory_traversability(floor_index, robots[0])
+        world_xy, is_path_traversable, _, reachable_candidates = self._trajectory_traversability(
+            floor_index, robots[0]
+        )
+        # The installed static traversability raster does not encode the current
+        # randomized movable furniture. Remove its expanded world AABBs before
+        # choosing starts; contact QA below remains authoritative.
+        floor_id = f"floor_{floor_index:02d}"
+        dynamic_objects = [
+            obj for obj in self.object_catalog()
+            if not obj.structural and obj.floor_id == floor_id
+            and obj.bbox_max_world[2] > float(scene.get_floor_height(floor_index)) + 0.10
+        ]
+        start_clearance_m = float(placement.get("dynamic_object_start_clearance_m", 0.55))
+        free = np.ones(len(world_xy), dtype=bool)
+        for obj in dynamic_objects:
+            free &= ~(
+                (world_xy[:, 0] >= obj.bbox_min_world[0] - start_clearance_m)
+                & (world_xy[:, 0] <= obj.bbox_max_world[0] + start_clearance_m)
+                & (world_xy[:, 1] >= obj.bbox_min_world[1] - start_clearance_m)
+                & (world_xy[:, 1] <= obj.bbox_max_world[1] + start_clearance_m)
+            )
+        world_xy = world_xy[free]
         if len(world_xy) < 3:
-            raise SimulatorUnavailableError(f"Floor {floor_index} has fewer than three traversable pixels")
-        z = float(scene.get_floor_height(floor_index))
-        candidates = np.column_stack((world_xy, np.full(len(world_xy), z)))
-        cluster_radius = float(placement["cluster_radius_m"])
-        preferred_radius = min(
-            cluster_radius,
-            float(placement.get("preferred_cluster_radius_m", cluster_radius)),
-        )
-        trajectory_minimum_length = float(
-            self.config["trajectory"]["path_length_min_m"]
-        )
-        trajectory_ready_radius = min(
-            cluster_radius,
-            preferred_radius + trajectory_minimum_length,
-        )
-        candidate_radii = [preferred_radius]
-        for radius in (trajectory_ready_radius, cluster_radius):
-            if radius > candidate_radii[-1] + 1.0e-9:
-                candidate_radii.append(radius)
-        minimum_distance = float(placement["minimum_pairwise_distance_m"])
-        trajectory_headroom = float(placement["trajectory_separation_headroom_m"])
-        selection_distance = minimum_distance + trajectory_headroom
-        maximum_attempts = int(placement["maximum_attempts"])
-        selected: list[np.ndarray] = []
-        selected_focus_xy_by_robot: list[np.ndarray] = []
-        selected_shared_heading: float | None = None
-        heading_jitter = np.deg2rad(float(placement.get("heading_jitter_deg", 5.0)))
-        heading_tolerance = np.deg2rad(
-            float(self.config["trajectory"]["initial_heading_tolerance_deg"])
-        )
-        maximum_focus_bearing_error = max(0.0, heading_tolerance - heading_jitter)
-
-        def has_safe_forward_line(source_xy: np.ndarray, target_xy: np.ndarray) -> bool:
-            distance = float(np.linalg.norm(target_xy - source_xy))
-            samples = max(2, int(np.ceil(distance / 0.025)) + 1)
-            line = source_xy + np.linspace(0.0, 1.0, samples)[:, None] * (
-                target_xy - source_xy
+            raise SampleRejected("insufficient_traversable_starts", {"floor_index": floor_index})
+        labels = self._observation_region_labels(floor_index, world_xy)
+        regions = {
+            label: np.flatnonzero(labels == label)
+            for label in sorted(set(labels))
+            if np.count_nonzero(labels == label) >= 3
+        }
+        if not regions:
+            raise SampleRejected("no_observation_regions", {"floor_index": floor_index})
+        regime = choose_weighted_label(placement["observation_regime_weights"], rng)
+        region_ids = tuple(regions)
+        reuse_penalty = float(placement.get("sibling_region_reuse_penalty", 1.0))
+        anchor_weights = np.asarray([
+            1.0 / (1.0 + reuse_penalty * int(region_id in discouraged_region_ids))
+            for region_id in region_ids
+        ])
+        anchor = str(rng.choice(region_ids, p=anchor_weights / anchor_weights.sum()))
+        adjacency_distance = float(placement["region_adjacency_distance_m"])
+        anchor_points = world_xy[regions[anchor]]
+        anchor_sample = anchor_points[
+            np.linspace(0, len(anchor_points) - 1, min(256, len(anchor_points))).astype(int)
+        ]
+        adjacent = []
+        for region_id in region_ids:
+            if region_id == anchor:
+                continue
+            points = world_xy[regions[region_id]]
+            sample = points[np.linspace(0, len(points) - 1, min(256, len(points))).astype(int)]
+            if float(np.min(np.linalg.norm(anchor_sample[:, None] - sample[None, :], axis=2))) <= adjacency_distance:
+                adjacent.append(region_id)
+        if regime == "dense_shared" or not adjacent:
+            target_regions = (anchor,)
+        elif regime == "partial_chain":
+            target_regions = (anchor, str(rng.choice(adjacent)))
+        else:
+            candidates = [anchor, *adjacent]
+            target_regions = tuple(candidates[index] for index in rng.permutation(len(candidates))[:3])
+        spatial_scales = placement["regime_spatial_soft_scale_m"]
+        region_sampling_anchors: dict[str, np.ndarray] = {}
+        if regime == "dense_shared":
+            region_sampling_anchors[anchor] = anchor_points[int(rng.integers(len(anchor_points)))]
+        elif regime == "partial_chain" and len(target_regions) == 2:
+            other = target_regions[1]
+            other_points = world_xy[regions[other]]
+            other_sample = other_points[
+                np.linspace(0, len(other_points) - 1, min(256, len(other_points))).astype(int)
+            ]
+            distances = np.linalg.norm(
+                anchor_sample[:, None] - other_sample[None, :], axis=2
             )
-            return is_path_traversable(line)
-
+            anchor_index, other_index = np.unravel_index(
+                int(np.argmin(distances)), distances.shape
+            )
+            region_sampling_anchors[anchor] = anchor_sample[anchor_index]
+            region_sampling_anchors[other] = other_sample[other_index]
+        minimum_distance = (
+            float(placement["minimum_pairwise_distance_m"])
+            + float(placement.get("trajectory_separation_headroom_m", 0.0))
+        )
+        selected_indices: list[int] = []
         attempts = 0
-        attempts_by_radius: dict[str, int] = {}
-        effective_radius = preferred_radius
-        for radius in candidate_radii:
-            radius_attempts = 0
-            for center_index in rng.permutation(len(candidates))[:maximum_attempts]:
-                attempts += 1
-                radius_attempts += 1
-                center = candidates[int(center_index)]
-                local = candidates[np.linalg.norm(candidates[:, :2] - center[:2], axis=1) <= radius]
-                if len(local) < 3:
-                    continue
-                selection = [local[int(rng.integers(len(local)))]]
-                # Keep the group compact while respecting the hard separation.
-                # Compact starts materially improve shared camera coverage.
-                tie_order = rng.permutation(len(local))
-                while len(selection) < 3:
-                    pairwise = np.stack(
-                        [np.linalg.norm(local[:, :2] - point[:2], axis=1) for point in selection], axis=1
+        maximum_attempts = int(placement["maximum_attempts"])
+        target_pool = np.concatenate([regions[name] for name in target_regions])
+        all_pool = np.arange(len(world_xy))
+        minimum_reachable_displacement = (
+            0.75 * float(self.config["trajectory"]["path_length_min_m"])
+        )
+        maximum_reachable_displacement = float(
+            self.config["trajectory"]["path_length_max_m"]
+        )
+        viability_cache: dict[tuple[float, float], bool] = {}
+
+        def start_has_path_neighborhood(point: np.ndarray) -> bool:
+            key = tuple(map(float, point))
+            if key not in viability_cache:
+                reachable = reachable_candidates(point)
+                distances = np.linalg.norm(reachable - point, axis=1)
+                viability_cache[key] = bool(
+                    np.any(
+                        (distances >= minimum_reachable_displacement)
+                        & (distances <= maximum_reachable_displacement)
                     )
-                    nearest = pairwise.min(axis=1)
-                    valid = nearest >= selection_distance
-                    if not np.any(valid):
-                        break
-                    compactness = pairwise.max(axis=1)
-                    score = np.where(valid, compactness, np.inf)
-                    best = tie_order[np.argmin(score[tie_order])]
-                    selection.append(local[int(best)])
-                if len(selection) == 3:
-                    positions_xy = np.stack(selection, axis=0)[:, :2]
-                    cluster_center = positions_xy.mean(axis=0)
-                    heading_targets = world_xy[
-                        rng.permutation(len(world_xy))[: min(32, len(world_xy))]
-                    ]
-                    heading_candidates = np.arctan2(
-                        heading_targets[:, 1] - cluster_center[1],
-                        heading_targets[:, 0] - cluster_center[0],
-                    )
-                    for proposed_heading in heading_candidates:
-                        per_robot_focus: list[np.ndarray] = []
-                        for point in selection:
-                            deltas = world_xy - point[:2]
-                            distances = np.linalg.norm(deltas, axis=1)
-                            bearings = np.arctan2(deltas[:, 1], deltas[:, 0])
-                            bearing_errors = np.abs(
-                                (bearings - proposed_heading + np.pi)
-                                % (2.0 * np.pi)
-                                - np.pi
-                            )
-                            forward_indices = np.flatnonzero(
-                                (distances >= trajectory_minimum_length)
-                                & (distances <= float(
-                                    self.config["trajectory"]["path_length_max_m"]
-                                ))
-                                & (bearing_errors <= maximum_focus_bearing_error)
-                            )
-                            forward_order = forward_indices[
-                                np.argsort(bearing_errors[forward_indices])
-                            ]
-                            safe_focus = next(
-                                (
-                                    world_xy[int(focus_index)]
-                                    for focus_index in forward_order[:32]
-                                    if has_safe_forward_line(
-                                        point[:2], world_xy[int(focus_index)]
-                                    )
-                                ),
-                                None,
-                            )
-                            if safe_focus is None:
-                                break
-                            per_robot_focus.append(safe_focus.copy())
-                        if len(per_robot_focus) == len(selection):
-                            selected = selection
-                            selected_focus_xy_by_robot = per_robot_focus
-                            selected_shared_heading = float(proposed_heading)
-                            effective_radius = radius
+                )
+            return viability_cache[key]
+
+        # Region membership is a sampling prior, not a compactness-like hard
+        # constraint. Expand gracefully when a small room cannot fit 3 robots.
+        for group_attempt in range(maximum_attempts):
+            selected_indices = []
+            for robot_index in range(len(robots)):
+                desired = target_regions[robot_index % len(target_regions)]
+                pools = (regions[desired], target_pool, all_pool)
+                chosen = None
+                for pool in pools:
+                    for index in (
+                        soft_anchor_candidate_order(
+                            pool, world_xy, region_sampling_anchors[desired],
+                            float(spatial_scales[regime]), rng,
+                            probability_floor=float(placement["spatial_soft_probability_floor"]),
+                        )
+                        if desired in region_sampling_anchors
+                        else rng.permutation(pool)
+                    )[:maximum_attempts]:
+                        attempts += 1
+                        point = world_xy[int(index)]
+                        if not start_has_path_neighborhood(point):
+                            continue
+                        if all(np.linalg.norm(point - world_xy[prior]) >= minimum_distance for prior in selected_indices):
+                            chosen = int(index)
                             break
-                    if selected:
+                    if chosen is not None:
                         break
-            attempts_by_radius[f"{radius:.6g}"] = radius_attempts
-            if selected:
+                if chosen is None:
+                    break
+                selected_indices.append(chosen)
+            if len(selected_indices) == len(robots):
                 break
-        if len(selected) != 3:
-            raise SimulatorUnavailableError(
-                f"Failed clustered placement after {attempts} candidate centers "
-                f"across radii {candidate_radii} on floor {floor_index}"
+        if len(selected_indices) != 3:
+            raise SampleRejected(
+                "region_balanced_placement_failed",
+                {"regime": regime, "target_regions": target_regions, "attempts": attempts},
             )
+        selected_xy = world_xy[selected_indices]
+        z = float(scene.get_floor_height(floor_index))
+        selected = np.column_stack((selected_xy, np.full(3, z)))
         sampled_heights: dict[str, float] = {}
         pitch = np.deg2rad(float(self.config["camera"]["pitch_deg"]))
         cosine, sine = np.cos(pitch), np.sin(pitch)
-        # Columns are OpenCV camera right, down, forward expressed in robot base coordinates.
-        camera_rotation_base = np.array([[0.0, sine, cosine], [-1.0, 0.0, 0.0], [0.0, -cosine, sine]])
-        cv_to_usd = np.diag([1.0, -1.0, -1.0, 1.0])
-        cluster_center_xy = np.mean(np.stack(selected, axis=0)[:, :2], axis=0)
-        assert selected_shared_heading is not None
-        assert len(selected_focus_xy_by_robot) == len(selected)
-        common_view_distance = float(placement["common_view_focus_distance_m"])
-        common_view_focus_xy = cluster_center_xy + common_view_distance * np.array(
-            [np.cos(selected_shared_heading), np.sin(selected_shared_heading)]
+        camera_rotation_base = np.array(
+            [[0.0, sine, cosine], [-1.0, 0.0, 0.0], [0.0, -cosine, sine]]
         )
-        focus_distances_m = [
-            float(np.linalg.norm(focus - point[:2]))
-            for focus, point in zip(selected_focus_xy_by_robot, selected, strict=True)
-        ]
-        heading_offsets = np.linspace(-heading_jitter, heading_jitter, len(robots))
-        placement_yaws: dict[str, float] = {}
-        for robot, point, heading_offset in zip(robots, selected, heading_offsets, strict=True):
-            delta_to_focus = common_view_focus_xy - point[:2]
-            base_yaw = float(np.arctan2(delta_to_focus[1], delta_to_focus[0]))
-            yaw = float((base_yaw + heading_offset + np.pi) % (2.0 * np.pi) - np.pi)
-            placement_yaws[robot.name] = yaw
-            orientation = self._transform_utils.euler2quat(self._th.tensor([0.0, 0.0, yaw]))
-            robot.set_position_orientation(
-                position=self._th.as_tensor(point, dtype=self._th.float32), orientation=orientation
+        cv_to_usd = np.diag([1.0, -1.0, -1.0, 1.0])
+        shared_heading = float(rng.uniform(-np.pi, np.pi))
+        if regime == "dense_shared":
+            focus = (
+                region_sampling_anchors[anchor]
+                + float(placement["dense_shared_focus_distance_m"])
+                * np.asarray([np.cos(shared_heading), np.sin(shared_heading)])
             )
-            height = float(rng.choice(heights))
-            sampled_heights[robot.name] = height
-            if self._using_final_robot:
-                mast_joint = next(
-                    joint for name, joint in robot.joints.items()
-                    if name.endswith("mvwd_mast_joint")
-                )
-                mast_joint.set_pos(height - float(min(heights)), drive=False)
-            base_to_world = self._pose_matrix(robot)
-            camera_to_base = np.eye(4)
-            camera_to_base[:3, :3] = camera_rotation_base
-            camera_to_base[:3, 3] = [
-                0.08 if self._using_final_robot else 0.0, 0.0, height
-            ]
-            cv_camera_to_world = base_to_world @ camera_to_base
-            usd_camera_to_world = cv_camera_to_world @ cv_to_usd
-            camera_position, camera_orientation = self._transform_utils.mat2pose(
-                self._th.as_tensor(usd_camera_to_world, dtype=self._th.float32)
+            provisional_yaws = np.arctan2(
+                focus[1] - selected_xy[:, 1], focus[0] - selected_xy[:, 0]
             )
-            vision_sensors = [
-                sensor for sensor in robot.sensors.values() if isinstance(sensor, self._vision_sensor_type)
-            ]
-            if len(vision_sensors) != 1:
-                raise SimulatorUnavailableError(
-                    f"Expected one VisionSensor on {robot.name}, found {len(vision_sensors)}"
+            heading_policy = "soft_convergent_scene_focus"
+        elif regime == "partial_chain":
+            offsets = np.deg2rad(np.asarray([-40.0, 0.0, 40.0]))
+            provisional_yaws = shared_heading + offsets[rng.permutation(len(robots))]
+            heading_policy = "chain_scene_directions"
+        else:
+            provisional_yaws = rng.uniform(-np.pi, np.pi, len(robots))
+            heading_policy = "independent_scene_directions"
+        provisional_yaws = (provisional_yaws + np.pi) % (2.0 * np.pi) - np.pi
+        # Preserve each regime's scene-view direction as a soft prior, but
+        # project it onto an actually reachable outgoing direction. This avoids
+        # sampling a robot that can only slide sideways relative to its initial
+        # body and camera heading.
+        minimum_heading_probe_m = float(placement["initial_heading_probe_min_m"])
+        maximum_heading_probe_m = float(placement["initial_heading_probe_max_m"])
+        heading_validation_spacing_m = float(
+            self.config["trajectory"]["line_validation_spacing_m"]
+        )
+        desired_yaws = provisional_yaws.copy()
+        heading_adjustments = []
+        for index, (point, desired_yaw) in enumerate(
+            zip(selected_xy, desired_yaws, strict=True)
+        ):
+            reachable = reachable_candidates(point)
+            try:
+                chosen, heading_error = select_local_traversable_heading(
+                    point,
+                    reachable,
+                    float(desired_yaw),
+                    is_path_traversable,
+                    minimum_probe_m=minimum_heading_probe_m,
+                    maximum_probe_m=maximum_heading_probe_m,
+                    validation_spacing_m=heading_validation_spacing_m,
                 )
-            sensor = vision_sensors[0]
-            if not self._using_final_robot:
-                sensor.set_position_orientation(position=camera_position, orientation=camera_orientation)
-            self._development_camera_mounts[robot.name] = camera_to_base.copy()
-        settle_steps = min(30, int(self.config["generation"]["settle_steps"]))
-        # Propagate articulated camera transforms into their stable RGB/depth
-        # render products. Final-robot segmentation uses a separate raw AOV,
-        # so no InstanceMapping graph is ticked here.
-        rendering_settle_steps = min(2, settle_steps)
-        for _ in range(settle_steps):
-            for robot in robots:
-                robot.keep_still()
-            self._og.sim.step_physics()
-        # Keep the sampled base poses exactly on their validated map pixels;
-        # passive wheel settling must not move a trajectory start into an
-        # adjacent non-traversable cell.
-        for robot, point in zip(robots, selected, strict=True):
-            yaw = placement_yaws[robot.name]
+            except SampleRejected as error:
+                raise SampleRejected(
+                    error.reason,
+                    {"robot_index": index, "start_xy": point.tolist()},
+                ) from error
+            provisional_yaws[index] = chosen
+            heading_adjustments.append(heading_error)
+        heights = self.config["camera"]["heights_m"]
+        for robot, point, yaw in zip(robots, selected, provisional_yaws, strict=True):
             orientation = self._transform_utils.euler2quat(
-                self._th.tensor([0.0, 0.0, yaw])
+                self._th.tensor([0.0, 0.0, float(yaw)])
             )
             robot.set_position_orientation(
                 position=self._th.as_tensor(point, dtype=self._th.float32),
                 orientation=orientation,
             )
-            self._restore_final_robot_mast_mount(robot)
-            robot.keep_still()
-        # A full step is required for articulation-mounted VisionSensor render
-        # products; bare render ticks can retain a stale camera transform.
-        for _ in range(rendering_settle_steps):
+            height = float(rng.choice(heights))
+            sampled_heights[robot.name] = height
+            if self._using_final_robot:
+                mast_joint = next(joint for name, joint in robot.joints.items() if name.endswith("mvwd_mast_joint"))
+                mast_joint.set_pos(height - float(min(heights)), drive=False)
+            base_to_world = self._pose_matrix(robot)
+            camera_to_base = np.eye(4)
+            camera_to_base[:3, :3] = camera_rotation_base
+            camera_to_base[:3, 3] = [0.08 if self._using_final_robot else 0.0, 0.0, height]
+            usd_camera_to_world = base_to_world @ camera_to_base @ cv_to_usd
+            camera_position, camera_orientation = self._transform_utils.mat2pose(
+                self._th.as_tensor(usd_camera_to_world, dtype=self._th.float32)
+            )
+            sensors = [sensor for sensor in robot.sensors.values() if isinstance(sensor, self._vision_sensor_type)]
+            if len(sensors) != 1:
+                raise SimulatorUnavailableError(f"Expected one VisionSensor on {robot.name}")
+            if not self._using_final_robot:
+                sensors[0].set_position_orientation(position=camera_position, orientation=camera_orientation)
+            self._development_camera_mounts[robot.name] = camera_to_base.copy()
+        settle_steps = min(30, int(self.config["generation"]["settle_steps"]))
+        for _ in range(settle_steps):
             for robot in robots:
                 robot.keep_still()
-            self._og.sim.step()
-        # The static traversability raster does not move with randomized
-        # furniture. Reject such starts immediately, before camera-overlap and
-        # geodesic candidate generation make the same frame-0 discovery much
-        # more expensively in rollout preflight.
-        floors = [
-            obj
-            for obj in scene.objects
-            if str(getattr(obj, "category", "")) == "floors"
-        ]
+            self._og.sim.step_physics()
+        for robot, point, yaw in zip(robots, selected, provisional_yaws, strict=True):
+            orientation = self._transform_utils.euler2quat(self._th.tensor([0.0, 0.0, float(yaw)]))
+            robot.set_position_orientation(position=self._th.as_tensor(point, dtype=self._th.float32), orientation=orientation)
+            self._restore_final_robot_mast_mount(robot)
+            robot.keep_still()
+        floors = [obj for obj in scene.objects if str(getattr(obj, "category", "")) == "floors"]
         for robot in robots:
-            external_pairs = self._external_robot_contact_pairs(robot, floors)
-            if external_pairs:
-                raise SampleRejected(
-                    "initial_robot_collision",
-                    {"robot_id": robot.name, "contact_pairs": external_pairs[:50]},
-                )
-        self._runtime_findings["development_camera_heights_m"] = sampled_heights
-        self._runtime_findings["development_camera_settle_steps"] = settle_steps
-        self._runtime_findings["development_camera_rendering_settle_steps"] = rendering_settle_steps
-        self._runtime_findings["placement_attempts"] = attempts
-        self._runtime_findings["placement_attempts_by_radius_m"] = attempts_by_radius
-        self._runtime_findings["placement_pairwise_minimum_m"] = minimum_distance
-        self._runtime_findings["placement_pairwise_target_m"] = selection_distance
-        self._runtime_findings["placement_candidate_count"] = len(candidates)
-        self._runtime_findings["placement_common_view_focus_xy"] = (
-            common_view_focus_xy.tolist()
-        )
-        self._runtime_findings["placement_heading_mode"] = (
-            "distant_common_focus_with_independent_robot_eroded_los_corridors"
-        )
-        self._runtime_findings["placement_cluster_center_xy"] = cluster_center_xy.tolist()
-        self._runtime_findings["placement_focus_xy_by_robot"] = {
-            robot.name: focus.tolist()
-            for robot, focus in zip(robots, selected_focus_xy_by_robot, strict=True)
+            pairs = self._external_robot_contact_pairs(robot, floors)
+            if pairs:
+                raise SampleRejected("initial_robot_collision", {"robot_id": robot.name, "contact_pairs": pairs[:50]})
+        self._runtime_findings["sampled_floor_index"] = floor_index
+        self._runtime_findings["placement_observation_regime"] = regime
+        self._runtime_findings["placement_start_region_ids"] = [str(labels[index]) for index in selected_indices]
+        self._runtime_findings["placement_target_region_ids"] = list(target_regions)
+        self._runtime_findings["placement_region_sampling_anchors_xy"] = {
+            name: point.tolist() for name, point in region_sampling_anchors.items()
         }
-        self._runtime_findings["placement_focus_distances_m"] = focus_distances_m
-        self._runtime_findings["placement_yaws_rad"] = placement_yaws
-        self._runtime_findings["placement_source"] = "robot-eroded traversability map"
-        self._runtime_findings["placement_effective_radius_m"] = effective_radius
+        self._runtime_findings["placement_region_adjacency"] = {anchor: sorted(adjacent)}
+        self._runtime_findings["placement_heading_mode"] = (
+            f"{heading_policy}_then_accepted_trajectory_tangent"
+        )
+        self._runtime_findings["placement_desired_headings_rad"] = desired_yaws.tolist()
+        self._runtime_findings["placement_reachable_headings_rad"] = provisional_yaws.tolist()
+        self._runtime_findings["placement_heading_adjustments_rad"] = heading_adjustments
+        self._runtime_findings["placement_heading_probe"] = {
+            "minimum_m": minimum_heading_probe_m,
+            "maximum_m": maximum_heading_probe_m,
+            "validation_spacing_m": heading_validation_spacing_m,
+            "source": "robot_eroded_direct_local_exit",
+        }
+        self._runtime_findings["placement_attempts"] = attempts
+        self._runtime_findings["placement_minimum_start_distance_m"] = minimum_distance
+        self._runtime_findings["placement_dynamic_object_filter"] = {
+            "clearance_m": start_clearance_m,
+            "dynamic_object_count": len(dynamic_objects),
+            "remaining_candidate_count": len(world_xy),
+            "path_viable_candidate_checks": len(viability_cache),
+        }
+        self._runtime_findings["development_camera_heights_m"] = sampled_heights
         return sampled_heights
 
     def _trajectory_traversability(
@@ -1871,6 +2109,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
     ) -> tuple[
         np.ndarray, Callable[[np.ndarray], bool],
         Callable[[np.ndarray, np.ndarray], tuple[np.ndarray, float] | None],
+        Callable[[np.ndarray], np.ndarray],
     ]:
         """Return strict robot-eroded candidates, validator, and OG planner."""
         scene = self._require_scene()
@@ -1880,6 +2119,34 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         )
         pixels = self._th.stack(self._th.where(eroded == 255), dim=1)
         world_xy = self._native_value(trav_map.map_to_world(pixels)).astype(np.float64)
+        pixels_native = self._native_value(pixels).astype(np.int64)
+
+        # Restrict every robot to its actual 8-connected component of the
+        # robot-eroded map. Sampling Euclidean-near goals from another component
+        # made the native planner repeat hundreds of guaranteed failures.
+        unassigned = {tuple(map(int, pixel)) for pixel in pixels_native}
+        component_by_cell: dict[tuple[int, int], int] = {}
+        component_cells: dict[int, np.ndarray] = {}
+        component_index = 0
+        while unassigned:
+            seed_cell = unassigned.pop()
+            stack = [seed_cell]
+            members = [seed_cell]
+            component_by_cell[seed_cell] = component_index
+            while stack:
+                row, column = stack.pop()
+                for row_delta in (-1, 0, 1):
+                    for column_delta in (-1, 0, 1):
+                        if row_delta == 0 and column_delta == 0:
+                            continue
+                        neighbor = (row + row_delta, column + column_delta)
+                        if neighbor in unassigned:
+                            unassigned.remove(neighbor)
+                            component_by_cell[neighbor] = component_index
+                            members.append(neighbor)
+                            stack.append(neighbor)
+            component_cells[component_index] = np.asarray(members, dtype=np.int64)
+            component_index += 1
 
         eroded_native = self._native_value(eroded) == 255
         height, width = eroded_native.shape
@@ -1902,6 +2169,22 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 np.all(inside)
                 and np.all(eroded_native[rows, columns])
             )
+
+        def reachable_candidates(source_xy: np.ndarray) -> np.ndarray:
+            source_pixel = self._native_value(
+                trav_map.world_to_map(
+                    self._th.as_tensor(source_xy, dtype=self._th.float32)
+                )
+            ).astype(int)
+            component = component_by_cell.get(tuple(map(int, source_pixel)))
+            if component is None:
+                return np.empty((0, 2), dtype=np.float64)
+            member_pixels = component_cells[component]
+            return self._native_value(
+                trav_map.map_to_world(
+                    self._th.as_tensor(member_pixels, dtype=self._th.int64)
+                )
+            ).astype(np.float64)
 
         def plan_segment(
             source_xy: np.ndarray,
@@ -1933,11 +2216,19 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             "native_waypoint_interval": int(trav_map.waypoint_interval),
             "robot_eroded": True,
             "erosion_source": "installed_omnigibson_3.9.2",
+            "connected_component_count": len(component_cells),
+            "connected_component_sizes": sorted(
+                (len(cells) for cells in component_cells.values()), reverse=True
+            ),
         }
-        return world_xy, is_path_traversable, plan_segment
+        return world_xy, is_path_traversable, plan_segment, reachable_candidates
 
-    def sample_robot_trajectories(self, seed: int) -> tuple[tuple[Trajectory, ...], dict[str, Any]]:
-        observations = self.robot_observations()
+    def sample_robot_trajectories(
+        self, seed: int, *, candidate_pool_size_override: int | None = None,
+        maximum_attempts_override: int | None = None,
+        observations_override: dict[str, dict[str, Any]] | None = None,
+    ) -> tuple[tuple[Trajectory, ...], dict[str, Any]]:
+        observations = observations_override or self.robot_observations()
         starts = {robot_id: record["base_to_world"] for robot_id, record in observations.items()}
         # A serialized PhysX restore can leave the passive Nova mast a few
         # millimetres away from its calibrated joint position until the next
@@ -1957,14 +2248,28 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         if len(robot_floor_indices) != 1:
             raise SampleRejected("robots_span_multiple_floors", {"floor_indices": sorted(robot_floor_indices)})
         floor_index = robot_floor_indices.pop()
-        world_xy, is_path_traversable, plan_segment = self._trajectory_traversability(
+        world_xy, is_path_traversable, plan_segment, reachable_candidates = self._trajectory_traversability(
             floor_index, self._env.robots[0]
         )
         trajectory_config = self.config["trajectory"]
+        reachable_by_robot = {
+            robot_id: reachable_candidates(transform[:2, 3])
+            for robot_id, transform in starts.items()
+        }
+        if any(not len(points) for points in reachable_by_robot.values()):
+            raise SampleRejected(
+                "trajectory_start_outside_eroded_component",
+                {
+                    "reachable_candidate_counts": {
+                        robot_id: len(points)
+                        for robot_id, points in reachable_by_robot.items()
+                    }
+                },
+            )
         trajectories = sample_geodesic_trajectory_set(
             starts,
             mounts,
-            world_xy,
+            reachable_by_robot,
             float(floor_heights[floor_index]),
             np.random.default_rng(seed),
             frames=int(self.config["dataset"]["frames"]),
@@ -1983,19 +2288,51 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             minimum_waypoint_trajectories=int(
                 trajectory_config["minimum_waypoint_trajectories"]
             ),
+            # Placement contributes only a regime-level scene-view prior. The
+            # persisted yaw is still the exact accepted path tangent.
             initial_heading_tolerance_rad=np.deg2rad(
                 float(trajectory_config["initial_heading_tolerance_deg"])
+            ),
+            derive_initial_heading_from_tangent=(
+                trajectory_config["initial_heading_policy"] == "trajectory_tangent"
+            ),
+            initial_heading_probability_floor=float(
+                trajectory_config["initial_heading_soft_probability_floor"]
             ),
             line_validation_spacing_m=float(trajectory_config["line_validation_spacing_m"]),
             smoothing_validation_spacing_m=float(trajectory_config["smoothing_validation_spacing_m"]),
             smoothing_strengths=trajectory_config["smoothing_strengths"],
-            candidate_pool_size=int(trajectory_config["candidate_pool_size"]),
-            maximum_attempts=int(trajectory_config["sampling_maximum_attempts"]),
+            candidate_pool_size=int(
+                candidate_pool_size_override or trajectory_config["candidate_pool_size"]
+            ),
+            maximum_attempts=int(
+                maximum_attempts_override or trajectory_config["sampling_maximum_attempts"]
+            ),
             joint_pool_rounds=int(trajectory_config["joint_pool_rounds"]),
+            maximum_control_turn_rad=np.deg2rad(
+                float(trajectory_config["maximum_control_turn_deg"])
+            ),
+            observation_regime=str(
+                self._runtime_findings.get("placement_observation_regime", "partial_chain")
+            ),
+            formation_degeneracy_limits=self.config["placement"]["formation_degeneracy"],
+            regime_coverage_saturation_m2=trajectory_config["regime_coverage_saturation_m2"],
+            regime_initial_heading_prior_weights=trajectory_config["regime_initial_heading_prior_weights"],
         )
+        joint_metrics = joint_trajectory_metrics(trajectories)
+        traversed_regions = {
+            trajectory.robot_id: sorted(set(self._observation_region_labels(
+                floor_index, trajectory.base_to_world[:, :2, 3]
+            ).tolist()))
+            for trajectory in trajectories
+        }
         metrics = {
             "floor_index": floor_index,
             "traversable_candidate_count": int(len(world_xy)),
+            "reachable_candidate_counts": {
+                robot_id: len(points)
+                for robot_id, points in reachable_by_robot.items()
+            },
             "robots": {
                 trajectory.robot_id: {
                     **trajectory_kinematic_metrics(trajectory),
@@ -2007,19 +2344,169 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 }
                 for trajectory in trajectories
             },
-            "minimum_pairwise_distance_m": min(
-                float(
-                    np.linalg.norm(
-                        trajectories[left].base_to_world[:, :2, 3]
-                        - trajectories[right].base_to_world[:, :2, 3],
-                        axis=1,
-                    ).min()
-                )
-                for left in range(len(trajectories))
-                for right in range(left + 1, len(trajectories))
+            "minimum_pairwise_distance_m": float(
+                joint_metrics["minimum_inter_robot_distance_m"]
             ),
+            "joint_diversity": joint_metrics,
+            "observation_regime": str(
+                self._runtime_findings.get("placement_observation_regime", "partial_chain")
+            ),
+            "start_region_ids": list(
+                self._runtime_findings.get("placement_start_region_ids", [])
+            ),
+            "target_region_ids": list(
+                self._runtime_findings.get("placement_target_region_ids", [])
+            ),
+            "traversed_region_ids": traversed_regions,
+            "unique_traversed_region_count": len({
+                region for values in traversed_regions.values() for region in values
+            }),
         }
         return trajectories, metrics
+
+    def sample_robot_trajectory_sets(
+        self, seed: int
+    ) -> tuple[tuple[tuple[Trajectory, ...], dict[str, Any]], ...]:
+        """Generate a nested pool of joint sets for one fixed placement."""
+        count = int(self.config["trajectory"]["trajectory_sets_per_placement"])
+        candidates: list[tuple[tuple[Trajectory, ...], dict[str, Any]]] = []
+        observations = self.robot_observations()
+        failures: list[dict[str, Any]] = []
+        for index in range(count):
+            try:
+                candidates.append(
+                    self.sample_robot_trajectories(
+                        seed + 130363 * (index + 1),
+                        candidate_pool_size_override=max(
+                            3,
+                            int(np.ceil(
+                                self.config["trajectory"]["candidate_pool_size"] / count
+                            )),
+                        ),
+                        maximum_attempts_override=max(
+                            50,
+                            int(np.ceil(
+                                self.config["trajectory"]["sampling_maximum_attempts"] / count
+                            )),
+                        ),
+                        observations_override=observations,
+                    )
+                )
+            except SampleRejected as error:
+                failures.append({"reason": error.reason, "details": error.details})
+        if not candidates:
+            raise SampleRejected(
+                "trajectory_set_pool_exhausted",
+                {"requested_set_count": count, "failures": failures[:20]},
+            )
+        rng = np.random.default_rng(seed)
+        utilities = []
+        for _, metrics in candidates:
+            joint = metrics["joint_diversity"]
+            regime = str(metrics["observation_regime"])
+            utilities.append(
+                regime_trajectory_soft_score(
+                    joint, regime, self.config["trajectory"]["regime_coverage_saturation_m2"],
+                    jitter=float(rng.uniform(0.0, 0.25)),
+                    heading_prior_weights=self.config["trajectory"]["regime_initial_heading_prior_weights"],
+                )
+            )
+        ranked: list[tuple[tuple[Trajectory, ...], dict[str, Any]]] = []
+        ranking = np.argsort(-np.asarray(utilities))
+        candidate_diversity = [item[1]["joint_diversity"] for item in candidates]
+        for rank, candidate_index in enumerate(ranking.tolist()):
+            trajectories, original_metrics = candidates[int(candidate_index)]
+            metrics = dict(original_metrics)
+            metrics["nested_trajectory_sets"] = {
+                "requested": count,
+                "accepted": len(candidates),
+                "candidate_index": int(candidate_index),
+                "soft_score_rank": rank,
+                "soft_score": float(utilities[int(candidate_index)]),
+                "rejection_count": len(failures),
+                "generation_failures": failures[:20],
+                "candidate_joint_diversity": candidate_diversity,
+            }
+            ranked.append((trajectories, metrics))
+        return tuple(ranked)
+
+    def complementary_trajectory_hybrids(
+        self,
+        candidate_sets: tuple[tuple[tuple[Trajectory, ...], dict[str, Any]], ...],
+        candidate_failures: list[dict[str, Any]],
+    ) -> tuple[tuple[tuple[Trajectory, ...], dict[str, Any]], ...]:
+        """Build a bounded hybrid pool only from complementary measured overlap graphs."""
+        trajectory_config = self.config["trajectory"]
+        specs = complementary_hybrid_trajectory_sets(
+            candidate_sets,
+            candidate_failures,
+            minimum_pairwise_distance_m=float(
+                self.config["placement"]["minimum_pairwise_distance_m"]
+            ),
+            minimum_waypoint_trajectories=int(
+                trajectory_config["minimum_waypoint_trajectories"]
+            ),
+            formation_degeneracy_limits=self.config["placement"]["formation_degeneracy"],
+            coverage_saturation_m2=trajectory_config["regime_coverage_saturation_m2"],
+            heading_prior_weights=trajectory_config[
+                "regime_initial_heading_prior_weights"
+            ],
+            maximum_candidates=int(
+                trajectory_config["maximum_complementary_hybrid_candidates"]
+            ),
+        )
+        hybrids: list[tuple[tuple[Trajectory, ...], dict[str, Any]]] = []
+        for hybrid_rank, (trajectories, source_by_robot, joint_metrics) in enumerate(specs):
+            cloned = tuple(
+                replace(
+                    trajectory,
+                    metadata={
+                        **trajectory.metadata,
+                        "joint_pool_hybrid": True,
+                        "hybrid_source_candidate_rank": int(
+                            source_by_robot[trajectory.robot_id]
+                        ),
+                        "joint_diversity_metrics": dict(joint_metrics),
+                    },
+                )
+                for trajectory in trajectories
+            )
+            template_source = min(source_by_robot.values())
+            template_metrics = candidate_sets[template_source][1]
+            robot_metrics = {
+                robot_id: candidate_sets[source_index][1]["robots"][robot_id]
+                for robot_id, source_index in source_by_robot.items()
+            }
+            traversed_regions = {
+                robot_id: candidate_sets[source_index][1]["traversed_region_ids"][
+                    robot_id
+                ]
+                for robot_id, source_index in source_by_robot.items()
+            }
+            nested = dict(template_metrics.get("nested_trajectory_sets", {}))
+            nested.update({
+                "candidate_kind": "complementary_hybrid",
+                "hybrid_rank": hybrid_rank,
+                "source_candidate_by_robot": source_by_robot,
+                "source_overlap_evidence": joint_metrics["complementary_hybrid"],
+            })
+            metrics = {
+                **template_metrics,
+                "robots": robot_metrics,
+                "minimum_pairwise_distance_m": float(
+                    joint_metrics["minimum_inter_robot_distance_m"]
+                ),
+                "joint_diversity": joint_metrics,
+                "traversed_region_ids": traversed_regions,
+                "unique_traversed_region_count": len({
+                    region
+                    for values in traversed_regions.values()
+                    for region in values
+                }),
+                "nested_trajectory_sets": nested,
+            }
+            hybrids.append((cloned, metrics))
+        return tuple(hybrids)
 
     def trajectory_traversability_inspection(self, floor_index: int) -> dict[str, Any]:
         """Expose the exact robot-eroded planning raster for inspection only."""
@@ -2189,6 +2676,38 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         rows = np.clip(np.rint(rows).astype(np.int64), 0, source_height - 1)
         return array[rows[:, None], columns[None, :]]
 
+    def robot_depth_observations(self) -> dict[str, dict[str, Any]]:
+        """Capture mounted-sensor depth and its exact pose without shared AOV work."""
+        self._require_scene()
+        result: dict[str, dict[str, Any]] = {}
+        for robot in self._env.robots:
+            sensors = [
+                sensor for sensor in robot.sensors.values()
+                if isinstance(sensor, self._vision_sensor_type)
+            ]
+            if len(sensors) != 1:
+                raise SimulatorUnavailableError(
+                    f"Expected one VisionSensor on {robot.name}"
+                )
+            sensor = sensors[0]
+            observation, _ = sensor.get_obs()
+            if "depth_linear" not in observation:
+                raise SimulatorUnavailableError(
+                    f"Mounted camera is missing depth_linear on {robot.name}"
+                )
+            depth = self._reshape_vision_observation(
+                sensor, "depth_linear", observation["depth_linear"]
+            )
+            usd_camera_to_world = self._pose_matrix(sensor)
+            camera_to_world = validate_transform(
+                usd_camera_to_world @ np.diag([1.0, -1.0, -1.0, 1.0])
+            )
+            result[robot.name] = {
+                "depth_linear": depth,
+                "camera_to_world": camera_to_world,
+            }
+        return result
+
     def robot_observations(self) -> dict[str, dict[str, Any]]:
         self._require_scene()
         result: dict[str, dict[str, Any]] = {}
@@ -2271,9 +2790,19 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 )
             else:
                 observation, info = observation_sensor.get_obs()
-            camera_to_world = validate_transform(usd_camera_to_world @ np.diag([1.0, -1.0, -1.0, 1.0]))
+                observation, info = self._publicize_observation_labels(observation, info)
+            mounted_camera_to_world = validate_transform(
+                requested_usd_camera_to_world @ np.diag([1.0, -1.0, -1.0, 1.0])
+            )
+            capture_camera_to_world = validate_transform(
+                usd_camera_to_world @ np.diag([1.0, -1.0, -1.0, 1.0])
+            )
+            # RGB/depth are produced by the mounted sensor. Public trajectory
+            # camera poses therefore follow that sensor, while AOV producer
+            # poses are retained separately below.
+            camera_to_world = mounted_camera_to_world
             base_to_world = self._pose_matrix(robot)
-            camera_to_base = np.linalg.inv(base_to_world) @ camera_to_world
+            camera_to_base = np.linalg.inv(base_to_world) @ mounted_camera_to_world
             mount_orthonormality_error = float(
                 np.linalg.norm(camera_to_base[:3, :3].T @ camera_to_base[:3, :3] - np.eye(3), ord="fro")
             )
@@ -2293,6 +2822,15 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 },
                 "info": info,
                 "camera_to_world": camera_to_world,
+                "mounted_camera_to_world": mounted_camera_to_world,
+                "capture_camera_to_world": capture_camera_to_world,
+                "modality_camera_to_world": {
+                    "rgb": mounted_camera_to_world,
+                    "depth_linear": mounted_camera_to_world,
+                    "seg_semantic": capture_camera_to_world,
+                    "seg_instance": capture_camera_to_world,
+                    "normal": capture_camera_to_world,
+                },
                 "base_to_world": base_to_world,
                 "camera_to_base": camera_to_base,
                 "expected_camera_to_base": expected_mount,
@@ -2497,6 +3035,46 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             },
         )
 
+    def _publicize_observation_labels(
+        self, observation: dict[str, Any], info: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Replace transient renderer IDs with Dataset-v1.1 public IDs."""
+        instance = observation.get("seg_instance_id", observation.get("seg_instance"))
+        renderer_info = info.get("seg_instance_id", info.get("seg_instance", {}))
+        if instance is None or not isinstance(renderer_info, dict):
+            return observation, info
+        catalog = self.object_catalog()
+        robot_paths = {robot.name: str(robot.prim_path) for robot in self._env.robots}
+        public_instance, public_semantic, mapping = remap_public_labels(
+            self._native_value(instance), renderer_info, catalog, robot_paths
+        )
+        like = instance
+        if hasattr(like, "device"):
+            public_instance_value = self._th.as_tensor(public_instance, device=like.device)
+            public_semantic_value = self._th.as_tensor(public_semantic, device=like.device)
+        else:
+            public_instance_value = public_instance
+            public_semantic_value = public_semantic
+        observation["seg_instance_id"] = public_instance_value
+        observation["seg_instance"] = public_instance_value
+        observation["seg_semantic"] = public_semantic_value
+        state_by_id = {obj.instance_id: obj for obj in catalog}
+        public_info = {"0": "BACKGROUND"}
+        semantic_info = {"0": {"class": "background"}, "1": {"class": "unknown"}, "2": {"class": "robot"}}
+        for public_id, state_id in mapping["public_instance_to_state"].items():
+            public_info[public_id] = state_by_id[state_id].native_path
+            semantic_info[str(3 + (__import__("zlib").crc32(state_by_id[state_id].category.encode("utf-8")) & 0x3FFFFFFF))] = {"class": state_by_id[state_id].category}
+        for public_id, robot_id in mapping["reserved_robot_instances"].items():
+            public_info[public_id] = robot_paths[robot_id]
+        info["seg_instance_id"] = public_info
+        info["seg_instance"] = public_info
+        info["seg_semantic"] = semantic_info
+        info["mvwd_public_id_mapping"] = mapping
+        self._runtime_findings["public_instance_mapping_source"] = (
+            "renderer_id->native_path->ObjectState.instance_id->public_integer"
+        )
+        return observation, info
+
     def _get_final_robot_capture_observation(
         self, camera: Any
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -2506,7 +3084,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         )
         observation.update(segmentation)
         info.update(segmentation_info)
-        return observation, info
+        return self._publicize_observation_labels(observation, info)
 
     def _initialize_final_robot_capture_sensor(self) -> None:
         """Create one stable world-space render graph before the first snapshot."""
@@ -2796,6 +3374,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 )
             else:
                 observation, info = camera.get_obs()
+                observation, info = self._publicize_observation_labels(observation, info)
             arrays: dict[str, np.ndarray] = {}
             for public_name in sensor_modalities:
                 backend_name = backend_names.get(public_name, public_name)
@@ -2908,6 +3487,9 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         }
         actual_bases: dict[str, list[np.ndarray]] = {robot_id: [] for robot_id in robots}
         actual_cameras: dict[str, list[np.ndarray]] = {robot_id: [] for robot_id in robots}
+        capture_cameras: dict[str, list[np.ndarray]] = {robot_id: [] for robot_id in robots}
+        capture_translation_errors: dict[str, list[float]] = {robot_id: [] for robot_id in robots}
+        capture_rotation_errors: dict[str, list[float]] = {robot_id: [] for robot_id in robots}
         maximum_base_pose_error = 0.0
         maximum_camera_pose_error = 0.0
         maximum_robot_mask_error = 0.0
@@ -3048,6 +3630,9 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                     )
                 else:
                     world_observation, world_info = camera.get_obs()
+                    world_observation, world_info = self._publicize_observation_labels(
+                        world_observation, world_info
+                    )
                 frame_arrays: dict[str, np.ndarray] = {}
                 for public_name in sensor_modalities:
                     backend_name = backend_names.get(public_name, public_name)
@@ -3268,6 +3853,13 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                     planned = by_id[robot_id]
                     actual_bases[robot_id].append(record["base_to_world"])
                     actual_cameras[robot_id].append(record["camera_to_world"])
+                    capture_cameras[robot_id].append(record["capture_camera_to_world"])
+                    capture_translation_errors[robot_id].append(
+                        float(record["capture_pose_translation_error_m"])
+                    )
+                    capture_rotation_errors[robot_id].append(
+                        float(record["capture_pose_rotation_error_rad"])
+                    )
                     maximum_camera_pose_error = max(
                         maximum_camera_pose_error,
                         float(
@@ -3316,6 +3908,14 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 metrics["own_view_best_fraction"]
                 >= minimum_multimodal_alignment_fraction
                 for metrics in multimodal_alignment["modalities"].values()
+            )
+            maximum_capture_translation_error = max(
+                (max(values, default=0.0) for values in capture_translation_errors.values()),
+                default=0.0,
+            )
+            maximum_capture_rotation_error = max(
+                (max(values, default=0.0) for values in capture_rotation_errors.values()),
+                default=0.0,
             )
             self._runtime_findings["robot_multimodal_view_alignment"] = (
                 multimodal_alignment
@@ -3395,6 +3995,14 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 "collision_free": not collision_frames,
                 "valid_depth": minimum_depth_valid_ratio >= 0.50,
                 "robot_multimodal_view_alignment": multimodal_alignment_passed,
+                "capture_sensor_translation_alignment": (
+                    maximum_capture_translation_error
+                    <= float(self.config["camera"]["maximum_capture_translation_error_m"])
+                ),
+                "capture_sensor_rotation_alignment": (
+                    maximum_capture_rotation_error
+                    <= float(self.config["camera"]["maximum_capture_rotation_error_rad"])
+                ),
                 "world_bev_each_robot_visible": minimum_robot_pixels >= 4,
                 "world_bev_robot_mask_projection": maximum_robot_mask_error <= mask_tolerance,
                 "world_bev_camera_pose_stable": (
@@ -3419,6 +4027,12 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                         "robot_multimodal_alignment": multimodal_alignment,
                         "minimum_multimodal_alignment_fraction": (
                             minimum_multimodal_alignment_fraction
+                        ),
+                        "maximum_capture_translation_error_m": (
+                            maximum_capture_translation_error
+                        ),
+                        "maximum_capture_rotation_error_rad": (
+                            maximum_capture_rotation_error
                         ),
                         "minimum_robot_pixels": minimum_robot_pixels,
                         "maximum_robot_mask_error_m": maximum_robot_mask_error,
@@ -3452,7 +4066,23 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             )
             return {
                 "world_bev": {
-                    name: np.stack(values) for name, values in world_frames.items()
+                    **{
+                        name: np.stack(values)
+                        for name, values in world_frames.items()
+                    },
+                    "calibration_world_bounds": np.asarray(
+                        calibration.world_bounds
+                    ),
+                    "calibration_pixel_to_world": (
+                        calibration.pixel_to_world_transform
+                    ),
+                    "calibration_world_to_pixel": (
+                        calibration.world_to_pixel_transform
+                    ),
+                    "calibration_meters_per_pixel": np.asarray(
+                        calibration.meters_per_pixel
+                    ),
+                    "calibration_floor_z": np.asarray(calibration.floor_z),
                 },
                 "robot_views": {
                     robot_id: {
@@ -3461,6 +4091,15 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                     for robot_id, modalities in robot_frames.items()
                 },
                 "actual_trajectories": actual_trajectories,
+                "camera_capture_metadata": {
+                    robot_id: {
+                        "mounted_camera_to_world": np.stack(actual_cameras[robot_id]),
+                        "capture_camera_to_world": np.stack(capture_cameras[robot_id]),
+                        "capture_pose_translation_error_m": np.asarray(capture_translation_errors[robot_id]),
+                        "capture_pose_rotation_error_rad": np.asarray(capture_rotation_errors[robot_id]),
+                    }
+                    for robot_id in sorted(robots)
+                },
                 "checks": checks,
                 "metrics": {
                     "maximum_base_pose_error": maximum_base_pose_error,
@@ -3469,6 +4108,12 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                     "robot_multimodal_alignment": multimodal_alignment,
                     "minimum_multimodal_alignment_fraction": (
                         minimum_multimodal_alignment_fraction
+                    ),
+                    "maximum_capture_translation_error_m": (
+                        maximum_capture_translation_error
+                    ),
+                    "maximum_capture_rotation_error_rad": (
+                        maximum_capture_rotation_error
                     ),
                     "minimum_robot_pixels": int(minimum_robot_pixels),
                     "maximum_robot_mask_error_m": maximum_robot_mask_error,

@@ -1,0 +1,12 @@
+extends: final_robot_preview.yaml
+profile: integration
+
+dataset:
+  scene_limit: 1
+  accepted_configurations_per_scene: 5
+  accepted_episodes_per_configuration: 3
+  frames: 60
+
+# Keep the verified final robot and full native relation sampling QA.
+robot:
+  use_final_robot: true
