@@ -52,6 +52,10 @@ placement:
   region_adjacency_distance_m: 0.5
   # Covers the final robot footprint around current movable-object AABBs.
   dynamic_object_start_clearance_m: 0.55
+  # AABBs already include each object's body; add the robot half-width plus
+  # margin for paths. Execution still performs exact contact validation.
+  dynamic_object_path_clearance_m: 0.35
+  dynamic_object_path_obstacle_height_m: 0.65
   initial_heading_probe_min_m: 0.15
   initial_heading_probe_max_m: 0.75
   sibling_region_reuse_penalty: 1.0
@@ -60,7 +64,7 @@ placement:
     dense_shared: 1.75
     partial_chain: 2.25
     exploratory: null
-  dense_shared_focus_distance_m: 4.0
+  dense_shared_focus_distance_m: 2.0
   observation_regime_weights:
     dense_shared: 0.30
     partial_chain: 0.50
@@ -106,7 +110,16 @@ trajectory:
   candidate_pool_size: 6
   joint_pool_rounds: 5
   trajectory_sets_per_placement: 8
-  maximum_complementary_hybrid_candidates: 8
+  maximum_complementary_hybrid_candidates: 2
+  # Recovery is triggered only after GT depth measured exactly one union edge.
+  maximum_measured_overlap_bridge_candidates: 6
+  measured_overlap_bridge_pool_size: 3
+  measured_overlap_bridge_sampling_attempts: 120
+  measured_overlap_bridge_target_depth_m: 3.0
+  measured_overlap_bridge_guide_distance_m: 2.0
+  measured_overlap_bridge_heading_floor: 0.02
+  measured_overlap_bridge_guide_scale_m: 0.40
+  measured_overlap_bridge_guide_floor: 0.02
   sampling_maximum_attempts: 200
   regime_coverage_saturation_m2:
     dense_shared: 8.0
@@ -118,6 +131,22 @@ trajectory:
     dense_shared: 1.00
     partial_chain: 0.75
     exploratory: 0.00
+  # Softly bias each independent path toward its own regime observation anchor.
+  # This never changes the hard minimum separation or selects compact triples.
+  regime_trajectory_guide_soft_scale_m:
+    dense_shared: 1.25
+    partial_chain: 1.50
+    exploratory: 1.50
+  regime_trajectory_guide_probability_floor:
+    dense_shared: 0.05
+    partial_chain: 0.10
+    exploratory: 1.00
+  # Rank joint candidates by whether camera rays meet at shared scene targets.
+  # This is soft only and does not reward compact positions or parallel headings.
+  regime_view_connectivity_weights:
+    dense_shared: 2.00
+    partial_chain: 1.50
+    exploratory: 0.75
   overlap_preflight:
     keyframe_count: 7
     geometry_width: 224

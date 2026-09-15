@@ -43,6 +43,7 @@ def run_sampling_diagnostics(
     heading_prior_alignments: list[float] = []
     path_similarities: list[float] = []
     velocity_correlations: list[float] = []
+    view_connectivity_proxies: list[float] = []
     minimum_separations: list[float] = []
     traversed_regions: Counter[str] = Counter()
     overlap_values: list[float] = []
@@ -101,6 +102,9 @@ def run_sampling_diagnostics(
             )
             path_similarities.append(float(joint["mean_path_direction_similarity"]))
             velocity_correlations.append(float(joint["mean_velocity_profile_correlation"]))
+            view_connectivity_proxies.append(float(
+                joint["temporal_camera_view_connectivity_proxy"]
+            ))
             minimum_separations.append(float(joint["minimum_inter_robot_distance_m"]))
             positions = [trajectory.base_to_world[0, :2, 3] for trajectory in trajectories]
             start_distances.extend(
@@ -174,6 +178,9 @@ def run_sampling_diagnostics(
             "mean_initial_heading_prior_alignment": _summary(heading_prior_alignments),
             "mean_path_direction_similarity": _summary(path_similarities),
             "mean_velocity_profile_correlation": _summary(velocity_correlations),
+            "temporal_camera_view_connectivity_proxy": _summary(
+                view_connectivity_proxies
+            ),
             "spatial_coverage_m2": _summary(coverages),
             "minimum_inter_robot_distance_m": _summary(minimum_separations),
             "configuration_candidates": {

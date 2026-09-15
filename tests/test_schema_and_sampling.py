@@ -20,6 +20,7 @@ from multi_view_world_dataset.sampling.trajectories import (
     _sample_route_controls,
     collision_safe_planner_polyline,
     densify_polyline,
+    sample_geodesic_robot_trajectory_pool,
     sample_geodesic_trajectory_set,
     smooth_collision_safe_path,
     trajectories_equal,
@@ -407,3 +408,87 @@ def test_snapshot_restore_metrics_allow_float32_pose_noise_but_not_state_drift()
     )
     assert error == pytest.approx(2.4e-7)
     assert discrete_equal
+
+
+def test_adapter_close_does_not_mask_cli_result_with_system_exit():
+    class FakeApp:
+        def close(self):
+            raise SystemExit(0)
+
+    class FakeOG:
+        sim = None
+        app = FakeApp()
+
+        @staticmethod
+        def cleanup():
+            return None
+
+    adapter = object.__new__(OmniGibsonAdapter)
+    adapter._started = True
+    adapter._env = object()
+    adapter._og = FakeOG()
+    adapter._runtime_findings = {}
+    adapter.close()
+    assert not adapter._started
+    assert adapter._runtime_findings["simulation_app_close_system_exit"] == "0"
+
+
+def test_route_control_guide_is_soft_deterministic_and_effective():
+    candidates = np.asarray([
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [-1.0, 0.0],
+        [0.0, -1.0],
+    ])
+
+    def endpoint(seed, guide):
+        return _sample_route_controls(
+            np.zeros(2), 0.0, candidates, "direct", 0.99, 1.01,
+            0.2, 1.0, np.random.default_rng(seed),
+            soft_initial_heading=True,
+            initial_heading_probability_floor=1.0,
+            guide_xy=guide,
+            guide_soft_scale_m=0.25,
+            guide_probability_floor=0.01,
+        )[-1]
+
+    target = np.asarray([0.0, 1.0])
+    unguided = [endpoint(seed, None) for seed in range(40)]
+    guided = [endpoint(seed, target) for seed in range(40)]
+    guided_mean = np.mean([np.linalg.norm(point - target) for point in guided])
+    unguided_mean = np.mean([np.linalg.norm(point - target) for point in unguided])
+    assert guided_mean < 0.1 * unguided_mean
+    assert np.array_equal(endpoint(7, target), endpoint(7, target))
+
+def test_single_robot_rescue_pool_reuses_validated_geodesic_sampler():
+    start = np.eye(4)
+    yaw = np.pi / 2.0
+    start[:2, :2] = [[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]]
+    candidates = np.asarray([[1.0, 0.0], [0.0, 1.0]])
+    kwargs = dict(
+        frames=60, fps=10, path_length_range_m=(0.99, 1.01),
+        maximum_linear_speed_mps=0.8, maximum_angular_speed_radps=1.2,
+        maximum_acceleration_mps2=1.5, plan_segment=_straight_planner,
+        is_path_traversable=lambda points: bool(np.all(np.abs(points) <= 1.01)),
+        path_family_weights={
+            "direct": 1.0, "one_waypoint": 0.0, "two_waypoint": 0.0,
+        },
+        initial_heading_tolerance_rad=np.deg2rad(35.0),
+        derive_initial_heading_from_tangent=True,
+        initial_heading_probability_floor=0.01,
+        maximum_control_turn_rad=np.deg2rad(55.0),
+        line_validation_spacing_m=0.02,
+        smoothing_validation_spacing_m=0.02,
+        smoothing_strengths=(1.0,), candidate_pool_size=1, maximum_attempts=10,
+        guide_xy=np.asarray([0.0, 1.0]), guide_soft_scale_m=0.1,
+        guide_probability_floor=0.01,
+    )
+    def sample():
+        return sample_geodesic_robot_trajectory_pool(
+            "robot_01", start, np.eye(4), candidates, 0.0,
+            np.random.default_rng(17), **kwargs,
+        )[0]
+    first, second = sample(), sample()
+    assert np.array_equal(first.base_to_world, second.base_to_world)
+    assert first.base_to_world[-1, 1, 3] == pytest.approx(1.0)
+    assert trajectory_kinematic_metrics(first)["maximum_linear_speed_mps"] <= 0.8

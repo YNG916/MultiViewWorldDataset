@@ -10,7 +10,7 @@ from multi_view_world_dataset.cameras.calibration import backproject_depth, proj
 from multi_view_world_dataset.errors import GeometryError
 
 
-def _directed_overlap(
+def _directed_overlap_evidence(
     source_depth: np.ndarray,
     source_intrinsics: np.ndarray,
     source_camera_to_world: np.ndarray,
@@ -19,10 +19,10 @@ def _directed_overlap(
     target_camera_to_world: np.ndarray,
     stride: int,
     tolerance_m: float,
-) -> float:
+) -> tuple[float, np.ndarray]:
     points = backproject_depth(source_depth, source_intrinsics, source_camera_to_world, stride=stride)
     if len(points) == 0:
-        return 0.0
+        return 0.0, np.empty((0, 3), dtype=np.float64)
     pixels, projected_depth = project_world_points(points, target_intrinsics, target_camera_to_world)
     finite_projection = np.isfinite(pixels).all(axis=1) & np.isfinite(projected_depth)
     u = np.zeros(len(points), dtype=np.int64)
@@ -38,11 +38,11 @@ def _directed_overlap(
         & (v < target_depth.shape[0])
     )
     if not inside.any():
-        return 0.0
+        return 0.0, np.empty((0, 3), dtype=np.float64)
     observed = np.full(len(points), np.nan, dtype=np.float64)
     observed[inside] = target_depth[v[inside], u[inside]]
     shared = inside & np.isfinite(observed) & (observed > 0) & (np.abs(observed - projected_depth) <= tolerance_m)
-    return float(shared.sum() / len(points))
+    return float(shared.sum() / len(points)), points[shared]
 
 
 def pairwise_visible_surface_overlap(
@@ -63,10 +63,44 @@ def pairwise_visible_surface_overlap(
         raise GeometryError("Invalid depth overlap inputs")
     ka, kb = np.asarray(intrinsics_a, dtype=np.float64), np.asarray(intrinsics_b, dtype=np.float64)
     ta, tb = np.asarray(camera_a_to_world, dtype=np.float64), np.asarray(camera_b_to_world, dtype=np.float64)
-    ab = _directed_overlap(a, ka, ta, b, kb, tb, stride, tolerance_m)
-    ba = _directed_overlap(b, kb, tb, a, ka, ta, stride, tolerance_m)
+    ab = _directed_overlap_evidence(a, ka, ta, b, kb, tb, stride, tolerance_m)[0]
+    ba = _directed_overlap_evidence(b, kb, tb, a, ka, ta, stride, tolerance_m)[0]
     return 0.5 * (ab + ba)
 
+
+def pairwise_shared_surface_centroid(
+    depth_a: ArrayLike,
+    intrinsics_a: ArrayLike,
+    camera_a_to_world: ArrayLike,
+    depth_b: ArrayLike,
+    intrinsics_b: ArrayLike,
+    camera_b_to_world: ArrayLike,
+    *,
+    stride: int = 8,
+    tolerance_m: float = 0.08,
+) -> np.ndarray | None:
+    """Return a robust world-space center of the same GT-verified surfaces."""
+    a = np.asarray(depth_a, dtype=np.float64)
+    b = np.asarray(depth_b, dtype=np.float64)
+    if a.ndim != 2 or b.ndim != 2 or stride < 1 or tolerance_m <= 0:
+        raise GeometryError("Invalid depth overlap inputs")
+    ka = np.asarray(intrinsics_a, dtype=np.float64)
+    kb = np.asarray(intrinsics_b, dtype=np.float64)
+    ta = np.asarray(camera_a_to_world, dtype=np.float64)
+    tb = np.asarray(camera_b_to_world, dtype=np.float64)
+    _, points_ab = _directed_overlap_evidence(
+        a, ka, ta, b, kb, tb, stride, tolerance_m
+    )
+    _, points_ba = _directed_overlap_evidence(
+        b, kb, tb, a, ka, ta, stride, tolerance_m
+    )
+    if not len(points_ab) and not len(points_ba):
+        return None
+    points = np.concatenate((points_ab, points_ba), axis=0)
+    finite = points[np.isfinite(points).all(axis=1)]
+    if not len(finite):
+        return None
+    return np.median(finite, axis=0)
 
 @dataclass(frozen=True)
 class OverlapGraph:

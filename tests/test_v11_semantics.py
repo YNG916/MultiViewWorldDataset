@@ -309,6 +309,31 @@ def test_complementary_hybrids_are_bounded_deterministic_and_separated():
             ["robot_00", "robot_02"],
         ]
 
+    single_edge_failures = (
+        {
+            "candidate_rank": 0,
+            "reason": "trajectory_temporal_overlap_failed",
+            "details": {"union_edges": [["robot_00", "robot_02"]]},
+        },
+        {
+            "candidate_rank": 1,
+            "reason": "trajectory_temporal_overlap_failed",
+            "details": {"union_edges": []},
+        },
+    )
+    bridges = complementary_hybrid_trajectory_sets(
+        candidates, single_edge_failures, **kwargs
+    )
+    assert bridges
+    _, bridge_sources, bridge_metrics = bridges[0]
+    assert bridge_sources == {
+        "robot_00": 0, "robot_01": 1, "robot_02": 0,
+    }
+    assert bridge_metrics["complementary_hybrid"]["predicted_preserved_edges"] == [
+        ["robot_00", "robot_02"]
+    ]
+    assert bridge_metrics["complementary_hybrid"]["strategy"] == "measured_edge_bridge"
+
 
 
 def test_dataset_diagnostics_aggregate_finalized_training_semantics(tmp_path):
@@ -484,3 +509,52 @@ def test_dataset_diagnostics_aggregate_finalized_training_semantics(tmp_path):
         "complete_world_bev_calibration_episode_count"
     ] == 1
     assert report["collapse_warning_evaluation_deferred"]["episodes"]
+
+def test_camera_view_proxy_rewards_shared_scene_content_not_parallel_headings():
+    angles = np.deg2rad([0.0, 120.0, 240.0])
+    positions = np.column_stack((3.0 * np.cos(angles), 3.0 * np.sin(angles)))
+
+    def trajectories(outward: bool):
+        result = []
+        for index, position in enumerate(positions):
+            forward = position / np.linalg.norm(position)
+            if not outward:
+                forward = -forward
+            base = np.repeat(np.eye(4)[None], 5, axis=0)
+            base[:, :2, 3] = position
+            camera = base.copy()
+            camera[:, 0, 2] = forward[0]
+            camera[:, 1, 2] = forward[1]
+            camera[:, 2, 2] = 0.0
+            result.append(SimpleNamespace(
+                robot_id=f"robot_{index:02d}",
+                base_to_world=base,
+                camera_to_world=camera,
+                metadata={},
+            ))
+        return tuple(result)
+
+    converging = joint_trajectory_metrics(trajectories(outward=False))
+    looking_away = joint_trajectory_metrics(trajectories(outward=True))
+    # The converging camera directions are 120 degrees apart, not parallel,
+    # yet most of their sampled view-cone volumes intersect around the target.
+    assert converging["temporal_camera_view_connectivity_proxy"] > 0.70
+    assert looking_away["temporal_camera_view_connectivity_proxy"] < 0.01
+
+    saturation = {
+        "dense_shared": 8.0,
+        "partial_chain": 16.0,
+        "exploratory": 30.0,
+    }
+    shared = {
+        "spatial_coverage_bbox_area_m2": 8.0,
+        "mean_inter_robot_distance_m": 3.0,
+        "temporal_camera_view_connectivity_proxy": 1.0,
+    }
+    sparse = {**shared, "temporal_camera_view_connectivity_proxy": 0.0}
+    weights = {"dense_shared": 2.0}
+    assert regime_trajectory_soft_score(
+        shared, "dense_shared", saturation, view_connectivity_weights=weights,
+    ) > regime_trajectory_soft_score(
+        sparse, "dense_shared", saturation, view_connectivity_weights=weights,
+    )

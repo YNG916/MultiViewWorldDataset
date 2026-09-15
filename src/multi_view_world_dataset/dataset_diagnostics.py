@@ -156,6 +156,7 @@ def summarize_generated_dataset(
     cumulative_yaw_changes: list[float] = []
     heading_differences: list[float] = []
     path_direction_similarities: list[float] = []
+    view_connectivity_proxies: list[float] = []
     minimum_separations: list[float] = []
     connected_fractions: list[float] = []
     overlap_values: list[float] = []
@@ -217,6 +218,9 @@ def summarize_generated_dataset(
             joint.get("mean_path_direction_similarity", 0.0)
         )
         path_direction_similarities.append(similarity)
+        view_connectivity_proxies.append(float(
+            joint.get("temporal_camera_view_connectivity_proxy", 0.0)
+        ))
         parallel_episodes += int(similarity >= parallel_min)
         minimum_separations.append(
             float(
@@ -412,6 +416,9 @@ def summarize_generated_dataset(
             ),
             "mean_path_direction_similarity": _summary(
                 path_direction_similarities
+            ),
+            "temporal_camera_view_connectivity_proxy": _summary(
+                view_connectivity_proxies
             ),
             "minimum_inter_robot_distance_m": _summary(minimum_separations),
             "parallel_episode_fraction": (

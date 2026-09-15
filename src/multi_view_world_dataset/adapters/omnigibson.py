@@ -27,11 +27,13 @@ from multi_view_world_dataset.sampling.interventions import (
 from multi_view_world_dataset.sampling.diversity import (
     choose_weighted_label,
     complementary_hybrid_trajectory_sets,
+    formation_degenerate,
     joint_trajectory_metrics,
     regime_trajectory_soft_score,
 )
 from multi_view_world_dataset.sampling.splits import infer_scene_family
 from multi_view_world_dataset.sampling.trajectories import (
+    sample_geodesic_robot_trajectory_pool,
     sample_geodesic_trajectory_set,
     trajectory_kinematic_metrics,
 )
@@ -274,8 +276,15 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             self._runtime_findings["cleanup_warning"] = str(error)
         if self._og.sim is not None:
             self._og.sim._disable_usd_guard()
-        self._og.app.close()
-        self._started = False
+        try:
+            self._og.app.close()
+        except SystemExit as error:
+            # SimulationApp.close() raises SystemExit in this runtime. Let the
+            # CLI / generator return normally (or propagate the active sample
+            # failure) instead of silently turning every failure into exit 0.
+            self._runtime_findings["simulation_app_close_system_exit"] = str(error)
+        finally:
+            self._started = False
 
     def _require_started(self) -> None:
         if not self._started:
@@ -1855,6 +1864,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         if not regions:
             raise SampleRejected("no_observation_regions", {"floor_index": floor_index})
         regime = choose_weighted_label(placement["observation_regime_weights"], rng)
+        requested_regime = regime
         region_ids = tuple(regions)
         reuse_penalty = float(placement.get("sibling_region_reuse_penalty", 1.0))
         anchor_weights = np.asarray([
@@ -1875,7 +1885,9 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             sample = points[np.linspace(0, len(points) - 1, min(256, len(points))).astype(int)]
             if float(np.min(np.linalg.norm(anchor_sample[:, None] - sample[None, :], axis=2))) <= adjacency_distance:
                 adjacent.append(region_id)
-        if regime == "dense_shared" or not adjacent:
+        if not adjacent:
+            regime = "dense_shared"
+        if regime == "dense_shared":
             target_regions = (anchor,)
         elif regime == "partial_chain":
             target_regions = (anchor, str(rng.choice(adjacent)))
@@ -1978,20 +1990,42 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         )
         cv_to_usd = np.diag([1.0, -1.0, -1.0, 1.0])
         shared_heading = float(rng.uniform(-np.pi, np.pi))
+        trajectory_guides: dict[str, np.ndarray] = {}
         if regime == "dense_shared":
-            focus = (
+            requested_focus = (
                 region_sampling_anchors[anchor]
                 + float(placement["dense_shared_focus_distance_m"])
                 * np.asarray([np.cos(shared_heading), np.sin(shared_heading)])
             )
+            focus = anchor_points[int(np.argmin(
+                np.linalg.norm(anchor_points - requested_focus, axis=1)
+            ))]
             provisional_yaws = np.arctan2(
                 focus[1] - selected_xy[:, 1], focus[0] - selected_xy[:, 0]
             )
-            heading_policy = "soft_convergent_scene_focus"
+            trajectory_guides = {
+                robot.name: focus.copy() for robot in robots
+            }
+            heading_policy = "soft_in_region_scene_focus"
         elif regime == "partial_chain":
-            offsets = np.deg2rad(np.asarray([-40.0, 0.0, 40.0]))
-            provisional_yaws = shared_heading + offsets[rng.permutation(len(robots))]
-            heading_policy = "chain_scene_directions"
+            anchor_guide = region_sampling_anchors[anchor]
+            other_guide = region_sampling_anchors[target_regions[1]]
+            assigned_regions = [
+                target_regions[index % len(target_regions)] for index in range(len(robots))
+            ]
+            guide_points = np.asarray([
+                other_guide if desired == anchor else anchor_guide
+                for desired in assigned_regions
+            ])
+            provisional_yaws = np.arctan2(
+                guide_points[:, 1] - selected_xy[:, 1],
+                guide_points[:, 0] - selected_xy[:, 0],
+            )
+            trajectory_guides = {
+                robot.name: guide_points[index].copy()
+                for index, robot in enumerate(robots)
+            }
+            heading_policy = "soft_adjacent_region_chain_anchors"
         else:
             provisional_yaws = rng.uniform(-np.pi, np.pi, len(robots))
             heading_policy = "independent_scene_directions"
@@ -2073,10 +2107,15 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 raise SampleRejected("initial_robot_collision", {"robot_id": robot.name, "contact_pairs": pairs[:50]})
         self._runtime_findings["sampled_floor_index"] = floor_index
         self._runtime_findings["placement_observation_regime"] = regime
+        self._runtime_findings["placement_requested_observation_regime"] = requested_regime
         self._runtime_findings["placement_start_region_ids"] = [str(labels[index]) for index in selected_indices]
         self._runtime_findings["placement_target_region_ids"] = list(target_regions)
         self._runtime_findings["placement_region_sampling_anchors_xy"] = {
             name: point.tolist() for name, point in region_sampling_anchors.items()
+        }
+        self._runtime_findings["placement_trajectory_guides_xy"] = {
+            robot_id: point.tolist()
+            for robot_id, point in trajectory_guides.items()
         }
         self._runtime_findings["placement_region_adjacency"] = {anchor: sorted(adjacent)}
         self._runtime_findings["placement_heading_mode"] = (
@@ -2121,6 +2160,45 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         world_xy = self._native_value(trav_map.map_to_world(pixels)).astype(np.float64)
         pixels_native = self._native_value(pixels).astype(np.int64)
 
+        eroded_native = self._native_value(eroded) == 255
+        floor_id = f"floor_{floor_index:02d}"
+        floor_height = float(scene.get_floor_height(floor_index))
+        obstacle_height_m = float(
+            self.config["placement"].get(
+                "dynamic_object_path_obstacle_height_m", 0.65
+            )
+        )
+        dynamic_objects = [
+            obj
+            for obj in self.object_catalog()
+            if not obj.structural
+            and obj.floor_id == floor_id
+            and obj.bbox_max_world[2] > floor_height + 0.10
+            and obj.bbox_min_world[2] < floor_height + obstacle_height_m
+        ]
+        dynamic_clearance_m = float(
+            self.config["placement"].get("dynamic_object_path_clearance_m", 0.55)
+        )
+        dynamically_free = np.ones(len(world_xy), dtype=bool)
+        for obj in dynamic_objects:
+            dynamically_free &= ~(
+                (world_xy[:, 0] >= obj.bbox_min_world[0] - dynamic_clearance_m)
+                & (world_xy[:, 0] <= obj.bbox_max_world[0] + dynamic_clearance_m)
+                & (world_xy[:, 1] >= obj.bbox_min_world[1] - dynamic_clearance_m)
+                & (world_xy[:, 1] <= obj.bbox_max_world[1] + dynamic_clearance_m)
+            )
+        blocked_pixels = pixels_native[~dynamically_free]
+        if len(blocked_pixels):
+            eroded_native[blocked_pixels[:, 0], blocked_pixels[:, 1]] = False
+        pixels_native = pixels_native[dynamically_free]
+        world_xy = world_xy[dynamically_free]
+        self._runtime_findings["trajectory_dynamic_object_filter"] = {
+            "clearance_m": dynamic_clearance_m,
+            "obstacle_height_m": obstacle_height_m,
+            "dynamic_object_count": len(dynamic_objects),
+            "blocked_candidate_count": int(np.count_nonzero(~dynamically_free)),
+        }
+
         # Restrict every robot to its actual 8-connected component of the
         # robot-eroded map. Sampling Euclidean-near goals from another component
         # made the native planner repeat hundreds of guaranteed failures.
@@ -2148,7 +2226,6 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             component_cells[component_index] = np.asarray(members, dtype=np.int64)
             component_index += 1
 
-        eroded_native = self._native_value(eroded) == 255
         height, width = eroded_native.shape
         def is_path_traversable(path_xy: np.ndarray) -> bool:
             points = np.asarray(path_xy, dtype=np.float64)
@@ -2266,6 +2343,15 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                     }
                 },
             )
+        observation_regime = str(
+            self._runtime_findings.get("placement_observation_regime", "partial_chain")
+        )
+        trajectory_guides = {
+            robot_id: np.asarray(point, dtype=np.float64)
+            for robot_id, point in self._runtime_findings.get(
+                "placement_trajectory_guides_xy", {}
+            ).items()
+        }
         trajectories = sample_geodesic_trajectory_set(
             starts,
             mounts,
@@ -2312,14 +2398,23 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             maximum_control_turn_rad=np.deg2rad(
                 float(trajectory_config["maximum_control_turn_deg"])
             ),
-            observation_regime=str(
-                self._runtime_findings.get("placement_observation_regime", "partial_chain")
+            observation_regime=observation_regime,
+            trajectory_guides_xy=trajectory_guides or None,
+            guide_soft_scale_m=float(
+                trajectory_config["regime_trajectory_guide_soft_scale_m"][observation_regime]
+            ),
+            guide_probability_floor=float(
+                trajectory_config["regime_trajectory_guide_probability_floor"][observation_regime]
             ),
             formation_degeneracy_limits=self.config["placement"]["formation_degeneracy"],
             regime_coverage_saturation_m2=trajectory_config["regime_coverage_saturation_m2"],
             regime_initial_heading_prior_weights=trajectory_config["regime_initial_heading_prior_weights"],
+            regime_view_connectivity_weights=trajectory_config["regime_view_connectivity_weights"],
+            camera_hfov_deg=float(self.config["camera"]["hfov_deg"]),
         )
-        joint_metrics = joint_trajectory_metrics(trajectories)
+        joint_metrics = joint_trajectory_metrics(
+            trajectories, camera_hfov_deg=float(self.config["camera"]["hfov_deg"])
+        )
         traversed_regions = {
             trajectory.robot_id: sorted(set(self._observation_region_labels(
                 floor_index, trajectory.base_to_world[:, :2, 3]
@@ -2351,6 +2446,10 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             "observation_regime": str(
                 self._runtime_findings.get("placement_observation_regime", "partial_chain")
             ),
+            "trajectory_guides_xy": {
+                robot_id: point.tolist()
+                for robot_id, point in trajectory_guides.items()
+            },
             "start_region_ids": list(
                 self._runtime_findings.get("placement_start_region_ids", [])
             ),
@@ -2409,6 +2508,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                     joint, regime, self.config["trajectory"]["regime_coverage_saturation_m2"],
                     jitter=float(rng.uniform(0.0, 0.25)),
                     heading_prior_weights=self.config["trajectory"]["regime_initial_heading_prior_weights"],
+                    view_connectivity_weights=self.config["trajectory"]["regime_view_connectivity_weights"],
                 )
             )
         ranked: list[tuple[tuple[Trajectory, ...], dict[str, Any]]] = []
@@ -2451,6 +2551,10 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             heading_prior_weights=trajectory_config[
                 "regime_initial_heading_prior_weights"
             ],
+            view_connectivity_weights=trajectory_config[
+                "regime_view_connectivity_weights"
+            ],
+            camera_hfov_deg=float(self.config["camera"]["hfov_deg"]),
             maximum_candidates=int(
                 trajectory_config["maximum_complementary_hybrid_candidates"]
             ),
@@ -2508,15 +2612,396 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             hybrids.append((cloned, metrics))
         return tuple(hybrids)
 
-    def trajectory_traversability_inspection(self, floor_index: int) -> dict[str, Any]:
-        """Expose the exact robot-eroded planning raster for inspection only."""
-        trav_map = self._require_scene().trav_map
-        eroded = trav_map._erode_trav_map(
-            self._th.clone(trav_map.floor_map[floor_index]),
-            robot=self._env.robots[0],
+    def measured_overlap_bridge_trajectories(
+        self,
+        candidate_sets: tuple[tuple[tuple[Trajectory, ...], dict[str, Any]], ...],
+        candidate_failures: list[dict[str, Any]],
+        seed: int,
+    ) -> tuple[tuple[tuple[Trajectory, ...], dict[str, Any]], ...]:
+        """Resample only an isolated robot after GT depth measured one edge."""
+        trajectory_config = self.config["trajectory"]
+        maximum_candidates = int(
+            trajectory_config["maximum_measured_overlap_bridge_candidates"]
         )
+        if maximum_candidates <= 0:
+            return ()
+        failure_by_rank = {
+            int(item["candidate_rank"]): item
+            for item in candidate_failures
+            if isinstance(item.get("candidate_rank"), int)
+            and item.get("candidate_kind", "base") == "base"
+            and item.get("reason") == "trajectory_temporal_overlap_failed"
+        }
+        robot_ids = tuple(
+            sorted(trajectory.robot_id for trajectory in candidate_sets[0][0])
+        )
+        floor_index = int(candidate_sets[0][1]["floor_index"])
+        _, is_path_traversable, plan_segment, reachable_candidates = (
+            self._trajectory_traversability(floor_index, self._env.robots[0])
+        )
+        floor_z = float(self._require_scene().get_floor_height(floor_index))
+        minimum_distance = float(
+            self.config["placement"]["minimum_pairwise_distance_m"]
+        )
+        target_depth = float(
+            trajectory_config["measured_overlap_bridge_target_depth_m"]
+        )
+        guide_distance = float(
+            trajectory_config["measured_overlap_bridge_guide_distance_m"]
+        )
+        ranked: list[
+            tuple[float, tuple[Trajectory, ...], dict[str, Any]]
+        ] = []
+        sampling_index = 0
+        for source_rank, (source_trajectories, source_metrics) in enumerate(
+            candidate_sets
+        ):
+            failure = failure_by_rank.get(source_rank)
+            if failure is None:
+                continue
+            edges = {
+                tuple(sorted(map(str, edge)))
+                for edge in failure.get("details", {}).get("union_edges", ())
+                if len(edge) == 2
+            }
+            if len(edges) != 1:
+                continue
+            preserved_edge = next(iter(edges))
+            isolated_ids = sorted(set(robot_ids) - set(preserved_edge))
+            if len(isolated_ids) != 1:
+                continue
+            isolated_id = isolated_ids[0]
+            source_by_id = {
+                trajectory.robot_id: trajectory
+                for trajectory in source_trajectories
+            }
+            isolated_source = source_by_id[isolated_id]
+            start_xy = isolated_source.base_to_world[0, :2, 3]
+            camera_mount = (
+                np.linalg.inv(isolated_source.base_to_world[0])
+                @ isolated_source.camera_to_world[0]
+            )
+            reachable = reachable_candidates(start_xy)
+            if not len(reachable):
+                continue
+            keyframes = failure.get("details", {}).get("keyframes", ())
+            edge_key = "|".join(preserved_edge)
+            edge_frames = [
+                int(keyframe["frame_index"])
+                for keyframe in keyframes
+                if preserved_edge
+                in {
+                    tuple(sorted(map(str, edge)))
+                    for edge in keyframe.get("edges", ())
+                }
+            ]
+            phases = edge_frames or [
+                0,
+                isolated_source.frames // 2,
+                isolated_source.frames - 1,
+            ]
+            for anchor_id in preserved_edge:
+                anchor = source_by_id[anchor_id]
+                for phase in phases[:2]:
+                    phase = min(max(int(phase), 0), anchor.frames - 1)
+                    camera = anchor.camera_to_world[phase]
+                    forward = np.asarray(camera[:2, 2], dtype=np.float64)
+                    norm = float(np.linalg.norm(forward))
+                    if norm <= 1.0e-8:
+                        continue
+                    forward /= norm
+                    shared_target = camera[:2, 3] + target_depth * forward
+                    target_source = "camera_ray_fallback"
+                    centroid = next(
+                        (
+                            keyframe.get(
+                                "shared_surface_centroids_world", {}
+                            ).get(edge_key)
+                            for keyframe in keyframes
+                            if int(keyframe["frame_index"]) == phase
+                        ),
+                        None,
+                    )
+                    if centroid is not None:
+                        centroid_xy = np.asarray(centroid, dtype=np.float64)[:2]
+                        if np.isfinite(centroid_xy).all():
+                            shared_target = centroid_xy
+                            target_source = "gt_depth_shared_surface_centroid"
+                    direction_specs = (
+                        ("shared_target", shared_target - start_xy),
+                        ("parallel_ray", forward),
+                    )
+                    for strategy, desired_direction in direction_specs:
+                        direction_norm = float(np.linalg.norm(desired_direction))
+                        if direction_norm <= 1.0e-8:
+                            continue
+                        direction = desired_direction / direction_norm
+                        desired_yaw = float(np.arctan2(direction[1], direction[0]))
+                        sampling_start = isolated_source.base_to_world[0].copy()
+                        cosine, sine = np.cos(desired_yaw), np.sin(desired_yaw)
+                        sampling_start[:2, :2] = [
+                            [cosine, -sine],
+                            [sine, cosine],
+                        ]
+                        guide = start_xy + guide_distance * direction
+                        sampling_index += 1
+                        try:
+                            rescue_pool = sample_geodesic_robot_trajectory_pool(
+                                isolated_id,
+                                sampling_start,
+                                camera_mount,
+                                reachable,
+                                floor_z,
+                                np.random.default_rng(
+                                    seed + 104729 * sampling_index
+                                ),
+                                frames=isolated_source.frames,
+                                fps=isolated_source.fps,
+                                path_length_range_m=(
+                                    float(trajectory_config["path_length_min_m"]),
+                                    float(trajectory_config["path_length_max_m"]),
+                                ),
+                                maximum_linear_speed_mps=float(
+                                    trajectory_config["maximum_linear_speed_mps"]
+                                ),
+                                maximum_angular_speed_radps=float(
+                                    trajectory_config["maximum_angular_speed_radps"]
+                                ),
+                                maximum_acceleration_mps2=float(
+                                    trajectory_config["maximum_acceleration_mps2"]
+                                ),
+                                plan_segment=plan_segment,
+                                is_path_traversable=is_path_traversable,
+                                path_family_weights=trajectory_config[
+                                    "path_family_weights"
+                                ],
+                                initial_heading_tolerance_rad=np.deg2rad(
+                                    float(
+                                        trajectory_config[
+                                            "initial_heading_tolerance_deg"
+                                        ]
+                                    )
+                                ),
+                                derive_initial_heading_from_tangent=True,
+                                initial_heading_probability_floor=float(
+                                    trajectory_config[
+                                        "measured_overlap_bridge_heading_floor"
+                                    ]
+                                ),
+                                maximum_control_turn_rad=np.deg2rad(
+                                    float(
+                                        trajectory_config[
+                                            "maximum_control_turn_deg"
+                                        ]
+                                    )
+                                ),
+                                line_validation_spacing_m=float(
+                                    trajectory_config[
+                                        "line_validation_spacing_m"
+                                    ]
+                                ),
+                                smoothing_validation_spacing_m=float(
+                                    trajectory_config[
+                                        "smoothing_validation_spacing_m"
+                                    ]
+                                ),
+                                smoothing_strengths=trajectory_config[
+                                    "smoothing_strengths"
+                                ],
+                                candidate_pool_size=int(
+                                    trajectory_config[
+                                        "measured_overlap_bridge_pool_size"
+                                    ]
+                                ),
+                                maximum_attempts=int(
+                                    trajectory_config[
+                                        "measured_overlap_bridge_sampling_attempts"
+                                    ]
+                                ),
+                                guide_xy=guide,
+                                guide_soft_scale_m=float(
+                                    trajectory_config[
+                                        "measured_overlap_bridge_guide_scale_m"
+                                    ]
+                                ),
+                                guide_probability_floor=float(
+                                    trajectory_config[
+                                        "measured_overlap_bridge_guide_floor"
+                                    ]
+                                ),
+                            )
+                        except SampleRejected:
+                            continue
+                        for rescue in rescue_pool:
+                            trajectories = tuple(
+                                rescue if robot_id == isolated_id
+                                else source_by_id[robot_id]
+                                for robot_id in robot_ids
+                            )
+                            positions = np.stack(
+                                [
+                                    trajectory.base_to_world[:, :2, 3]
+                                    for trajectory in trajectories
+                                ]
+                            )
+                            pairwise = np.stack(
+                                [
+                                    np.linalg.norm(
+                                        positions[left] - positions[right],
+                                        axis=1,
+                                    )
+                                    for left in range(len(trajectories))
+                                    for right in range(left + 1, len(trajectories))
+                                ]
+                            )
+                            if float(pairwise.min()) < minimum_distance:
+                                continue
+                            if (
+                                sum(
+                                    trajectory.path_family != "direct"
+                                    for trajectory in trajectories
+                                )
+                                < int(
+                                    trajectory_config[
+                                        "minimum_waypoint_trajectories"
+                                    ]
+                                )
+                            ):
+                                continue
+                            joint_metrics = joint_trajectory_metrics(
+                                trajectories,
+                                camera_hfov_deg=float(
+                                    self.config["camera"]["hfov_deg"]
+                                ),
+                            )
+                            if formation_degenerate(
+                                joint_metrics,
+                                self.config["placement"][
+                                    "formation_degeneracy"
+                                ],
+                            ):
+                                continue
+                            joint_metrics["formation_degenerate"] = False
+                            evidence = {
+                                "strategy": "measured_overlap_directed_resample",
+                                "source_candidate_rank": source_rank,
+                                "preserved_measured_edge": list(preserved_edge),
+                                "isolated_robot_id": isolated_id,
+                                "anchor_robot_id": anchor_id,
+                                "anchor_frame_index": phase,
+                                "view_direction_strategy": strategy,
+                                "shared_target_xy": shared_target.tolist(),
+                                "shared_target_source": target_source,
+                            }
+                            joint_metrics["measured_overlap_bridge"] = evidence
+                            cloned = tuple(
+                                replace(
+                                    trajectory,
+                                    metadata={
+                                        **trajectory.metadata,
+                                        "joint_pool_hybrid": True,
+                                        "joint_diversity_metrics": dict(
+                                            joint_metrics
+                                        ),
+                                        "measured_overlap_bridge": evidence,
+                                    },
+                                )
+                                for trajectory in trajectories
+                            )
+                            robot_metrics = dict(source_metrics["robots"])
+                            robot_metrics[isolated_id] = {
+                                **trajectory_kinematic_metrics(rescue),
+                                "path_family": rescue.path_family,
+                                "control_waypoints_xy": (
+                                    rescue.control_waypoints_xy.tolist()
+                                ),
+                                "planner_geodesic_length_m": float(
+                                    rescue.metadata[
+                                        "planner_geodesic_length_m"
+                                    ]
+                                ),
+                            }
+                            traversed_regions = dict(
+                                source_metrics["traversed_region_ids"]
+                            )
+                            traversed_regions[isolated_id] = sorted(
+                                set(
+                                    self._observation_region_labels(
+                                        floor_index,
+                                        rescue.base_to_world[:, :2, 3],
+                                    ).tolist()
+                                )
+                            )
+                            nested = dict(
+                                source_metrics.get(
+                                    "nested_trajectory_sets", {}
+                                )
+                            )
+                            nested.update(
+                                {
+                                    "candidate_kind": (
+                                        "measured_overlap_bridge"
+                                    ),
+                                    "source_overlap_evidence": evidence,
+                                }
+                            )
+                            metrics = {
+                                **source_metrics,
+                                "robots": robot_metrics,
+                                "minimum_pairwise_distance_m": float(
+                                    joint_metrics[
+                                        "minimum_inter_robot_distance_m"
+                                    ]
+                                ),
+                                "joint_diversity": joint_metrics,
+                                "traversed_region_ids": traversed_regions,
+                                "unique_traversed_region_count": len(
+                                    {
+                                        region
+                                        for values in traversed_regions.values()
+                                        for region in values
+                                    }
+                                ),
+                                "nested_trajectory_sets": nested,
+                            }
+                            regime = str(
+                                source_metrics["observation_regime"]
+                            )
+                            score = regime_trajectory_soft_score(
+                                joint_metrics,
+                                regime,
+                                trajectory_config[
+                                    "regime_coverage_saturation_m2"
+                                ],
+                                heading_prior_weights=trajectory_config[
+                                    "regime_initial_heading_prior_weights"
+                                ],
+                                view_connectivity_weights=trajectory_config[
+                                    "regime_view_connectivity_weights"
+                                ],
+                            )
+                            ranked.append((float(score), cloned, metrics))
+        ranked.sort(key=lambda item: -item[0])
+        return tuple(
+            (trajectories, metrics)
+            for _, trajectories, metrics in ranked[:maximum_candidates]
+        )
+
+    def trajectory_traversability_inspection(self, floor_index: int) -> dict[str, Any]:
+        """Expose the exact static-eroded plus dynamic-obstacle planning raster."""
+        scene = self._require_scene()
+        trav_map = scene.trav_map
+        world_xy, _, _, _ = self._trajectory_traversability(
+            floor_index, self._env.robots[0]
+        )
+        traversable = np.zeros(tuple(trav_map.floor_map[floor_index].shape), dtype=np.uint8)
+        pixels = self._native_value(trav_map.world_to_map(
+            self._th.as_tensor(world_xy, dtype=self._th.float32)
+        )).astype(int)
+        if len(pixels):
+            traversable[pixels[:, 0], pixels[:, 1]] = 1
         return {
-            "traversable": (self._native_value(eroded) == 255).astype(np.uint8),
+            "traversable": traversable,
             "map_resolution_m": float(trav_map.map_resolution),
             "map_size": int(trav_map.map_size),
         }

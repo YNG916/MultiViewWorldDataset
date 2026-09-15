@@ -26,12 +26,48 @@ def _wrap(values: np.ndarray) -> np.ndarray:
     return (values + np.pi) % (2.0 * np.pi) - np.pi
 
 
-def joint_trajectory_metrics(trajectories: Sequence[Any]) -> dict[str, Any]:
+def joint_trajectory_metrics(
+    trajectories: Sequence[Any],
+    *,
+    camera_hfov_deg: float = 70.0,
+) -> dict[str, Any]:
+    if not np.isfinite(camera_hfov_deg) or not 0.0 < camera_hfov_deg < 180.0:
+        raise ValueError("camera_hfov_deg must be finite and lie in (0,180)")
     positions = np.stack([item.base_to_world[:, :2, 3] for item in trajectories])
     yaws = np.stack([
         np.unwrap(np.arctan2(item.base_to_world[:, 1, 0], item.base_to_world[:, 0, 0]))
         for item in trajectories
     ])
+    view_positions = []
+    view_forwards = []
+    for item in trajectories:
+        camera = getattr(item, "camera_to_world", None)
+        poses = np.asarray(camera if camera is not None else item.base_to_world)
+        forward_column = 2 if camera is not None else 0
+        view_positions.append(poses[:, :2, 3])
+        view_forwards.append(poses[:, :2, forward_column])
+    view_positions_array = np.stack(view_positions)
+    view_forwards_array = np.stack(view_forwards)
+    view_norms = np.linalg.norm(view_forwards_array, axis=2, keepdims=True)
+    view_forwards_array = view_forwards_array / np.maximum(view_norms, 1.0e-9)
+    half_fov = np.deg2rad(0.5 * camera_hfov_deg)
+    ray_angles = np.linspace(-half_fov, half_fov, 7)
+    ray_depths = np.linspace(0.75, 6.0, 12)
+    cosine, sine = np.cos(ray_angles), np.sin(ray_angles)
+    view_samples = []
+    for origins, forwards in zip(view_positions_array, view_forwards_array, strict=True):
+        directions = np.stack((
+            forwards[:, None, 0] * cosine - forwards[:, None, 1] * sine,
+            forwards[:, None, 0] * sine + forwards[:, None, 1] * cosine,
+        ), axis=-1)
+        points = origins[:, None, None, :] + directions[:, :, None, :] * ray_depths[None, None, :, None]
+        view_samples.append(points.reshape(len(origins), -1, 2))
+    view_samples_array = np.stack(view_samples)
+    half_fov_cosine = float(np.cos(half_fov))
+    # Estimate symmetric shared view volume over several ray angles and depths.
+    # This is only a cheap ranking proxy; GT-depth reprojection remains the
+    # sole hard overlap criterion.
+
     prior_errors = np.asarray(
         [float(item.metadata.get("initial_heading_prior_error_rad", np.nan)) for item in trajectories],
         dtype=np.float64,
@@ -46,10 +82,31 @@ def joint_trajectory_metrics(trajectories: Sequence[Any]) -> dict[str, Any]:
     heading_differences: list[np.ndarray] = []
     path_similarities: list[float] = []
     velocity_correlations: list[float] = []
+    view_pair_peak_scores: list[float] = []
+    view_pair_peaks: dict[str, float] = {}
     for left in range(len(trajectories)):
         for right in range(left + 1, len(trajectories)):
             pair_distances.append(np.linalg.norm(positions[left] - positions[right], axis=1))
             heading_differences.append(np.abs(_wrap(yaws[left] - yaws[right])))
+            directed_scores = []
+            for source, target in ((left, right), (right, left)):
+                delta = (
+                    view_samples_array[source]
+                    - view_positions_array[target][:, None, :]
+                )
+                distance = np.linalg.norm(delta, axis=2)
+                direction_cosine = np.sum(
+                    delta * view_forwards_array[target][:, None, :], axis=2
+                ) / np.maximum(distance, 1.0e-9)
+                directed_scores.append(np.mean(
+                    (distance > 0.1) & (direction_cosine >= half_fov_cosine), axis=1,
+                ))
+            view_scores = 0.5 * (directed_scores[0] + directed_scores[1])
+            peak_view_score = float(np.max(view_scores, initial=0.0))
+            view_pair_peak_scores.append(peak_view_score)
+            view_pair_peaks[
+                f"{trajectories[left].robot_id}|{trajectories[right].robot_id}"
+            ] = peak_view_score
             left_delta = np.diff(positions[left], axis=0)
             right_delta = np.diff(positions[right], axis=0)
             left_norm = np.linalg.norm(left_delta, axis=1)
@@ -63,6 +120,9 @@ def joint_trajectory_metrics(trajectories: Sequence[Any]) -> dict[str, Any]:
                 velocity_correlations.append(float(np.corrcoef(left_norm, right_norm)[0, 1]))
             else:
                 velocity_correlations.append(float(np.mean(cosine)))
+    spanning_edge_count = max(0, len(trajectories) - 1)
+    strongest_edges = sorted(view_pair_peak_scores, reverse=True)[:spanning_edge_count]
+    view_connectivity_proxy = float(np.mean(strongest_edges)) if strongest_edges else 0.0
     distances = np.stack(pair_distances)
     headings = np.stack(heading_differences)
     all_xy = positions.reshape(-1, 2)
@@ -78,6 +138,8 @@ def joint_trajectory_metrics(trajectories: Sequence[Any]) -> dict[str, Any]:
         "mean_path_direction_similarity": float(np.mean(path_similarities)),
         "maximum_path_direction_similarity": float(np.max(path_similarities)),
         "mean_velocity_profile_correlation": float(np.mean(velocity_correlations)),
+        "temporal_camera_view_connectivity_proxy": view_connectivity_proxy,
+        "pairwise_camera_view_peak_proxy": view_pair_peaks,
         "spatial_coverage_bbox_area_m2": float(extent[0] * extent[1]),
         "spatial_coverage_trace_m": float(sum(np.linalg.norm(np.diff(p, axis=0), axis=1).sum() for p in positions)),
     }
@@ -90,6 +152,7 @@ def regime_trajectory_soft_score(
     *,
     jitter: float = 0.0,
     heading_prior_weights: Mapping[str, float] | None = None,
+    view_connectivity_weights: Mapping[str, float] | None = None,
 ) -> float:
     """Score useful spatial diversity without rewarding unbounded dispersion."""
     if regime not in coverage_saturation_m2:
@@ -105,6 +168,13 @@ def regime_trajectory_soft_score(
     if not np.isfinite(prior_weight) or prior_weight < 0.0:
         raise ValueError("heading-prior soft-score weights must be finite and non-negative")
     score += prior_weight * float(metrics.get("mean_initial_heading_prior_alignment", 0.0))
+    view_weights = view_connectivity_weights or {}
+    view_weight = float(view_weights.get(regime, 0.0))
+    if not np.isfinite(view_weight) or view_weight < 0.0:
+        raise ValueError("view-connectivity weights must be finite and non-negative")
+    score += view_weight * float(
+        metrics.get("temporal_camera_view_connectivity_proxy", 0.0)
+    )
     if regime == "exploratory":
         separation = max(float(metrics["mean_inter_robot_distance_m"]), 0.0)
         score += 0.15 * min(separation / np.sqrt(saturation), 1.0)
@@ -228,8 +298,10 @@ def complementary_hybrid_trajectory_sets(
     coverage_saturation_m2: Mapping[str, float],
     heading_prior_weights: Mapping[str, float],
     maximum_candidates: int,
+    view_connectivity_weights: Mapping[str, float] | None = None,
+    camera_hfov_deg: float = 70.0,
 ) -> tuple[tuple[tuple[Any, ...], dict[str, int], dict[str, Any]], ...]:
-    """Recombine only candidate pairs whose measured overlap edges are complementary."""
+    """Build bounded hybrids that preserve measured edges and bridge isolated views."""
     if maximum_candidates <= 0 or len(candidate_sets) < 2:
         return ()
     robot_ids = tuple(sorted(item.robot_id for item in candidate_sets[0][0]))
@@ -280,8 +352,6 @@ def complementary_hybrid_trajectory_sets(
         for right_index in range(left_index + 1, len(pools)):
             left_edges = _edges(failure_by_rank.get(left_index, {}))
             right_edges = _edges(failure_by_rank.get(right_index, {}))
-            if not _connected(left_edges | right_edges):
-                continue
             for mask in range(1, (1 << len(robot_ids)) - 1):
                 source_indices = tuple(
                     right_index if mask & (1 << robot_index) else left_index
@@ -296,7 +366,9 @@ def complementary_hybrid_trajectory_sets(
                 )
                 if sum(item.path_family != "direct" for item in trajectories) < minimum_waypoint_trajectories:
                     continue
-                metrics = joint_trajectory_metrics(trajectories)
+                metrics = joint_trajectory_metrics(
+                    trajectories, camera_hfov_deg=camera_hfov_deg
+                )
                 if float(metrics["minimum_inter_robot_distance_m"]) < minimum_pairwise_distance_m:
                     continue
                 if formation_degenerate(metrics, formation_degeneracy_limits):
@@ -314,6 +386,8 @@ def complementary_hybrid_trajectory_sets(
                     edge for edge in right_edges
                     if all(source_indices[robot_ids.index(robot_id)] == right_index for robot_id in edge)
                 }
+                if not predicted_edges:
+                    continue
                 participating = {robot_id for edge in predicted_edges for robot_id in edge}
                 priority = (
                     4.0 * float(_connected(predicted_edges))
@@ -324,6 +398,7 @@ def complementary_hybrid_trajectory_sets(
                         regime,
                         coverage_saturation_m2,
                         heading_prior_weights=heading_prior_weights,
+                        view_connectivity_weights=view_connectivity_weights,
                     )
                 )
                 source_by_robot = dict(zip(robot_ids, source_indices))
@@ -333,6 +408,10 @@ def complementary_hybrid_trajectory_sets(
                     "source_candidate_pair": [left_index, right_index],
                     "source_union_edges": [list(edge) for edge in sorted(left_edges | right_edges)],
                     "predicted_preserved_edges": [list(edge) for edge in sorted(predicted_edges)],
+                    "strategy": (
+                        "complementary_connected" if _connected(predicted_edges)
+                        else "measured_edge_bridge"
+                    ),
                     "soft_priority": float(priority),
                 }
                 ranked.append(

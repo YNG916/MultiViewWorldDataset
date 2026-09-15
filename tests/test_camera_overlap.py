@@ -2,7 +2,11 @@ import numpy as np
 
 from multi_view_world_dataset.adapters.omnigibson import robot_multimodal_alignment_metrics
 from multi_view_world_dataset.cameras.calibration import PinholeCalibration
-from multi_view_world_dataset.cameras.overlap import build_overlap_graph, pairwise_visible_surface_overlap
+from multi_view_world_dataset.cameras.overlap import (
+    build_overlap_graph,
+    pairwise_shared_surface_centroid,
+    pairwise_visible_surface_overlap,
+)
 
 
 def test_identical_planar_depth_has_full_overlap():
@@ -15,6 +19,24 @@ def test_identical_planar_depth_has_full_overlap():
     )
     assert overlap == 1.0
 
+
+def test_shared_surface_centroid_reuses_verified_depth_points():
+    calibration = PinholeCalibration(64, 32, 70, 0.1, 15)
+    depth = np.full((32, 64), 3.0)
+    centroid = pairwise_shared_surface_centroid(
+        depth,
+        calibration.pixel_intrinsics,
+        np.eye(4),
+        depth,
+        calibration.pixel_intrinsics,
+        np.eye(4),
+        stride=4,
+        tolerance_m=1e-5,
+    )
+    assert centroid is not None
+    assert np.isfinite(centroid).all()
+    assert centroid[2] == 3.0
+    assert np.linalg.norm(centroid[:2]) < 0.2
 
 def test_connected_graph_does_not_require_all_pairs():
     ids = ("a", "b", "c")

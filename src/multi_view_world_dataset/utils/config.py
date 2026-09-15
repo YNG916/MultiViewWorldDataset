@@ -129,15 +129,42 @@ def validate_config(config: dict[str, Any]) -> None:
     if not isinstance(trajectory_set_count, int) or not 8 <= trajectory_set_count <= 16:
         errors.append("trajectory_sets_per_placement must be an integer in [8,16]")
     hybrid_count = trajectory.get("maximum_complementary_hybrid_candidates")
+    bridge_count = trajectory.get("maximum_measured_overlap_bridge_candidates")
+    candidate_counts_valid = (
+        isinstance(hybrid_count, int)
+        and hybrid_count >= 0
+        and isinstance(bridge_count, int)
+        and bridge_count >= 0
+    )
     if (
-        not isinstance(hybrid_count, int)
-        or hybrid_count < 0
+        not candidate_counts_valid
         or isinstance(trajectory_set_count, int)
-        and trajectory_set_count + hybrid_count > 16
+        and trajectory_set_count + hybrid_count + bridge_count > 16
     ):
         errors.append(
-            "base trajectory sets plus complementary hybrids must total at most 16"
+            "base trajectory sets plus complementary and measured-overlap "
+            "bridge candidates must total at most 16"
         )
+    for key in (
+        "measured_overlap_bridge_pool_size",
+        "measured_overlap_bridge_sampling_attempts",
+        "measured_overlap_bridge_target_depth_m",
+        "measured_overlap_bridge_guide_distance_m",
+        "measured_overlap_bridge_guide_scale_m",
+    ):
+        value = trajectory.get(key)
+        if not isinstance(value, (int, float)) or float(value) <= 0.0:
+            errors.append(f"Trajectory setting {key} must be positive")
+    for key in (
+        "measured_overlap_bridge_heading_floor",
+        "measured_overlap_bridge_guide_floor",
+    ):
+        value = trajectory.get(key)
+        if (
+            not isinstance(value, (int, float))
+            or not 0.0 < float(value) <= 1.0
+        ):
+            errors.append(f"Trajectory setting {key} must lie in (0,1]")
 
     strengths = trajectory.get("smoothing_strengths", ())
     if not strengths or any(not 0.0 < float(value) <= 1.0 for value in strengths):
@@ -160,6 +187,37 @@ def validate_config(config: dict[str, Any]) -> None:
     ):
         errors.append(
             "Trajectory regime_initial_heading_prior_weights must define finite "
+            "non-negative values for all regimes"
+        )
+    guide_scales = trajectory.get("regime_trajectory_guide_soft_scale_m", {})
+    if set(guide_scales) != required_regimes or any(
+        not isinstance(value, (int, float))
+        or not isfinite(float(value))
+        or float(value) <= 0.0
+        for value in guide_scales.values()
+    ):
+        errors.append(
+            "Trajectory regime_trajectory_guide_soft_scale_m must define finite "
+            "positive values for all regimes"
+        )
+    guide_floors = trajectory.get("regime_trajectory_guide_probability_floor", {})
+    if set(guide_floors) != required_regimes or any(
+        not isinstance(value, (int, float)) or not 0.0 < float(value) <= 1.0
+        for value in guide_floors.values()
+    ):
+        errors.append(
+            "Trajectory regime_trajectory_guide_probability_floor must define "
+            "values in (0,1] for all regimes"
+        )
+    view_weights = trajectory.get("regime_view_connectivity_weights", {})
+    if set(view_weights) != required_regimes or any(
+        not isinstance(value, (int, float))
+        or not isfinite(float(value))
+        or float(value) < 0.0
+        for value in view_weights.values()
+    ):
+        errors.append(
+            "Trajectory regime_view_connectivity_weights must define finite "
             "non-negative values for all regimes"
         )
     if set(regimes) != required_regimes or abs(sum(float(v) for v in regimes.values()) - 1.0) > 1e-8:
@@ -196,6 +254,20 @@ def validate_config(config: dict[str, Any]) -> None:
         or not 0.0 < float(probe_min) <= float(probe_max)
     ):
         errors.append("placement heading probe bounds must satisfy 0 < min <= max")
+
+    for key in (
+        "dynamic_object_start_clearance_m",
+        "dynamic_object_path_clearance_m",
+    ):
+        value = placement.get(key)
+        if not isinstance(value, (int, float)) or float(value) < 0.0:
+            errors.append(f"Placement setting {key} must be non-negative")
+
+    obstacle_height = placement.get("dynamic_object_path_obstacle_height_m")
+    if not isinstance(obstacle_height, (int, float)) or float(obstacle_height) <= 0.0:
+        errors.append(
+            "Placement dynamic_object_path_obstacle_height_m must be positive"
+        )
 
     configuration_sampling = config.get("configuration_sampling", {})
     minimum_changed = configuration_sampling.get("minimum_changed_objects")

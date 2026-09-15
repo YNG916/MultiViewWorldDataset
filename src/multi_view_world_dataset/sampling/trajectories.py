@@ -319,6 +319,9 @@ def _sample_route_controls(
     *,
     soft_initial_heading: bool = False,
     initial_heading_probability_floor: float = 0.20,
+    guide_xy: FloatArray | None = None,
+    guide_soft_scale_m: float = 1.5,
+    guide_probability_floor: float = 0.10,
 ) -> FloatArray | None:
     segment_count = _PATH_FAMILY_SEGMENTS[family]
     controls = [start_xy]
@@ -351,15 +354,35 @@ def _sample_route_controls(
         indices = np.flatnonzero(eligible)
         if not len(indices):
             return None
+        selection_weights = None
         if segment_index == 0 and soft_initial_heading:
             if not 0.0 < initial_heading_probability_floor <= 1.0:
                 raise ValueError("initial heading probability floor must lie in (0,1]")
             heading_errors = np.abs(_wrap_angles(bearings[indices] - start_yaw))
             scale = max(float(initial_heading_tolerance_rad), 1.0e-6)
-            weights = initial_heading_probability_floor + (
+            selection_weights = initial_heading_probability_floor + (
                 1.0 - initial_heading_probability_floor
             ) * np.exp(-0.5 * (heading_errors / scale) ** 2)
-            selected_index = int(rng.choice(indices, p=weights / weights.sum()))
+        if guide_xy is not None:
+            if guide_soft_scale_m <= 0.0:
+                raise ValueError("guide soft scale must be positive")
+            if not 0.0 < guide_probability_floor <= 1.0:
+                raise ValueError("guide probability floor must lie in (0,1]")
+            guide = np.asarray(guide_xy, dtype=np.float64)
+            if guide.shape != (2,) or not np.isfinite(guide).all():
+                raise ValueError("guide_xy must be a finite XY point")
+            guide_distances = np.linalg.norm(candidates[indices] - guide, axis=1)
+            guide_weights = guide_probability_floor + (
+                1.0 - guide_probability_floor
+            ) * np.exp(-0.5 * (guide_distances / guide_soft_scale_m) ** 2)
+            selection_weights = (
+                guide_weights if selection_weights is None
+                else selection_weights * guide_weights
+            )
+        if selection_weights is not None:
+            selected_index = int(rng.choice(
+                indices, p=selection_weights / selection_weights.sum()
+            ))
         else:
             selected_index = int(indices[int(rng.integers(len(indices)))])
         previous_bearing = float(bearings[selected_index])
@@ -432,6 +455,9 @@ def _sample_robot_pool(
     smoothing_strengths: Sequence[float],
     candidate_pool_size: int,
     maximum_attempts: int,
+    guide_xy: FloatArray | None = None,
+    guide_soft_scale_m: float = 1.5,
+    guide_probability_floor: float = 0.10,
 ) -> list[Trajectory]:
     families, probabilities = _normalised_family_distribution(path_family_weights)
     start_xy = start[:2, 3]
@@ -465,6 +491,9 @@ def _sample_robot_pool(
             rng,
             soft_initial_heading=derive_initial_heading_from_tangent,
             initial_heading_probability_floor=initial_heading_probability_floor,
+            guide_xy=guide_xy,
+            guide_soft_scale_m=guide_soft_scale_m,
+            guide_probability_floor=guide_probability_floor,
         )
         if controls is None:
             rejection_counts["no_control_candidates"] += 1
@@ -553,6 +582,34 @@ def _sample_robot_pool(
         )
     return pool
 
+def sample_geodesic_robot_trajectory_pool(
+    robot_id: str,
+    start: FloatArray,
+    camera_mount: FloatArray,
+    candidates: FloatArray,
+    floor_z: float,
+    rng: np.random.Generator,
+    **kwargs: object,
+) -> tuple[Trajectory, ...]:
+    """Expose the validated one-robot pool for bounded joint rescue sampling.
+
+    This is intentionally the same planner / smoothing / kinematic path used
+    by :func:`sample_geodesic_trajectory_set`; it does not introduce a second
+    trajectory implementation. Joint separation and view connectivity remain
+    the caller's responsibility because they depend on the fixed peer paths.
+    """
+    return tuple(
+        _sample_robot_pool(
+            robot_id,
+            np.asarray(start, dtype=np.float64),
+            np.asarray(camera_mount, dtype=np.float64),
+            np.asarray(candidates, dtype=np.float64),
+            float(floor_z),
+            rng,
+            **kwargs,
+        )
+    )
+
 
 def sample_geodesic_trajectory_set(
     starts: Mapping[str, np.ndarray],
@@ -584,8 +641,13 @@ def sample_geodesic_trajectory_set(
     formation_degeneracy_limits: Mapping[str, float] | None = None,
     regime_coverage_saturation_m2: Mapping[str, float] | None = None,
     regime_initial_heading_prior_weights: Mapping[str, float] | None = None,
+    regime_view_connectivity_weights: Mapping[str, float] | None = None,
+    camera_hfov_deg: float = 70.0,
     derive_initial_heading_from_tangent: bool = False,
     initial_heading_probability_floor: float = 0.20,
+    trajectory_guides_xy: Mapping[str, np.ndarray] | None = None,
+    guide_soft_scale_m: float = 1.5,
+    guide_probability_floor: float = 0.10,
 ) -> tuple[Trajectory, ...]:
     """Sample independent robot paths, then jointly enforce temporal separation."""
     robot_ids = tuple(sorted(starts))
@@ -603,6 +665,18 @@ def sample_geodesic_trajectory_set(
         candidates_by_robot = {
             robot_id: shared_candidates for robot_id in robot_ids
         }
+    if trajectory_guides_xy is not None:
+        unknown_guides = set(trajectory_guides_xy) - set(robot_ids)
+        if unknown_guides:
+            raise ValueError(
+                f"trajectory guides contain unknown robots: {sorted(unknown_guides)}"
+            )
+        guides_by_robot = {
+            robot_id: np.asarray(trajectory_guides_xy[robot_id], dtype=np.float64)
+            for robot_id in robot_ids if robot_id in trajectory_guides_xy
+        }
+    else:
+        guides_by_robot = {}
     if any(
         candidates.ndim != 2 or candidates.shape[1] != 2 or not len(candidates)
         for candidates in candidates_by_robot.values()
@@ -666,6 +740,9 @@ def sample_geodesic_trajectory_set(
                     smoothing_strengths=smoothing_strengths,
                     candidate_pool_size=candidate_pool_size,
                     maximum_attempts=maximum_attempts,
+                    guide_xy=guides_by_robot.get(robot_id),
+                    guide_soft_scale_m=guide_soft_scale_m,
+                    guide_probability_floor=guide_probability_floor,
                 )
                 for robot_id in robot_ids
             }
@@ -716,7 +793,9 @@ def sample_geodesic_trajectory_set(
             if candidate_minimum_distance < minimum_pairwise_distance_m:
                 separation_rejections += 1
                 continue
-            metrics = joint_trajectory_metrics(trajectories)
+            metrics = joint_trajectory_metrics(
+                trajectories, camera_hfov_deg=camera_hfov_deg
+            )
             metrics["formation_degenerate"] = bool(
                 formation_degeneracy_limits
                 and formation_degenerate(metrics, formation_degeneracy_limits)
@@ -736,6 +815,7 @@ def sample_geodesic_trajectory_set(
                     metrics, observation_regime, saturation_by_regime,
                     jitter=float(rng.uniform(0.0, 0.10)),
                     heading_prior_weights=regime_initial_heading_prior_weights,
+                    view_connectivity_weights=regime_view_connectivity_weights,
                 ))
             trajectories, joint_metrics = valid[int(np.argmax(utilities))]
             for trajectory in trajectories:

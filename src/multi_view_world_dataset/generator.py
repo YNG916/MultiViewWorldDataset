@@ -9,7 +9,10 @@ import numpy as np
 
 from multi_view_world_dataset.adapters.omnigibson import OmniGibsonAdapter
 from multi_view_world_dataset.cameras.calibration import PinholeCalibration
-from multi_view_world_dataset.cameras.overlap import build_overlap_graph
+from multi_view_world_dataset.cameras.overlap import (
+    build_overlap_graph,
+    pairwise_shared_surface_centroid,
+)
 from multi_view_world_dataset.cameras.transforms import invert_transform
 from multi_view_world_dataset.errors import ConfigurationError, SampleRejected
 from multi_view_world_dataset.pipeline import _bev_geometry_metrics
@@ -198,6 +201,24 @@ def _temporal_overlap_preflight(
                 stride=int(preflight["depth_sample_stride"]),
                 tolerance_m=float(overlap_config["reprojection_tolerance_m"]),
             )
+            shared_surface_centroids_world = {}
+            for left, right in graph.edges:
+                centroid = pairwise_shared_surface_centroid(
+                    depths[left],
+                    calibration.pixel_intrinsics,
+                    observations[left]["camera_to_world"],
+                    depths[right],
+                    calibration.pixel_intrinsics,
+                    observations[right]["camera_to_world"],
+                    stride=int(preflight["depth_sample_stride"]),
+                    tolerance_m=float(
+                        overlap_config["reprojection_tolerance_m"]
+                    ),
+                )
+                if centroid is not None:
+                    shared_surface_centroids_world[
+                        f"{left}|{right}"
+                    ] = centroid.tolist()
             connected_count += int(graph.connected)
             incident = {robot_id: False for robot_id in robot_ids}
             for left, right in graph.edges:
@@ -216,6 +237,9 @@ def _temporal_overlap_preflight(
                     "frame_index": int(frame_index),
                     "connected": bool(graph.connected),
                     "edges": [list(edge) for edge in graph.edges],
+                    "shared_surface_centroids_world": (
+                        shared_surface_centroids_world
+                    ),
                     "isolated_robot_ids": isolated,
                     "near_duplicate_pairs": [list(pair) for pair in graph.near_duplicate_pairs],
                     "overlap_matrix": [
@@ -1034,6 +1058,16 @@ def generate_dataset(
                                     })
                                     candidate_rank += 1
                                     if candidate_rank == base_candidate_count:
+                                        trajectory_candidates.extend(
+                                            adapter.measured_overlap_bridge_trajectories(
+                                                base_trajectory_candidates,
+                                                candidate_failures,
+                                                stable_seed(
+                                                    episode_seed, "measured-overlap-bridge",
+                                                    placement_attempt,
+                                                ),
+                                            )
+                                        )
                                         trajectory_candidates.extend(
                                             adapter.complementary_trajectory_hybrids(
                                                 base_trajectory_candidates,
