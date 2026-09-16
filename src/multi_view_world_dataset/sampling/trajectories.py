@@ -26,9 +26,49 @@ _PATH_FAMILY_SEGMENTS = {
 }
 
 
+def lane_preserving_guides(
+    starts_xy: ArrayLike,
+    heading_rad: float,
+    distance_m: float,
+) -> FloatArray:
+    """Translate every start by one scene-view vector without collapsing lanes."""
+    starts = np.asarray(starts_xy, dtype=np.float64)
+    if starts.ndim != 2 or starts.shape[1] != 2 or not len(starts):
+        raise ValueError("starts_xy must have shape [N,2] with N >= 1")
+    if not np.isfinite(starts).all() or not np.isfinite(heading_rad):
+        raise ValueError("lane guide inputs must be finite")
+    if not np.isfinite(distance_m) or distance_m <= 0.0:
+        raise ValueError("distance_m must be finite and positive")
+    displacement = float(distance_m) * np.asarray(
+        [np.cos(float(heading_rad)), np.sin(float(heading_rad))],
+        dtype=np.float64,
+    )
+    return starts + displacement
+
+
 def _wrap_angles(angles: ArrayLike) -> FloatArray:
     values = np.asarray(angles, dtype=np.float64)
     return (values + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def _angular_density_balanced_weights(
+    bearings: FloatArray,
+    indices: NDArray[np.int64],
+    weights: FloatArray,
+    *,
+    bin_count: int = 36,
+) -> FloatArray:
+    """Remove traversable-pixel count as a hidden directional prior."""
+    if bin_count < 1:
+        raise ValueError("bin_count must be positive")
+    selected = _wrap_angles(np.asarray(bearings, dtype=np.float64)[indices])
+    bins = np.floor((selected + np.pi) * bin_count / (2.0 * np.pi)).astype(int)
+    bins = np.clip(bins, 0, bin_count - 1)
+    counts = np.bincount(bins, minlength=bin_count)
+    balanced = np.asarray(weights, dtype=np.float64) / counts[bins]
+    if not np.isfinite(balanced).all() or np.any(balanced <= 0.0):
+        raise ValueError("candidate weights must be finite and positive")
+    return balanced
 
 
 def _polyline_length(points: ArrayLike) -> float:
@@ -161,12 +201,16 @@ def smooth_collision_safe_path(
         dense = densify_polyline(values, validation_spacing_m)
         return (dense, 0.0) if is_path_traversable(dense) else None
     for strength in smoothing_strengths:
-        if not 0.0 < float(strength) <= 1.0:
-            raise ValueError("smoothing strengths must lie in (0,1]")
-        curve = _catmull_rom_curve(
-            values,
-            strength=float(strength),
-            validation_spacing_m=validation_spacing_m,
+        if not 0.0 <= float(strength) <= 1.0:
+            raise ValueError("smoothing strengths must lie in [0,1]")
+        curve = (
+            densify_polyline(values, validation_spacing_m)
+            if float(strength) == 0.0
+            else _catmull_rom_curve(
+                values,
+                strength=float(strength),
+                validation_spacing_m=validation_spacing_m,
+            )
         )
         if is_path_traversable(curve):
             return curve, float(strength)
@@ -249,6 +293,52 @@ def trajectory_from_spatial_path(
     )
 
 
+def minimum_separation_event(
+    trajectories: Sequence[Trajectory],
+) -> dict[str, object]:
+    """Describe the closest robot pair and frame with JSON-safe values."""
+    if len(trajectories) < 2:
+        raise ValueError("minimum separation requires at least two trajectories")
+    frame_counts = {len(trajectory.base_to_world) for trajectory in trajectories}
+    if len(frame_counts) != 1:
+        raise ValueError("joint trajectories must have the same frame count")
+    positions = np.stack(
+        [trajectory.base_to_world[:, :2, 3] for trajectory in trajectories]
+    )
+    pairs = [
+        (left, right)
+        for left in range(len(trajectories))
+        for right in range(left + 1, len(trajectories))
+    ]
+    distances = np.stack(
+        [np.linalg.norm(positions[left] - positions[right], axis=1) for left, right in pairs]
+    )
+    pair_index, frame_index = np.unravel_index(int(np.argmin(distances)), distances.shape)
+    left, right = pairs[int(pair_index)]
+    left_id = trajectories[left].robot_id
+    right_id = trajectories[right].robot_id
+    return {
+        "distance_m": float(distances[pair_index, frame_index]),
+        "frame_index": int(frame_index),
+        "robot_pair": [left_id, right_id],
+        "positions_xy": {
+            left_id: positions[left, frame_index].tolist(),
+            right_id: positions[right, frame_index].tolist(),
+        },
+        "start_xy": {
+            trajectory.robot_id: positions[index, 0].tolist()
+            for index, trajectory in enumerate(trajectories)
+        },
+        "end_xy": {
+            trajectory.robot_id: positions[index, -1].tolist()
+            for index, trajectory in enumerate(trajectories)
+        },
+        "path_families": {
+            trajectory.robot_id: trajectory.path_family for trajectory in trajectories
+        },
+    }
+
+
 def trajectories_equal(
     before: Trajectory,
     after: Trajectory,
@@ -322,6 +412,7 @@ def _sample_route_controls(
     guide_xy: FloatArray | None = None,
     guide_soft_scale_m: float = 1.5,
     guide_probability_floor: float = 0.10,
+    prefer_guide: bool = False,
 ) -> FloatArray | None:
     segment_count = _PATH_FAMILY_SEGMENTS[family]
     controls = [start_xy]
@@ -354,6 +445,22 @@ def _sample_route_controls(
         indices = np.flatnonzero(eligible)
         if not len(indices):
             return None
+        if prefer_guide and segment_index == 0 and guide_xy is not None:
+            guide_indices = indices
+            if family == "direct":
+                guide_indices = indices[distances[indices] >= minimum_length_m]
+            if not len(guide_indices):
+                return None
+            guide = np.asarray(guide_xy, dtype=np.float64)
+            if guide.shape != (2,) or not np.isfinite(guide).all():
+                raise ValueError("guide_xy must be a finite XY point")
+            selected_index = int(guide_indices[np.argmin(
+                np.linalg.norm(candidates[guide_indices] - guide, axis=1)
+            )])
+            previous_bearing = float(bearings[selected_index])
+            current = candidates[selected_index]
+            controls.append(current)
+            continue
         selection_weights = None
         if segment_index == 0 and soft_initial_heading:
             if not 0.0 < initial_heading_probability_floor <= 1.0:
@@ -378,6 +485,10 @@ def _sample_route_controls(
             selection_weights = (
                 guide_weights if selection_weights is None
                 else selection_weights * guide_weights
+            )
+        if selection_weights is not None:
+            selection_weights = _angular_density_balanced_weights(
+                bearings, indices, selection_weights
             )
         if selection_weights is not None:
             selected_index = int(rng.choice(
@@ -476,8 +587,13 @@ def _sample_robot_pool(
         "angular_speed": 0,
         "acceleration": 0,
     }
-    for _ in range(maximum_attempts):
-        family = str(rng.choice(families, p=probabilities))
+    for attempt_index in range(maximum_attempts):
+        prefer_guide = bool(
+            attempt_index == 0
+            and guide_xy is not None
+            and float(path_family_weights.get("direct", 0.0)) > 0.0
+        )
+        family = "direct" if prefer_guide else str(rng.choice(families, p=probabilities))
         attempts_by_family[family] += 1
         controls = _sample_route_controls(
             start_xy,
@@ -494,6 +610,7 @@ def _sample_robot_pool(
             guide_xy=guide_xy,
             guide_soft_scale_m=guide_soft_scale_m,
             guide_probability_floor=guide_probability_floor,
+            prefer_guide=prefer_guide,
         )
         if controls is None:
             rejection_counts["no_control_candidates"] += 1
@@ -537,14 +654,12 @@ def _sample_robot_pool(
                 "planner_geodesic_length_m": geodesic_length,
                 "smoothed_arc_length_m": smooth_arc_length,
                 "smoothing_strength": smoothing_strength,
+                "validated_guide_seed": prefer_guide,
             },
         )
         first_yaw = float(np.arctan2(candidate.base_to_world[0, 1, 0], candidate.base_to_world[0, 0, 0]))
         prior_heading_error = abs(float(_wrap_angles(first_yaw - start_yaw)))
-        heading_error = (
-            0.0 if derive_initial_heading_from_tangent
-            else prior_heading_error
-        )
+        heading_error = prior_heading_error
         metrics = trajectory_kinematic_metrics(candidate)
         dense_sampled = densify_polyline(
             candidate.base_to_world[:, :2, 3], smoothing_validation_spacing_m
@@ -648,6 +763,7 @@ def sample_geodesic_trajectory_set(
     trajectory_guides_xy: Mapping[str, np.ndarray] | None = None,
     guide_soft_scale_m: float = 1.5,
     guide_probability_floor: float = 0.10,
+    maximum_joint_valid_candidates: int | None = None,
 ) -> tuple[Trajectory, ...]:
     """Sample independent robot paths, then jointly enforce temporal separation."""
     robot_ids = tuple(sorted(starts))
@@ -708,6 +824,10 @@ def sample_geodesic_trajectory_set(
         or minimum_waypoint_trajectories < 0
         or minimum_waypoint_trajectories > len(robot_ids)
         or not 0.0 < maximum_control_turn_rad <= np.pi
+        or (
+            maximum_joint_valid_candidates is not None
+            and maximum_joint_valid_candidates < 1
+        )
     ):
         raise ValueError("invalid trajectory sampling count or waypoint minimum")
 
@@ -762,8 +882,11 @@ def sample_geodesic_trajectory_set(
         valid: list[tuple[tuple[Trajectory, ...], dict[str, object]]] = []
         waypoint_rejections = 0
         separation_rejections = 0
+        evaluated_combination_count = 0
         maximum_candidate_minimum_distance = 0.0
+        maximum_candidate_separation_event: dict[str, object] | None = None
         for combination_index in rng.permutation(len(combinations)):
+            evaluated_combination_count += 1
             selection = combinations[int(combination_index)]
             trajectories = tuple(
                 pools[robot_id][selection[index]]
@@ -776,20 +899,20 @@ def sample_geodesic_trajectory_set(
             if waypoint_count < minimum_waypoint_trajectories:
                 waypoint_rejections += 1
                 continue
-            positions = np.stack(
-                [trajectory.base_to_world[:, :2, 3] for trajectory in trajectories]
-            )
-            pairwise_distances = np.stack(
-                [
-                    np.linalg.norm(positions[left] - positions[right], axis=1)
-                    for left in range(len(trajectories))
-                    for right in range(left + 1, len(trajectories))
-                ]
-            )
-            candidate_minimum_distance = float(pairwise_distances.min())
-            maximum_candidate_minimum_distance = max(
-                maximum_candidate_minimum_distance, candidate_minimum_distance
-            )
+            separation_event = minimum_separation_event(trajectories)
+            candidate_minimum_distance = float(separation_event["distance_m"])
+            if (
+                maximum_candidate_separation_event is None
+                or candidate_minimum_distance > maximum_candidate_minimum_distance
+            ):
+                maximum_candidate_minimum_distance = candidate_minimum_distance
+                maximum_candidate_separation_event = {
+                    **separation_event,
+                    "pool_selection": {
+                        robot_id: int(selection[index])
+                        for index, robot_id in enumerate(robot_ids)
+                    },
+                }
             if candidate_minimum_distance < minimum_pairwise_distance_m:
                 separation_rejections += 1
                 continue
@@ -801,6 +924,11 @@ def sample_geodesic_trajectory_set(
                 and formation_degenerate(metrics, formation_degeneracy_limits)
             )
             valid.append((trajectories, metrics))
+            if (
+                maximum_joint_valid_candidates is not None
+                and len(valid) >= maximum_joint_valid_candidates
+            ):
+                break
         if valid:
             # Regime-aware stochastic soft selection; never minimize compactness
             # or heading spread as a hidden objective.
@@ -825,6 +953,14 @@ def sample_geodesic_trajectory_set(
                 trajectory.metadata["joint_waypoint_trajectory_count"] = sum(
                     item.path_family != "direct" for item in trajectories
                 )
+                trajectory.metadata["joint_combination_evaluated_count"] = (
+                    evaluated_combination_count
+                )
+                trajectory.metadata["joint_valid_candidate_count"] = len(valid)
+                trajectory.metadata["joint_valid_candidate_limit_reached"] = bool(
+                    maximum_joint_valid_candidates is not None
+                    and len(valid) >= maximum_joint_valid_candidates
+                )
             return trajectories
         round_diagnostics.append(
             {
@@ -836,6 +972,7 @@ def sample_geodesic_trajectory_set(
                 "waypoint_rejection_count": waypoint_rejections,
                 "separation_rejection_count": separation_rejections,
                 "maximum_candidate_minimum_distance_m": maximum_candidate_minimum_distance,
+                "best_separation_event": maximum_candidate_separation_event,
             }
         )
 

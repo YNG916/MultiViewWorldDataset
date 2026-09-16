@@ -7,6 +7,55 @@ import numpy as np
 from multi_view_world_dataset.errors import SampleRejected
 
 
+def select_shared_traversable_heading(
+    sources_xy: Sequence[np.ndarray],
+    desired_yaw: float,
+    is_path_traversable: Callable[[np.ndarray], bool],
+    *,
+    probe_distance_m: float,
+    validation_spacing_m: float,
+    angular_step_rad: float,
+) -> tuple[float, float]:
+    """Find one collision-free local exit direction shared by every robot."""
+    sources = np.asarray(sources_xy, dtype=np.float64)
+    if (
+        sources.ndim != 2
+        or sources.shape[1] != 2
+        or not len(sources)
+        or not np.isfinite(sources).all()
+        or not np.isfinite(desired_yaw)
+        or probe_distance_m <= 0.0
+        or validation_spacing_m <= 0.0
+        or not 0.0 < angular_step_rad <= np.pi
+    ):
+        raise ValueError("invalid shared heading search inputs")
+    maximum_step = int(np.ceil(np.pi / angular_step_rad))
+    offsets = [0.0]
+    for index in range(1, maximum_step + 1):
+        magnitude = min(np.pi, index * angular_step_rad)
+        offsets.extend((magnitude, -magnitude))
+    sample_count = max(
+        2, int(np.ceil(probe_distance_m / validation_spacing_m)) + 1
+    )
+    for offset in offsets:
+        yaw = float((desired_yaw + offset + np.pi) % (2.0 * np.pi) - np.pi)
+        displacement = probe_distance_m * np.asarray(
+            [np.cos(yaw), np.sin(yaw)], dtype=np.float64
+        )
+        if all(
+            is_path_traversable(
+                np.linspace(source, source + displacement, sample_count)
+            )
+            for source in sources
+        ):
+            error = abs(float((yaw - desired_yaw + np.pi) % (2.0 * np.pi) - np.pi))
+            return yaw, error
+    raise SampleRejected(
+        "initial_heading_no_shared_traversable_exit",
+        {"source_count": len(sources), "probe_distance_m": probe_distance_m},
+    )
+
+
 def select_local_traversable_heading(
     source_xy: np.ndarray,
     candidates_xy: Sequence[np.ndarray],
@@ -54,6 +103,64 @@ def select_local_traversable_heading(
         if is_path_traversable(ray):
             return float(bearings[int(local_index)]), float(errors[int(local_index)])
     raise SampleRejected("initial_heading_no_traversable_local_exit")
+
+
+def select_consensus_local_headings(
+    sources_xy: Sequence[np.ndarray],
+    candidates_xy: Sequence[np.ndarray],
+    desired_yaw: float,
+    is_path_traversable: Callable[[np.ndarray], bool],
+    *,
+    minimum_probe_m: float,
+    maximum_probe_m: float,
+    validation_spacing_m: float,
+    maximum_deviation_rad: float,
+    angular_step_rad: float,
+) -> tuple[np.ndarray, list[float], float]:
+    """Find nearby individually traversable headings around one consensus."""
+    sources = np.asarray(sources_xy, dtype=np.float64)
+    if (
+        sources.ndim != 2
+        or sources.shape[1] != 2
+        or not 0.0 < minimum_probe_m <= maximum_probe_m
+        or validation_spacing_m <= 0.0
+        or not 0.0 < maximum_deviation_rad <= np.pi
+        or not 0.0 < angular_step_rad <= np.pi
+    ):
+        raise ValueError("invalid heading consensus inputs")
+    pools = [np.asarray(values, dtype=np.float64) for values in candidates_xy]
+    if len(pools) != len(sources):
+        raise ValueError("candidate pools must match sources")
+    maximum_step = int(np.ceil(np.pi / angular_step_rad))
+    offsets = [0.0]
+    for index in range(1, maximum_step + 1):
+        magnitude = min(np.pi, index * angular_step_rad)
+        offsets.extend((magnitude, -magnitude))
+    for offset in offsets:
+        consensus = float((desired_yaw + offset + np.pi) % (2.0 * np.pi) - np.pi)
+        headings: list[float] = []
+        errors: list[float] = []
+        try:
+            for source, candidates in zip(sources, pools, strict=True):
+                heading, error = select_local_traversable_heading(
+                    source,
+                    candidates,
+                    consensus,
+                    is_path_traversable,
+                    minimum_probe_m=minimum_probe_m,
+                    maximum_probe_m=maximum_probe_m,
+                    validation_spacing_m=validation_spacing_m,
+                )
+                headings.append(heading)
+                errors.append(error)
+        except SampleRejected:
+            continue
+        if max(errors) <= maximum_deviation_rad:
+            return np.asarray(headings, dtype=np.float64), errors, consensus
+    raise SampleRejected(
+        "initial_heading_no_local_consensus",
+        {"source_count": len(sources), "maximum_deviation_rad": maximum_deviation_rad},
+    )
 
 
 def soft_anchor_candidate_order(

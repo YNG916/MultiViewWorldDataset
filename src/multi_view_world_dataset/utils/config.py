@@ -111,6 +111,7 @@ def validate_config(config: dict[str, Any]) -> None:
         "smoothing_validation_spacing_m",
         "candidate_pool_size",
         "joint_pool_rounds",
+        "maximum_joint_valid_candidates",
         "trajectory_sets_per_placement",
         "sampling_maximum_attempts",
     ):
@@ -119,12 +120,6 @@ def validate_config(config: dict[str, Any]) -> None:
             errors.append(f"Trajectory setting {key} must be positive")
     if trajectory.get("initial_heading_policy") not in {"trajectory_tangent", "fixed_prior"}:
         errors.append("Trajectory initial_heading_policy must be trajectory_tangent or fixed_prior")
-    heading_floor = trajectory.get("initial_heading_soft_probability_floor")
-    if (
-        not isinstance(heading_floor, (int, float))
-        or not 0.0 < float(heading_floor) <= 1.0
-    ):
-        errors.append("Trajectory initial_heading_soft_probability_floor must lie in (0,1]")
     trajectory_set_count = trajectory.get("trajectory_sets_per_placement")
     if not isinstance(trajectory_set_count, int) or not 8 <= trajectory_set_count <= 16:
         errors.append("trajectory_sets_per_placement must be an integer in [8,16]")
@@ -167,8 +162,8 @@ def validate_config(config: dict[str, Any]) -> None:
             errors.append(f"Trajectory setting {key} must lie in (0,1]")
 
     strengths = trajectory.get("smoothing_strengths", ())
-    if not strengths or any(not 0.0 < float(value) <= 1.0 for value in strengths):
-        errors.append("Trajectory smoothing_strengths must lie in (0,1]")
+    if not strengths or any(not 0.0 <= float(value) <= 1.0 for value in strengths):
+        errors.append("Trajectory smoothing_strengths must lie in [0,1]")
     preflight = trajectory.get("overlap_preflight", {})
     regimes = config.get("placement", {}).get("observation_regime_weights", {})
     required_regimes = {"dense_shared", "partial_chain", "exploratory"}
@@ -188,6 +183,17 @@ def validate_config(config: dict[str, Any]) -> None:
         errors.append(
             "Trajectory regime_initial_heading_prior_weights must define finite "
             "non-negative values for all regimes"
+        )
+    heading_floors = trajectory.get(
+        "regime_initial_heading_probability_floor", {}
+    )
+    if set(heading_floors) != required_regimes or any(
+        not isinstance(value, (int, float)) or not 0.0 < float(value) <= 1.0
+        for value in heading_floors.values()
+    ):
+        errors.append(
+            "Trajectory regime_initial_heading_probability_floor must define "
+            "values in (0,1] for all regimes"
         )
     guide_scales = trajectory.get("regime_trajectory_guide_soft_scale_m", {})
     if set(guide_scales) != required_regimes or any(
@@ -254,8 +260,35 @@ def validate_config(config: dict[str, Any]) -> None:
         or not 0.0 < float(probe_min) <= float(probe_max)
     ):
         errors.append("placement heading probe bounds must satisfy 0 < min <= max")
+    consensus_step = placement.get("heading_consensus_search_step_deg")
+    if (
+        not isinstance(consensus_step, (int, float))
+        or not 0.0 < float(consensus_step) <= 180.0
+    ):
+        errors.append(
+            "Placement heading_consensus_search_step_deg must lie in (0,180]"
+        )
+    lane_guide_distance = placement.get("lane_guide_distance_m")
+    if (
+        not isinstance(lane_guide_distance, (int, float))
+        or float(lane_guide_distance) <= 0.0
+    ):
+        errors.append("Placement lane_guide_distance_m must be positive")
+
+    headrooms = placement.get(
+        "regime_trajectory_separation_headroom_m", {}
+    )
+    if set(headrooms) != required_regimes or any(
+        not isinstance(value, (int, float)) or float(value) < 0.0
+        for value in headrooms.values()
+    ):
+        errors.append(
+            "Placement regime_trajectory_separation_headroom_m must define "
+            "non-negative values for all regimes"
+        )
 
     for key in (
+        "floor_support_aabb_tolerance_m",
         "dynamic_object_start_clearance_m",
         "dynamic_object_path_clearance_m",
     ):

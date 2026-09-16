@@ -309,6 +309,20 @@ def test_complementary_hybrids_are_bounded_deterministic_and_separated():
             ["robot_00", "robot_02"],
         ]
 
+    bounded = complementary_hybrid_trajectory_sets(
+        candidates, failures, **{**kwargs, "maximum_candidates": 2}
+    )
+    preserved = {
+        tuple(tuple(edge) for edge in metrics["complementary_hybrid"][
+            "predicted_preserved_edges"
+        ])
+        for _, _, metrics in bounded
+    }
+    assert preserved == {
+        (("robot_00", "robot_01"),),
+        (("robot_00", "robot_02"),),
+    }
+
     single_edge_failures = (
         {
             "candidate_rank": 0,

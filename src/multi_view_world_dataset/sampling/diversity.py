@@ -418,8 +418,33 @@ def complementary_hybrid_trajectory_sets(
                     (priority, source_indices, trajectories, source_by_robot, metrics)
                 )
     ranked.sort(key=lambda item: (-item[0], item[1]))
+    selected = []
+    seen_preserved_edge_sets: set[tuple[tuple[str, str], ...]] = set()
+    # A three-robot chain has two measured edges sharing one robot. No hybrid
+    # can provably preserve both when that shared robot followed a different
+    # path in each source set. Try both preservation directions before filling
+    # by soft score, then let GT-depth preflight decide which actually bridges.
+    for item in ranked:
+        evidence = item[4]["complementary_hybrid"]
+        signature = tuple(
+            tuple(map(str, edge))
+            for edge in evidence["predicted_preserved_edges"]
+        )
+        if signature in seen_preserved_edge_sets:
+            continue
+        seen_preserved_edge_sets.add(signature)
+        selected.append(item)
+        if len(selected) >= maximum_candidates:
+            break
+    if len(selected) < maximum_candidates:
+        selected_source_indices = {item[1] for item in selected}
+        selected.extend(
+            item
+            for item in ranked
+            if item[1] not in selected_source_indices
+        )
     return tuple(
         (trajectories, source_by_robot, metrics)
-        for _, _, trajectories, source_by_robot, metrics in ranked[:maximum_candidates]
+        for _, _, trajectories, source_by_robot, metrics in selected[:maximum_candidates]
     )
 

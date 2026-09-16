@@ -3,11 +3,17 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from multi_view_world_dataset.adapters.omnigibson import OmniGibsonAdapter
+from multi_view_world_dataset.adapters.omnigibson import (
+    OmniGibsonAdapter,
+    _points_inside_floor_support,
+    _restore_world_to_map_batch_order,
+)
 from multi_view_world_dataset.errors import SampleRejected
 from multi_view_world_dataset.sampling.configurations import exact_state_hash, near_duplicate_configuration
 from multi_view_world_dataset.sampling.placement import (
+    select_consensus_local_headings,
     select_local_traversable_heading,
+    select_shared_traversable_heading,
     soft_anchor_candidate_order,
 )
 from multi_view_world_dataset.sampling.interventions import (
@@ -17,9 +23,12 @@ from multi_view_world_dataset.sampling.interventions import (
 )
 from multi_view_world_dataset.sampling.splits import assign_scene_family_splits, infer_scene_family
 from multi_view_world_dataset.sampling.trajectories import (
+    _angular_density_balanced_weights,
     _sample_route_controls,
     collision_safe_planner_polyline,
     densify_polyline,
+    lane_preserving_guides,
+    minimum_separation_event,
     sample_geodesic_robot_trajectory_pool,
     sample_geodesic_trajectory_set,
     smooth_collision_safe_path,
@@ -59,6 +68,60 @@ def _straight_planner(start, goal):
     return path, float(np.linalg.norm(goal - start))
 
 
+def test_floor_support_filter_rejects_exterior_traversability_pixels():
+    points = np.asarray([
+        [0.5, 0.5],
+        [2.02, 0.5],
+        [-0.2, 0.5],
+        [3.0, 3.0],
+    ])
+    bounds = np.asarray([
+        [0.0, 0.0, 1.0, 1.0],
+        [1.0, 0.0, 2.0, 1.0],
+    ])
+    supported = _points_inside_floor_support(
+        points,
+        bounds,
+        tolerance_m=0.05,
+    )
+    assert supported.tolist() == [True, True, False, False]
+
+
+def test_smoothing_can_fall_back_to_dense_collision_safe_polyline():
+    points = np.asarray([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]])
+
+    def only_accept_original_segments(samples):
+        values = np.asarray(samples)
+        return bool(np.all(
+            (np.abs(values[:, 1]) < 1e-9)
+            | (np.abs(values[:, 0] - 1.0) < 1e-9)
+        ))
+
+    result = smooth_collision_safe_path(
+        points, only_accept_original_segments,
+        smoothing_strengths=(1.0, 0.5, 0.0), validation_spacing_m=0.05,
+    )
+    assert result is not None
+    curve, strength = result
+    assert strength == 0.0
+    assert only_accept_original_segments(curve)
+
+
+def test_omnigibson_world_to_map_batch_reversal_is_repaired():
+    expected = np.asarray([[10, 20], [30, 40], [50, 60]])
+    restored, repaired = _restore_world_to_map_batch_order(
+        expected[::-1], expected[0], expected[-1]
+    )
+    assert repaired is True
+    assert np.array_equal(restored, expected)
+
+    unchanged, repaired = _restore_world_to_map_batch_order(
+        expected, expected[0], expected[-1]
+    )
+    assert repaired is False
+    assert np.array_equal(unchanged, expected)
+
+
 def test_final_robot_capture_uses_only_raw_aov_for_segmentation():
     adapter = object.__new__(OmniGibsonAdapter)
     adapter.config = {
@@ -82,7 +145,10 @@ def test_final_robot_capture_uses_only_raw_aov_for_segmentation():
     }.issubset(adapter._configured_bev_sensor_names())
 
 
-def _sample_parallel_trajectories(seed, minimum_waypoint_trajectories=0):
+def _sample_parallel_trajectories(
+    seed, minimum_waypoint_trajectories=0,
+    maximum_joint_valid_candidates=None,
+):
     starts = {}
     mounts = {}
     candidates = []
@@ -113,6 +179,7 @@ def _sample_parallel_trajectories(seed, minimum_waypoint_trajectories=0):
         minimum_waypoint_trajectories=minimum_waypoint_trajectories,
         initial_heading_tolerance_rad=np.deg2rad(10.0),
         line_validation_spacing_m=0.02,
+        maximum_joint_valid_candidates=maximum_joint_valid_candidates,
         smoothing_validation_spacing_m=0.02,
         smoothing_strengths=(1.0, 0.5),
         candidate_pool_size=2,
@@ -151,6 +218,52 @@ def test_initial_heading_uses_a_directly_traversable_local_exit():
 
 
 
+def test_shared_heading_requires_one_traversable_exit_for_every_robot():
+    sources = np.asarray([[0.0, 0.0], [0.0, 1.0]])
+
+    def validator(points):
+        values = np.asarray(points)
+        # +X is blocked only for the upper robot; +Y is safe for both.
+        return not bool(np.any(
+            (values[:, 0] > 0.2)
+            & (values[:, 1] > 0.5)
+            & (values[:, 1] < 1.5)
+        ))
+
+    yaw, error = select_shared_traversable_heading(
+        sources,
+        0.0,
+        validator,
+        probe_distance_m=0.5,
+        validation_spacing_m=0.02,
+        angular_step_rad=np.pi / 2.0,
+    )
+    assert yaw == pytest.approx(np.pi / 2.0)
+    assert error == pytest.approx(np.pi / 2.0)
+
+
+def test_local_heading_consensus_searches_feasible_exit_sets():
+    sources = np.asarray([[0.0, 0.0], [2.0, 0.0]])
+    pools = [
+        np.asarray([[0.5, 0.0]]),
+        np.asarray([[2.0, 0.5]]),
+    ]
+    headings, errors, consensus = select_consensus_local_headings(
+        sources,
+        pools,
+        0.0,
+        lambda points: True,
+        minimum_probe_m=0.1,
+        maximum_probe_m=0.75,
+        validation_spacing_m=0.02,
+        maximum_deviation_rad=np.deg2rad(50.0),
+        angular_step_rad=np.deg2rad(45.0),
+    )
+    assert np.allclose(headings, [0.0, np.pi / 2.0])
+    assert max(errors) == pytest.approx(np.pi / 4.0)
+    assert consensus == pytest.approx(np.pi / 4.0)
+
+
 def test_joint_sampler_accepts_per_robot_reachable_components():
     starts = {}
     mounts = {}
@@ -184,6 +297,16 @@ def test_joint_sampler_accepts_per_robot_reachable_components():
     )
     assert len(trajectories) == 3
     assert [item.base_to_world[-1, 1, 3] for item in trajectories] == [0.0, 2.0, 4.0]
+
+
+def test_joint_sampler_caps_expensive_valid_combination_scoring():
+    trajectories = _sample_parallel_trajectories(
+        17, maximum_joint_valid_candidates=1,
+    )
+    for trajectory in trajectories:
+        assert trajectory.metadata["joint_valid_candidate_count"] == 1
+        assert trajectory.metadata["joint_valid_candidate_limit_reached"] is True
+        assert trajectory.metadata["joint_combination_evaluated_count"] >= 1
 
 
 def test_joint_set_enforces_configured_waypoint_minimum():
@@ -237,6 +360,47 @@ def test_trajectory_tangent_policy_keeps_non_prior_directions_eligible():
     }
     assert sampled_endpoints == {(1.0, 0.0), (0.0, 1.0)}
 
+
+def test_tangent_policy_still_enforces_sampled_initial_heading_tolerance():
+    start = np.eye(4)
+    with pytest.raises(SampleRejected, match="trajectory_no_geodesic_path"):
+        sample_geodesic_robot_trajectory_pool(
+            "robot_00",
+            start,
+            np.eye(4),
+            np.asarray([[0.0, 1.0]]),
+            0.0,
+            np.random.default_rng(5),
+            frames=60,
+            fps=10,
+            path_length_range_m=(0.99, 1.01),
+            maximum_linear_speed_mps=0.8,
+            maximum_angular_speed_radps=1.2,
+            maximum_acceleration_mps2=1.5,
+            plan_segment=_straight_planner,
+            is_path_traversable=lambda points: True,
+            path_family_weights={
+                "direct": 1.0, "one_waypoint": 0.0, "two_waypoint": 0.0,
+            },
+            initial_heading_tolerance_rad=np.deg2rad(10.0),
+            derive_initial_heading_from_tangent=True,
+            initial_heading_probability_floor=1.0,
+            maximum_control_turn_rad=np.deg2rad(55.0),
+            line_validation_spacing_m=0.02,
+            smoothing_validation_spacing_m=0.02,
+            smoothing_strengths=(1.0,), candidate_pool_size=1, maximum_attempts=2,
+        )
+
+
+
+def test_soft_direction_weights_are_not_dominated_by_pixel_count():
+    bearings = np.concatenate((np.zeros(1000), [np.pi / 2.0]))
+    indices = np.arange(len(bearings), dtype=np.int64)
+    balanced = _angular_density_balanced_weights(
+        bearings, indices, np.ones(len(indices))
+    )
+    assert np.isclose(balanced[:-1].sum(), balanced[-1])
+    assert np.isclose(balanced.sum(), 2.0)
 
 
 def test_state_hash_is_order_independent_and_near_duplicate():
@@ -459,6 +623,57 @@ def test_route_control_guide_is_soft_deterministic_and_effective():
     unguided_mean = np.mean([np.linalg.norm(point - target) for point in unguided])
     assert guided_mean < 0.1 * unguided_mean
     assert np.array_equal(endpoint(7, target), endpoint(7, target))
+
+
+def test_route_control_can_reserve_validated_guide_candidate():
+    candidates = np.asarray([
+        [0.0, 1.0],
+        [0.9, 0.0],
+        [1.0, 0.0],
+        [-1.0, 0.0],
+    ])
+    target = np.asarray([0.9, 0.0])
+    for seed in range(10):
+        controls = _sample_route_controls(
+            np.zeros(2), 0.0, candidates, "direct", 0.99, 1.01,
+            np.pi, np.pi, np.random.default_rng(seed),
+            soft_initial_heading=True,
+            initial_heading_probability_floor=1.0,
+            guide_xy=target,
+            prefer_guide=True,
+        )
+        assert controls is not None
+        assert np.array_equal(controls[-1], [1.0, 0.0])
+
+def test_lane_preserving_guides_keep_relative_start_offsets():
+    starts = np.asarray([[0.0, 0.0], [1.0, -0.5], [-0.25, 2.0]])
+    guides = lane_preserving_guides(starts, np.pi / 2.0, 2.0)
+    assert np.allclose(guides - starts, [[0.0, 2.0]] * 3, atol=1.0e-12)
+    assert np.allclose(guides[1:] - guides[0], starts[1:] - starts[0])
+
+
+def test_minimum_separation_event_identifies_crossing_pair_and_frame():
+    trajectories = (
+        trajectory_from_spatial_path(
+            "robot_00", [[-1.0, 0.0], [1.0, 0.0]], 0.0, np.eye(4), frames=61, fps=10
+        ),
+        trajectory_from_spatial_path(
+            "robot_01", [[0.0, -1.0], [0.0, 1.0]], 0.0, np.eye(4), frames=61, fps=10
+        ),
+        trajectory_from_spatial_path(
+            "robot_02", [[5.0, 0.0], [6.0, 0.0]], 0.0, np.eye(4), frames=61, fps=10
+        ),
+    )
+    event = minimum_separation_event(trajectories)
+    assert event["distance_m"] == pytest.approx(0.0, abs=1.0e-12)
+    assert event["frame_index"] == 30
+    assert event["robot_pair"] == ["robot_00", "robot_01"]
+    assert event["path_families"] == {
+        "robot_00": "unspecified",
+        "robot_01": "unspecified",
+        "robot_02": "unspecified",
+    }
+
 
 def test_single_robot_rescue_pool_reuses_validated_geodesic_sampler():
     start = np.eye(4)

@@ -47,24 +47,43 @@ bev:
 
 placement:
   minimum_pairwise_distance_m: 0.6
-  trajectory_separation_headroom_m: 0.50
+  # Regime-aware start-only spacing; the hard per-frame minimum remains 0.6 m.
+  # These are lower bounds only and never impose a maximum cluster radius.
+  regime_trajectory_separation_headroom_m:
+    dense_shared: 0.30
+    partial_chain: 0.50
+    exploratory: 0.90
   maximum_attempts: 200
   region_adjacency_distance_m: 0.5
-  # Covers the final robot footprint around current movable-object AABBs.
-  dynamic_object_start_clearance_m: 0.55
+  # Reject OG traversability pixels with no physical room-floor support. The
+  # small tolerance only absorbs map/AABB discretization at doorway seams.
+  floor_support_aabb_tolerance_m: 0.05
+  # Use the same footprint expansion for starts and paths. Applying a larger
+  # second start-only expansion can erase every feasible 3-robot placement in
+  # furnished rooms even though the path map and exact contact QA are safe.
+  dynamic_object_start_clearance_m: 0.45
   # AABBs already include each object's body; add the robot half-width plus
   # margin for paths. Execution still performs exact contact validation.
-  dynamic_object_path_clearance_m: 0.35
+  dynamic_object_path_clearance_m: 0.45
   dynamic_object_path_obstacle_height_m: 0.65
-  initial_heading_probe_min_m: 0.15
-  initial_heading_probe_max_m: 0.75
+  # Validate an exit over the same spatial scale as a valid trajectory. A
+  # sub-metre ray can point into a pocket that has no usable 1--3 m route and
+  # makes the expensive geodesic candidate pool fail repeatedly.
+  initial_heading_probe_min_m: 1.0
+  initial_heading_probe_max_m: 3.0
+  # Resolution for searching a scene direction compatible with every robot's
+  # individually traversable local exit.
+  heading_consensus_search_step_deg: 5.0
   sibling_region_reuse_penalty: 1.0
   spatial_soft_probability_floor: 0.05
   regime_spatial_soft_scale_m:
     dense_shared: 1.75
     partial_chain: 2.25
     exploratory: null
-  dense_shared_focus_distance_m: 2.0
+  # Dense and partial-chain starts share a desired scene direction. Each guide
+  # follows the closest robot-eroded local exit within the trajectory heading
+  # tolerance, so obstacles may induce different paths without lateral sliding.
+  lane_guide_distance_m: 2.0
   observation_regime_weights:
     dense_shared: 0.30
     partial_chain: 0.50
@@ -101,14 +120,23 @@ trajectory:
   minimum_waypoint_trajectories: 1
   initial_heading_tolerance_deg: 35.0
   initial_heading_policy: trajectory_tangent
-  # Preserve a scene-view direction as a soft prior without forcing convergence.
-  initial_heading_soft_probability_floor: 0.25
+  # Dense and chain samples share a scene direction while retaining start-lane
+  # offsets. A small nonzero floor preserves stochastic directional diversity.
+  regime_initial_heading_probability_floor:
+    dense_shared: 0.10
+    partial_chain: 0.10
+    exploratory: 1.00
   maximum_control_turn_deg: 55.0
   line_validation_spacing_m: 0.025
   smoothing_validation_spacing_m: 0.025
-  smoothing_strengths: [1.0, 0.5, 0.25]
+  # Fall back to the densely revalidated collision-safe shortcut polyline when
+  # every positive Catmull-Rom strength cuts a narrow obstacle boundary.
+  smoothing_strengths: [1.0, 0.5, 0.25, 0.0]
   candidate_pool_size: 6
   joint_pool_rounds: 5
+  # Score a randomized subset once enough hard-valid 3-robot combinations
+  # exist; exhaustively scoring candidate_pool_size^3 adds no hard QA value.
+  maximum_joint_valid_candidates: 128
   trajectory_sets_per_placement: 8
   maximum_complementary_hybrid_candidates: 2
   # Recovery is triggered only after GT depth measured exactly one union edge.
@@ -131,15 +159,16 @@ trajectory:
     dense_shared: 1.00
     partial_chain: 0.75
     exploratory: 0.00
-  # Softly bias each independent path toward its own regime observation anchor.
-  # This never changes the hard minimum separation or selects compact triples.
+  # Chain paths are softly biased toward their observation anchor. Dense guides
+  # translate every start by the same vector, avoiding common-focus convergence;
+  # hard separation and GT-depth connectivity checks remain authoritative.
   regime_trajectory_guide_soft_scale_m:
-    dense_shared: 1.25
-    partial_chain: 1.50
+    dense_shared: 0.75
+    partial_chain: 0.75
     exploratory: 1.50
   regime_trajectory_guide_probability_floor:
     dense_shared: 0.05
-    partial_chain: 0.10
+    partial_chain: 0.05
     exploratory: 1.00
   # Rank joint candidates by whether camera rays meet at shared scene targets.
   # This is soft only and does not reward compact positions or parallel headings.

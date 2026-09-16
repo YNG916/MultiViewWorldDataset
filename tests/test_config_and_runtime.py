@@ -31,6 +31,15 @@ def test_native_relation_attempt_budget_must_be_positive():
         validate_config(config)
 
 
+def test_regime_start_headroom_must_cover_all_regimes_and_be_non_negative():
+    config = load_yaml_config(REPOSITORY / "configs" / "smoke.yaml")
+    config["placement"]["regime_trajectory_separation_headroom_m"].pop(
+        "exploratory"
+    )
+    with pytest.raises(ConfigurationError, match="regime_trajectory_separation"):
+        validate_config(config)
+
+
 def test_runtime_path_precedence_and_failure(tmp_path):
     behavior = tmp_path / "behavior"
     (behavior / "OmniGibson" / "omnigibson").mkdir(parents=True)

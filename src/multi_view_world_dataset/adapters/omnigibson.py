@@ -14,6 +14,7 @@ from multi_view_world_dataset.errors import GeometryError, SampleRejected, Simul
 from multi_view_world_dataset.rendering.bev import BEVCalibration
 from multi_view_world_dataset.rendering.labels import remap_public_labels
 from multi_view_world_dataset.sampling.placement import (
+    select_consensus_local_headings,
     select_local_traversable_heading,
     soft_anchor_candidate_order,
 )
@@ -33,6 +34,7 @@ from multi_view_world_dataset.sampling.diversity import (
 )
 from multi_view_world_dataset.sampling.splits import infer_scene_family
 from multi_view_world_dataset.sampling.trajectories import (
+    lane_preserving_guides,
     sample_geodesic_robot_trajectory_pool,
     sample_geodesic_trajectory_set,
     trajectory_kinematic_metrics,
@@ -51,6 +53,57 @@ def _resize_nearest(values: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     rows = np.rint(np.linspace(0, array.shape[0] - 1, shape[0])).astype(np.int64)
     columns = np.rint(np.linspace(0, array.shape[1] - 1, shape[1])).astype(np.int64)
     return array[rows[:, None], columns[None, :]]
+
+
+def _points_inside_floor_support(
+    points_xy: np.ndarray,
+    support_bounds_xy: np.ndarray,
+    *,
+    tolerance_m: float = 0.0,
+) -> np.ndarray:
+    """Return whether XY points lie over at least one physical floor AABB."""
+    points = np.asarray(points_xy, dtype=np.float64)
+    bounds = np.asarray(support_bounds_xy, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError("points_xy must have shape [N,2]")
+    if bounds.size == 0:
+        return np.zeros(len(points), dtype=bool)
+    if bounds.ndim != 2 or bounds.shape[1] != 4:
+        raise ValueError("support_bounds_xy must have shape [M,4]")
+    tolerance = float(tolerance_m)
+    if tolerance < 0.0:
+        raise ValueError("tolerance_m must be non-negative")
+    return np.any(
+        (points[:, None, 0] >= bounds[None, :, 0] - tolerance)
+        & (points[:, None, 0] <= bounds[None, :, 2] + tolerance)
+        & (points[:, None, 1] >= bounds[None, :, 1] - tolerance)
+        & (points[:, None, 1] <= bounds[None, :, 3] + tolerance),
+        axis=1,
+    )
+
+
+def _restore_world_to_map_batch_order(
+    mapped: np.ndarray,
+    first_single: np.ndarray,
+    last_single: np.ndarray,
+) -> tuple[np.ndarray, bool]:
+    """Undo the OG 3.9.2 batch-axis flip while tolerating future fixed APIs."""
+    values = np.asarray(mapped)
+    first = np.asarray(first_single)
+    last = np.asarray(last_single)
+    if values.ndim != 2 or len(values) < 2:
+        return values, False
+    forward = np.array_equal(values[0], first) and np.array_equal(values[-1], last)
+    reversed_batch = (
+        np.array_equal(values[-1], first) and np.array_equal(values[0], last)
+    )
+    if forward:
+        return values, False
+    if reversed_batch:
+        return values[::-1].copy(), True
+    raise ValueError(
+        "world_to_map batch output matches neither forward nor reversed input order"
+    )
 
 
 def _continuous_edge_magnitude(values: np.ndarray) -> np.ndarray:
@@ -582,6 +635,21 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         if hasattr(value, "detach"):
             value = value.detach().cpu().numpy()
         return np.asarray(value)
+
+    def _world_to_map_preserving_batch(self, map_object: Any, world_xy: Any) -> np.ndarray:
+        """Call OG world_to_map without its 3.9.2 reversal of the batch axis."""
+        points = self._th.as_tensor(world_xy, dtype=self._th.float32)
+        mapped = self._native_value(map_object.world_to_map(points)).astype(int)
+        if points.ndim == 2 and len(points) >= 2:
+            first = self._native_value(map_object.world_to_map(points[0])).astype(int)
+            last = self._native_value(map_object.world_to_map(points[-1])).astype(int)
+            mapped, repaired = _restore_world_to_map_batch_order(mapped, first, last)
+            if repaired:
+                self._runtime_findings["world_to_map_batch_order_workaround"] = {
+                    "applied": True,
+                    "reason": "OmniGibson 3.9.2 world_to_map reverses [N,2] batch order",
+                }
+        return mapped
 
     def object_catalog(self) -> tuple[ObjectState, ...]:
         scene = self._require_scene()
@@ -1620,47 +1688,91 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         )
         mast_joint.set_pos(mast_extension, drive=False)
 
-    def _robot_eroded_traversability(self, floor_index: int, robot: Any) -> Any:
-        """Erode traversability by the robot footprint and one map-cell margin."""
+    def _floor_supported_traversability_source(self, floor_index: int) -> Any:
+        """Mask OG traversability to locations backed by physical floor geometry."""
         trav_map = self._require_scene().trav_map
         source = self._th.clone(trav_map.floor_map[floor_index])
+        pixels = self._th.stack(self._th.where(source == 255), dim=1)
+        floor_id = f"floor_{floor_index:02d}"
+        supports = [
+            obj
+            for obj in self.object_catalog()
+            if obj.floor_id == floor_id
+            and str(obj.category).lower() in {"floor", "floors"}
+        ]
+        if not supports or not len(pixels):
+            self._runtime_findings["floor_support_filter"] = {
+                "available": False,
+                "floor_id": floor_id,
+                "support_object_count": len(supports),
+                "candidate_count": int(len(pixels)),
+            }
+            if not supports:
+                raise SampleRejected(
+                    "floor_support_geometry_unavailable",
+                    {"floor_id": floor_id},
+                )
+            return source
+        world_xy = self._native_value(trav_map.map_to_world(pixels)).astype(
+            np.float64
+        )
+        support_bounds = np.asarray(
+            [
+                [
+                    obj.bbox_min_world[0],
+                    obj.bbox_min_world[1],
+                    obj.bbox_max_world[0],
+                    obj.bbox_max_world[1],
+                ]
+                for obj in supports
+            ],
+            dtype=np.float64,
+        )
+        tolerance_m = float(
+            self.config["placement"]["floor_support_aabb_tolerance_m"]
+        )
+        supported = _points_inside_floor_support(
+            world_xy,
+            support_bounds,
+            tolerance_m=tolerance_m,
+        )
+        unsupported_pixels = pixels[
+            self._th.as_tensor(~supported, device=pixels.device)
+        ]
+        if len(unsupported_pixels):
+            source[unsupported_pixels[:, 0], unsupported_pixels[:, 1]] = 0
+        self._runtime_findings["floor_support_filter"] = {
+            "available": True,
+            "floor_id": floor_id,
+            "support_object_count": len(supports),
+            "tolerance_m": tolerance_m,
+            "source_candidate_count": int(len(pixels)),
+            "supported_candidate_count": int(np.count_nonzero(supported)),
+            "removed_candidate_count": int(np.count_nonzero(~supported)),
+        }
+        return source
+
+    def _robot_eroded_traversability(self, floor_index: int, robot: Any) -> Any:
+        """Use the installed OG 3.9.2 robot-aware traversability erosion."""
+        trav_map = self._require_scene().trav_map
+        source = self._floor_supported_traversability_source(floor_index)
         chassis_extent = self._native_value(
             robot.reset_joint_pos_aabb_extent[:2]
         ).astype(np.float64)
         footprint_radius_m = float(np.linalg.norm(chassis_extent) / 2.0)
-        # Preserve one full traversability cell as a coarse-map safety margin.
-        safety_margin_m = min(0.1, float(trav_map.map_resolution))
-        clearance_m = footprint_radius_m + safety_margin_m
-        radius_pixels = max(
-            1,
-            int(np.ceil(clearance_m / float(trav_map.map_resolution))),
-        )
-        # OG 3.9.2 hardcodes another 0.2 m and passes radius_pixels as the cv2
-        # kernel width, which erodes by only about half that combined radius.
-        # Use the actual circumscribed footprint plus the explicit margin above,
-        # a true 2r+1 kernel, and treat the map boundary as occupied.
-        obstacles = (source != 255).to(dtype=self._th.float32)[None, None]
-        padded = self._th.nn.functional.pad(
-            obstacles,
-            (radius_pixels, radius_pixels, radius_pixels, radius_pixels),
-            value=1.0,
-        )
-        blocked = self._th.nn.functional.max_pool2d(
-            padded,
-            kernel_size=2 * radius_pixels + 1,
-            stride=1,
-        )[0, 0] > 0
-        eroded = self._th.where(
-            blocked,
-            self._th.zeros_like(source),
-            self._th.full_like(source, 255),
+        installed_radius_m = footprint_radius_m + 0.2
+        radius_pixels = int(np.ceil(
+            installed_radius_m / float(trav_map.map_resolution)
+        ))
+        eroded = trav_map._erode_trav_map(
+            self._th.clone(source), robot=robot
         )
         self._runtime_findings["traversability_clearance"] = {
+            "api": "trav_map._erode_trav_map(robot=robot)",
             "chassis_extent_xy_m": chassis_extent.tolist(),
             "footprint_radius_m": footprint_radius_m,
-            "safety_margin_m": safety_margin_m,
-            "clearance_m": clearance_m,
-            "radius_pixels": radius_pixels,
+            "installed_radius_m": installed_radius_m,
+            "installed_cv2_kernel_width_pixels": radius_pixels,
             "map_resolution_m": float(trav_map.map_resolution),
         }
         return eroded
@@ -1767,13 +1879,14 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         pixels = np.column_stack((columns.ravel(), rows.ravel()))
         world = calibration.pixel_to_world(pixels)[:, :2]
         trav_map = self._require_scene().trav_map
-        eroded = self._robot_eroded_traversability(
+        world_xy, _, _, _ = self._trajectory_traversability(
             floor_index, self._env.robots[0]
         )
-        native = self._native_value(eroded) == 255
-        mapped = self._native_value(
-            trav_map.world_to_map(self._th.as_tensor(world, dtype=self._th.float32))
-        ).astype(int)
+        native = np.zeros(tuple(trav_map.floor_map[floor_index].shape), dtype=bool)
+        native_pixels = self._world_to_map_preserving_batch(trav_map, world_xy)
+        if len(native_pixels):
+            native[native_pixels[:, 0], native_pixels[:, 1]] = True
+        mapped = self._world_to_map_preserving_batch(trav_map, world)
         valid = (
             (mapped[:, 0] >= 0) & (mapped[:, 0] < native.shape[0])
             & (mapped[:, 1] >= 0) & (mapped[:, 1] < native.shape[1])
@@ -1791,11 +1904,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         if floor_index == 0:
             try:
                 seg_map = scene.seg_map
-                pixels = self._native_value(
-                    seg_map.world_to_map(
-                        self._th.as_tensor(world_xy, dtype=self._th.float32)
-                    )
-                ).astype(int)
+                pixels = self._world_to_map_preserving_batch(seg_map, world_xy)
                 room_map = self._native_value(seg_map.room_ins_map)
                 mapping = dict(seg_map.room_ins_id_to_ins_name)
                 inside = (
@@ -1843,7 +1952,10 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             if not obj.structural and obj.floor_id == floor_id
             and obj.bbox_max_world[2] > float(scene.get_floor_height(floor_index)) + 0.10
         ]
-        start_clearance_m = float(placement.get("dynamic_object_start_clearance_m", 0.55))
+        configured_start_clearance_m = float(
+            placement.get("dynamic_object_start_clearance_m", 0.35)
+        )
+        start_clearance_m = configured_start_clearance_m
         free = np.ones(len(world_xy), dtype=bool)
         for obj in dynamic_objects:
             free &= ~(
@@ -1912,22 +2024,38 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             )
             region_sampling_anchors[anchor] = anchor_sample[anchor_index]
             region_sampling_anchors[other] = other_sample[other_index]
+        headroom_by_regime = placement[
+            "regime_trajectory_separation_headroom_m"
+        ]
         minimum_distance = (
             float(placement["minimum_pairwise_distance_m"])
-            + float(placement.get("trajectory_separation_headroom_m", 0.0))
+            + float(headroom_by_regime[regime])
         )
         selected_indices: list[int] = []
         attempts = 0
         maximum_attempts = int(placement["maximum_attempts"])
         target_pool = np.concatenate([regions[name] for name in target_regions])
+        nearby_region_ids = tuple(dict.fromkeys((anchor, *adjacent)))
+        nearby_pool = np.concatenate([
+            regions[name] for name in nearby_region_ids
+        ])
         all_pool = np.arange(len(world_xy))
-        minimum_reachable_displacement = (
-            0.75 * float(self.config["trajectory"]["path_length_min_m"])
+        # Geodesic distance is never shorter than Euclidean displacement.
+        # Requiring the full arc-length lower bound here prevents starts in
+        # tiny connected components from reaching the expensive path sampler.
+        minimum_reachable_displacement = float(
+            self.config["trajectory"]["path_length_min_m"]
         )
         maximum_reachable_displacement = float(
             self.config["trajectory"]["path_length_max_m"]
         )
         viability_cache: dict[tuple[float, float], bool] = {}
+        heading_exit_cache: dict[tuple[float, float], bool] = {}
+        placement_probe_min_m = float(placement["initial_heading_probe_min_m"])
+        placement_probe_max_m = float(placement["initial_heading_probe_max_m"])
+        placement_probe_spacing_m = float(
+            self.config["trajectory"]["line_validation_spacing_m"]
+        )
 
         def start_has_path_neighborhood(point: np.ndarray) -> bool:
             key = tuple(map(float, point))
@@ -1942,13 +2070,38 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 )
             return viability_cache[key]
 
+        def start_has_long_traversable_exit(point: np.ndarray) -> bool:
+            key = tuple(map(float, point))
+            if key not in heading_exit_cache:
+                try:
+                    select_local_traversable_heading(
+                        point,
+                        reachable_candidates(point),
+                        0.0,
+                        is_path_traversable,
+                        minimum_probe_m=placement_probe_min_m,
+                        maximum_probe_m=placement_probe_max_m,
+                        validation_spacing_m=placement_probe_spacing_m,
+                    )
+                    heading_exit_cache[key] = True
+                except SampleRejected:
+                    heading_exit_cache[key] = False
+            return heading_exit_cache[key]
+
+        consensus_preflight_checks = 0
+        maximum_consensus_deviation_rad = np.deg2rad(
+            float(self.config["trajectory"]["initial_heading_tolerance_deg"])
+        )
+        consensus_search_step_rad = np.deg2rad(
+            float(placement["heading_consensus_search_step_deg"])
+        )
         # Region membership is a sampling prior, not a compactness-like hard
         # constraint. Expand gracefully when a small room cannot fit 3 robots.
         for group_attempt in range(maximum_attempts):
             selected_indices = []
             for robot_index in range(len(robots)):
                 desired = target_regions[robot_index % len(target_regions)]
-                pools = (regions[desired], target_pool, all_pool)
+                pools = (regions[desired], target_pool, nearby_pool, all_pool)
                 chosen = None
                 for pool in pools:
                     for index in (
@@ -1964,6 +2117,8 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                         point = world_xy[int(index)]
                         if not start_has_path_neighborhood(point):
                             continue
+                        if not start_has_long_traversable_exit(point):
+                            continue
                         if all(np.linalg.norm(point - world_xy[prior]) >= minimum_distance for prior in selected_indices):
                             chosen = int(index)
                             break
@@ -1973,6 +2128,24 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                     break
                 selected_indices.append(chosen)
             if len(selected_indices) == len(robots):
+                if regime in {"dense_shared", "partial_chain"}:
+                    consensus_preflight_checks += 1
+                    selected_points = world_xy[selected_indices]
+                    try:
+                        select_consensus_local_headings(
+                            selected_points,
+                            [reachable_candidates(point) for point in selected_points],
+                            0.0,
+                            is_path_traversable,
+                            minimum_probe_m=placement_probe_min_m,
+                            maximum_probe_m=placement_probe_max_m,
+                            validation_spacing_m=placement_probe_spacing_m,
+                            maximum_deviation_rad=maximum_consensus_deviation_rad,
+                            angular_step_rad=consensus_search_step_rad,
+                        )
+                    except SampleRejected:
+                        selected_indices = []
+                        continue
                 break
         if len(selected_indices) != 3:
             raise SampleRejected(
@@ -1992,40 +2165,35 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         shared_heading = float(rng.uniform(-np.pi, np.pi))
         trajectory_guides: dict[str, np.ndarray] = {}
         if regime == "dense_shared":
-            requested_focus = (
-                region_sampling_anchors[anchor]
-                + float(placement["dense_shared_focus_distance_m"])
-                * np.asarray([np.cos(shared_heading), np.sin(shared_heading)])
+            guide_points = lane_preserving_guides(
+                selected_xy,
+                shared_heading,
+                float(placement["lane_guide_distance_m"]),
             )
-            focus = anchor_points[int(np.argmin(
-                np.linalg.norm(anchor_points - requested_focus, axis=1)
-            ))]
-            provisional_yaws = np.arctan2(
-                focus[1] - selected_xy[:, 1], focus[0] - selected_xy[:, 0]
-            )
-            trajectory_guides = {
-                robot.name: focus.copy() for robot in robots
-            }
-            heading_policy = "soft_in_region_scene_focus"
-        elif regime == "partial_chain":
-            anchor_guide = region_sampling_anchors[anchor]
-            other_guide = region_sampling_anchors[target_regions[1]]
-            assigned_regions = [
-                target_regions[index % len(target_regions)] for index in range(len(robots))
-            ]
-            guide_points = np.asarray([
-                other_guide if desired == anchor else anchor_guide
-                for desired in assigned_regions
-            ])
-            provisional_yaws = np.arctan2(
-                guide_points[:, 1] - selected_xy[:, 1],
-                guide_points[:, 0] - selected_xy[:, 0],
-            )
+            provisional_yaws = np.full(len(robots), shared_heading)
             trajectory_guides = {
                 robot.name: guide_points[index].copy()
                 for index, robot in enumerate(robots)
             }
-            heading_policy = "soft_adjacent_region_chain_anchors"
+            heading_policy = "soft_lane_preserving_shared_scene_direction"
+        elif regime == "partial_chain":
+            anchor_guide = region_sampling_anchors[anchor]
+            other_guide = region_sampling_anchors[target_regions[1]]
+            chain_heading = float(np.arctan2(
+                other_guide[1] - anchor_guide[1],
+                other_guide[0] - anchor_guide[0],
+            ))
+            guide_points = lane_preserving_guides(
+                selected_xy,
+                chain_heading,
+                float(placement["lane_guide_distance_m"]),
+            )
+            provisional_yaws = np.full(len(robots), chain_heading)
+            trajectory_guides = {
+                robot.name: guide_points[index].copy()
+                for index, robot in enumerate(robots)
+            }
+            heading_policy = "soft_lane_preserving_adjacent_region_direction"
         else:
             provisional_yaws = rng.uniform(-np.pi, np.pi, len(robots))
             heading_policy = "independent_scene_directions"
@@ -2062,6 +2230,47 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 ) from error
             provisional_yaws[index] = chosen
             heading_adjustments.append(heading_error)
+        if regime in {"dense_shared", "partial_chain"}:
+            maximum_regime_heading_error = np.deg2rad(
+                float(self.config["trajectory"]["initial_heading_tolerance_deg"])
+            )
+            if max(heading_adjustments) > maximum_regime_heading_error:
+                reachable_pools = [
+                    reachable_candidates(point)
+                    for point in selected_xy
+                ]
+                (
+                    provisional_yaws,
+                    heading_adjustments,
+                    consensus_yaw,
+                ) = select_consensus_local_headings(
+                    selected_xy,
+                    reachable_pools,
+                    float(desired_yaws[0]),
+                    is_path_traversable,
+                    minimum_probe_m=minimum_heading_probe_m,
+                    maximum_probe_m=maximum_heading_probe_m,
+                    validation_spacing_m=heading_validation_spacing_m,
+                    maximum_deviation_rad=maximum_regime_heading_error,
+                    angular_step_rad=np.deg2rad(
+                        float(placement["heading_consensus_search_step_deg"])
+                    ),
+                )
+                desired_yaws.fill(consensus_yaw)
+            heading_policy = f"{heading_policy}_with_local_exit_consensus"
+        # Every projected heading was densely validated from its start through
+        # at least minimum_heading_probe_m. Persist that guaranteed endpoint as
+        # the per-robot guide. The trajectory sampler uses it once as a hard
+        # direct candidate, then keeps the remaining family draws stochastic.
+        guide_distance = minimum_heading_probe_m
+        guide_directions = np.column_stack(
+            (np.cos(provisional_yaws), np.sin(provisional_yaws))
+        )
+        guide_points = selected_xy + guide_distance * guide_directions
+        trajectory_guides = {
+            robot.name: guide_points[index].copy()
+            for index, robot in enumerate(robots)
+        }
         heights = self.config["camera"]["heights_m"]
         for robot, point, yaw in zip(robots, selected, provisional_yaws, strict=True):
             orientation = self._transform_utils.euler2quat(
@@ -2133,10 +2342,13 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         self._runtime_findings["placement_attempts"] = attempts
         self._runtime_findings["placement_minimum_start_distance_m"] = minimum_distance
         self._runtime_findings["placement_dynamic_object_filter"] = {
+            "configured_clearance_m": configured_start_clearance_m,
             "clearance_m": start_clearance_m,
             "dynamic_object_count": len(dynamic_objects),
             "remaining_candidate_count": len(world_xy),
             "path_viable_candidate_checks": len(viability_cache),
+            "long_exit_candidate_checks": len(heading_exit_cache),
+            "heading_consensus_preflight_checks": consensus_preflight_checks,
         }
         self._runtime_findings["development_camera_heights_m"] = sampled_heights
         return sampled_heights
@@ -2153,9 +2365,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         """Return strict robot-eroded candidates, validator, and OG planner."""
         scene = self._require_scene()
         trav_map = scene.trav_map
-        eroded = trav_map._erode_trav_map(
-            self._th.clone(trav_map.floor_map[floor_index]), robot=robot
-        )
+        eroded = self._robot_eroded_traversability(floor_index, robot)
         pixels = self._th.stack(self._th.where(eroded == 255), dim=1)
         world_xy = self._native_value(trav_map.map_to_world(pixels)).astype(np.float64)
         pixels_native = self._native_value(pixels).astype(np.int64)
@@ -2176,9 +2386,10 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             and obj.bbox_max_world[2] > floor_height + 0.10
             and obj.bbox_min_world[2] < floor_height + obstacle_height_m
         ]
-        dynamic_clearance_m = float(
-            self.config["placement"].get("dynamic_object_path_clearance_m", 0.55)
+        configured_dynamic_clearance_m = float(
+            self.config["placement"].get("dynamic_object_path_clearance_m", 0.35)
         )
+        dynamic_clearance_m = configured_dynamic_clearance_m
         dynamically_free = np.ones(len(world_xy), dtype=bool)
         for obj in dynamic_objects:
             dynamically_free &= ~(
@@ -2193,6 +2404,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         pixels_native = pixels_native[dynamically_free]
         world_xy = world_xy[dynamically_free]
         self._runtime_findings["trajectory_dynamic_object_filter"] = {
+            "configured_clearance_m": configured_dynamic_clearance_m,
             "clearance_m": dynamic_clearance_m,
             "obstacle_height_m": obstacle_height_m,
             "dynamic_object_count": len(dynamic_objects),
@@ -2229,11 +2441,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         height, width = eroded_native.shape
         def is_path_traversable(path_xy: np.ndarray) -> bool:
             points = np.asarray(path_xy, dtype=np.float64)
-            map_points = self._native_value(
-                trav_map.world_to_map(
-                    self._th.as_tensor(points, dtype=self._th.float32)
-                )
-            ).astype(int)
+            map_points = self._world_to_map_preserving_batch(trav_map, points)
             rows = map_points[:, 0]
             columns = map_points[:, 1]
             inside = (
@@ -2248,11 +2456,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             )
 
         def reachable_candidates(source_xy: np.ndarray) -> np.ndarray:
-            source_pixel = self._native_value(
-                trav_map.world_to_map(
-                    self._th.as_tensor(source_xy, dtype=self._th.float32)
-                )
-            ).astype(int)
+            source_pixel = self._world_to_map_preserving_batch(trav_map, source_xy)
             component = component_by_cell.get(tuple(map(int, source_pixel)))
             if component is None:
                 return np.empty((0, 2), dtype=np.float64)
@@ -2263,22 +2467,41 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 )
             ).astype(np.float64)
 
+        planning_source = self._th.where(
+            self._th.as_tensor(eroded_native, dtype=self._th.bool),
+            self._th.full_like(eroded, 255),
+            self._th.zeros_like(eroded),
+        )
+
         def plan_segment(
             source_xy: np.ndarray,
             target_xy: np.ndarray,
         ) -> tuple[np.ndarray, float] | None:
             original_waypoint_interval = int(trav_map.waypoint_interval)
+            original_floor_map = trav_map.floor_map[floor_index]
+            original_default_erosion_radius = float(
+                trav_map.default_erosion_radius
+            )
             trav_map.waypoint_interval = 1
+            trav_map.floor_map[floor_index] = planning_source
+            # This source is already conservatively robot-eroded. A sub-cell
+            # radius makes OG's cv2 erosion a 1x1 identity kernel while still
+            # using the installed shortest-path API and exact signature.
+            trav_map.default_erosion_radius = 0.5 * float(
+                trav_map.map_resolution
+            )
             try:
                 path, distance = scene.get_shortest_path(
                     floor_index,
                     self._th.as_tensor(source_xy, dtype=self._th.float32),
                     self._th.as_tensor(target_xy, dtype=self._th.float32),
                     entire_path=True,
-                    robot=robot,
+                    robot=None,
                 )
             finally:
+                trav_map.floor_map[floor_index] = original_floor_map
                 trav_map.waypoint_interval = original_waypoint_interval
+                trav_map.default_erosion_radius = original_default_erosion_radius
             if path is None or distance is None:
                 return None
             return (
@@ -2292,7 +2515,8 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             "planner_waypoint_interval": 1,
             "native_waypoint_interval": int(trav_map.waypoint_interval),
             "robot_eroded": True,
-            "erosion_source": "installed_omnigibson_3.9.2",
+            "erosion_source": "installed_omnigibson_3.9.2_robot_eroded_then_shortest_path",
+            "planner_internal_erosion": "one_pixel_identity_kernel",
             "connected_component_count": len(component_cells),
             "connected_component_sizes": sorted(
                 (len(cells) for cells in component_cells.values()), reverse=True
@@ -2383,7 +2607,9 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 trajectory_config["initial_heading_policy"] == "trajectory_tangent"
             ),
             initial_heading_probability_floor=float(
-                trajectory_config["initial_heading_soft_probability_floor"]
+                trajectory_config["regime_initial_heading_probability_floor"][
+                    observation_regime
+                ]
             ),
             line_validation_spacing_m=float(trajectory_config["line_validation_spacing_m"]),
             smoothing_validation_spacing_m=float(trajectory_config["smoothing_validation_spacing_m"]),
@@ -2395,6 +2621,9 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 maximum_attempts_override or trajectory_config["sampling_maximum_attempts"]
             ),
             joint_pool_rounds=int(trajectory_config["joint_pool_rounds"]),
+            maximum_joint_valid_candidates=int(
+                trajectory_config["maximum_joint_valid_candidates"]
+            ),
             maximum_control_turn_rad=np.deg2rad(
                 float(trajectory_config["maximum_control_turn_deg"])
             ),
@@ -2995,9 +3224,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             floor_index, self._env.robots[0]
         )
         traversable = np.zeros(tuple(trav_map.floor_map[floor_index].shape), dtype=np.uint8)
-        pixels = self._native_value(trav_map.world_to_map(
-            self._th.as_tensor(world_xy, dtype=self._th.float32)
-        )).astype(int)
+        pixels = self._world_to_map_preserving_batch(trav_map, world_xy)
         if len(pixels):
             traversable[pixels[:, 0], pixels[:, 1]] = 1
         return {
