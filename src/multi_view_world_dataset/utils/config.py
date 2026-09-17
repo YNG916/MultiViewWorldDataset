@@ -49,6 +49,7 @@ def validate_config(config: dict[str, Any]) -> None:
     intervention = config.get("intervention", {})
     generation = config.get("generation", {})
     trajectory = config.get("trajectory", {})
+    navigation = config.get("navigation", {})
     if dataset.get("robots") != 3:
         errors.append("Dataset v1 requires exactly 3 robots")
     if config.get("profile") not in {"smoke", "integration"} and dataset.get("frames") != 60:
@@ -252,46 +253,7 @@ def validate_config(config: dict[str, Any]) -> None:
             "define non-negative integer values for all regimes"
         )
     placement = config.get("placement", {})
-    probe_min = placement.get("initial_heading_probe_min_m")
-    probe_max = placement.get("initial_heading_probe_max_m")
-    if (
-        not isinstance(probe_min, (int, float))
-        or not isinstance(probe_max, (int, float))
-        or not 0.0 < float(probe_min) <= float(probe_max)
-    ):
-        errors.append("placement heading probe bounds must satisfy 0 < min <= max")
-    consensus_step = placement.get("heading_consensus_search_step_deg")
-    if (
-        not isinstance(consensus_step, (int, float))
-        or not 0.0 < float(consensus_step) <= 180.0
-    ):
-        errors.append(
-            "Placement heading_consensus_search_step_deg must lie in (0,180]"
-        )
-    lane_guide_distance = placement.get("lane_guide_distance_m")
-    if (
-        not isinstance(lane_guide_distance, (int, float))
-        or float(lane_guide_distance) <= 0.0
-    ):
-        errors.append("Placement lane_guide_distance_m must be positive")
-
-    headrooms = placement.get(
-        "regime_trajectory_separation_headroom_m", {}
-    )
-    if set(headrooms) != required_regimes or any(
-        not isinstance(value, (int, float)) or float(value) < 0.0
-        for value in headrooms.values()
-    ):
-        errors.append(
-            "Placement regime_trajectory_separation_headroom_m must define "
-            "non-negative values for all regimes"
-        )
-
-    for key in (
-        "floor_support_aabb_tolerance_m",
-        "dynamic_object_start_clearance_m",
-        "dynamic_object_path_clearance_m",
-    ):
+    for key in ("floor_support_aabb_tolerance_m",):
         value = placement.get(key)
         if not isinstance(value, (int, float)) or float(value) < 0.0:
             errors.append(f"Placement setting {key} must be non-negative")
@@ -300,6 +262,106 @@ def validate_config(config: dict[str, Any]) -> None:
     if not isinstance(obstacle_height, (int, float)) or float(obstacle_height) <= 0.0:
         errors.append(
             "Placement dynamic_object_path_obstacle_height_m must be positive"
+        )
+
+    for key in (
+        "footprint_yaw_bins",
+        "footprint_physx_probe_count_per_category",
+        "route_bank_target_size",
+        "route_bank_minimum_size",
+        "route_bank_max_raw_attempts",
+        "route_candidate_attempts_per_raw",
+        "top_triplets_for_exact_validation",
+        "joint_route_search_budget",
+        "cheap_visibility_keyframes",
+        "cheap_visibility_ray_count",
+        "start_blacklist_yaw_bins",
+        "minimum_visible_intervention_candidates",
+    ):
+        value = navigation.get(key)
+        if not isinstance(value, int) or value < 1:
+            errors.append(f"Navigation setting {key} must be a positive integer")
+    if (
+        isinstance(navigation.get("footprint_yaw_bins"), int)
+        and navigation["footprint_yaw_bins"] < 4
+    ):
+        errors.append("navigation.footprint_yaw_bins must be at least 4")
+    if (
+        isinstance(navigation.get("route_bank_target_size"), int)
+        and isinstance(navigation.get("route_bank_minimum_size"), int)
+        and navigation["route_bank_minimum_size"] > navigation["route_bank_target_size"]
+    ):
+        errors.append("navigation route-bank minimum cannot exceed target size")
+    cheap_edge_threshold = navigation.get("cheap_visibility_edge_threshold")
+    if not isinstance(cheap_edge_threshold, (int, float)) or not (
+        0.0 <= float(cheap_edge_threshold) <= 1.0
+    ):
+        errors.append(
+            "navigation.cheap_visibility_edge_threshold must be in [0, 1]"
+        )
+    visibility_priority_fraction = navigation.get(
+        "joint_route_visibility_priority_fraction"
+    )
+    if not isinstance(visibility_priority_fraction, (int, float)) or not (
+        0.0 <= float(visibility_priority_fraction) <= 1.0
+    ):
+        errors.append(
+            "navigation.joint_route_visibility_priority_fraction must be in [0, 1]"
+        )
+    visibility_score_weight = navigation.get(
+        "joint_route_visibility_score_weight"
+    )
+    if not isinstance(visibility_score_weight, (int, float)) or float(
+        visibility_score_weight
+    ) < 0.0:
+        errors.append(
+            "navigation.joint_route_visibility_score_weight must be non-negative"
+        )
+    if not isinstance(
+        navigation.get("require_connected_start_regions"), bool
+    ):
+        errors.append(
+            "navigation.require_connected_start_regions must be boolean"
+        )
+    cheap_isolated_fraction = navigation.get(
+        "cheap_visibility_maximum_isolated_fraction"
+    )
+    if not isinstance(cheap_isolated_fraction, (int, float)) or not (
+        0.0 <= float(cheap_isolated_fraction) < 1.0
+    ):
+        errors.append(
+            "navigation.cheap_visibility_maximum_isolated_fraction "
+            "must be in [0, 1)"
+        )
+    for key in (
+        "footprint_safety_margin_m",
+        "dynamic_obstacle_margin_m",
+    ):
+        value = navigation.get(key)
+        if not isinstance(value, (int, float)) or float(value) < 0.0:
+            errors.append(f"Navigation setting {key} must be non-negative")
+    for key in (
+        "footprint_sampling_spacing_fraction",
+        "cheap_visibility_max_range_m",
+        "start_blacklist_position_quantization_m",
+    ):
+        value = navigation.get(key)
+        if not isinstance(value, (int, float)) or float(value) <= 0.0:
+            errors.append(f"Navigation setting {key} must be positive")
+    sparse_keyframes = navigation.get("sparse_physics_keyframes")
+    yaw_fraction = navigation.get("route_seed_minimum_yaw_fraction")
+    if (
+        not isinstance(yaw_fraction, (int, float))
+        or not 0.0 < float(yaw_fraction) <= 1.0
+    ):
+        errors.append("navigation.route_seed_minimum_yaw_fraction must lie in (0,1]")
+    if (
+        not isinstance(sparse_keyframes, list)
+        or not sparse_keyframes
+        or any(not isinstance(value, int) or value < 0 for value in sparse_keyframes)
+    ):
+        errors.append(
+            "navigation.sparse_physics_keyframes must be non-negative integers"
         )
 
     configuration_sampling = config.get("configuration_sampling", {})

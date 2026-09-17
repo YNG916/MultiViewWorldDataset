@@ -5,7 +5,10 @@ import numpy as np
 import pytest
 
 from multi_view_world_dataset.errors import ConfigurationError
-from multi_view_world_dataset.generator import _temporal_overlap_preflight
+from multi_view_world_dataset.generator import (
+    _sparse_intervention_visibility_preflight,
+    _temporal_overlap_preflight,
+)
 from multi_view_world_dataset.rendering.labels import remap_public_labels, stable_semantic_id
 from multi_view_world_dataset.sampling.diversity import (
     complementary_hybrid_trajectory_sets,
@@ -26,6 +29,39 @@ def _object(instance_id: str, path: str, category: str = "chair") -> ObjectState
         available_states=(), object_to_world=np.eye(4),
         bbox_min_world=(0, 0, 0), bbox_max_world=(1, 1, 1), scale=(1, 1, 1),
     )
+
+
+def test_sparse_intervention_visibility_preflight_uses_public_instance_ids():
+    catalog = (
+        _object("chair_a", "/World/chair_a"),
+        _object("chair_b", "/World/chair_b"),
+    )
+    views = {
+        "robot_00": {"instance": np.full((3, 8, 8), 4, dtype=np.int32)},
+        "robot_01": {"instance": np.zeros((3, 8, 8), dtype=np.int32)},
+        "robot_02": {"instance": np.zeros((3, 8, 8), dtype=np.int32)},
+    }
+    config = {
+        "intervention": {
+            "target_visibility": {
+                "minimum_pixels": 16,
+                "minimum_frames": 2,
+                "minimum_robots": 1,
+                "preferred_robots": 2,
+            }
+        },
+        "navigation": {"minimum_visible_intervention_candidates": 1},
+    }
+    result = _sparse_intervention_visibility_preflight(
+        catalog,
+        views,
+        config,
+        sampled_frame_count=3,
+        full_frame_count=60,
+    )
+    assert result["passed"]
+    assert result["eligible_target_ids"] == ["chair_a"]
+    assert result["objects"]["chair_a"]["public_instance_id"] == 4
 
 
 def test_stable_seed_depends_on_identifiers_not_enumeration_position():

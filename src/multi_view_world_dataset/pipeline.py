@@ -151,8 +151,15 @@ def run_simulator_probe(
             selected_scene, robot_count=3, development_robot=robot_model
         )
         load_seconds = time.perf_counter() - started
-        stage = "place_and_settle_robots"
-        sampled_heights = adapter.place_development_robots(int(config["seed"]))
+        stage = "prepare_navigation_and_place_robots"
+        adapter.prepare_navigation_context(
+            f"simulator-probe:{selected_scene}", int(config["seed"]), force=True
+        )
+        sampled_heights, route_sets = adapter.sample_route_first_trajectory_sets(
+            int(config["seed"])
+        )
+        probe_trajectories, _ = route_sets[0]
+        adapter.place_robots_at_trajectory_frame(probe_trajectories, 0)
 
         stage = "catalog_and_snapshot"
         catalog_before = adapter.object_catalog()

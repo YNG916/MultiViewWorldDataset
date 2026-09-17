@@ -134,22 +134,27 @@ def shortcut_polyline(
     is_path_traversable: PathValidator,
     *,
     validation_spacing_m: float,
-) -> FloatArray:
+) -> FloatArray | None:
     """Greedily remove planner vertices only when the full LOS chord is safe."""
     values = np.asarray(points, dtype=np.float64)
     if len(values) < 3:
-        return values.copy()
+        dense = densify_polyline(values, validation_spacing_m)
+        return values.copy() if is_path_traversable(dense) else None
     result = [values[0]]
     source = 0
     while source < len(values) - 1:
         target = len(values) - 1
-        while target > source + 1:
+        accepted_target = None
+        while target > source:
             line = densify_polyline(values[[source, target]], validation_spacing_m)
             if is_path_traversable(line):
+                accepted_target = target
                 break
             target -= 1
-        result.append(values[target])
-        source = target
+        if accepted_target is None:
+            return None
+        result.append(values[accepted_target])
+        source = accepted_target
     return np.asarray(result, dtype=np.float64)
 
 
@@ -270,6 +275,7 @@ def trajectory_from_spatial_path(
     control_waypoints_xy: ArrayLike | None = None,
     planner_path_xy: ArrayLike | None = None,
     smoothed_path_xy: ArrayLike | None = None,
+    simplified_path_xy: ArrayLike | None = None,
     metadata: Mapping[str, object] | None = None,
 ) -> Trajectory:
     sampled_xy = resample_path_by_arc_length(path_xy, frames)
@@ -288,6 +294,7 @@ def trajectory_from_spatial_path(
         path_family=path_family,
         control_waypoints_xy=empty if control_waypoints_xy is None else control_waypoints_xy,
         planner_path_xy=empty if planner_path_xy is None else planner_path_xy,
+        simplified_path_xy=empty if simplified_path_xy is None else simplified_path_xy,
         smoothed_path_xy=np.asarray(path_xy if smoothed_path_xy is None else smoothed_path_xy),
         metadata={"velocity_profile": "symmetric_sinusoidal_ramp", **dict(metadata or {})},
     )
@@ -413,16 +420,45 @@ def _sample_route_controls(
     guide_soft_scale_m: float = 1.5,
     guide_probability_floor: float = 0.10,
     prefer_guide: bool = False,
+    transition_is_traversable: PathValidator | None = None,
+    transition_validation_spacing_m: float = 0.05,
 ) -> FloatArray | None:
     segment_count = _PATH_FAMILY_SEGMENTS[family]
+    desired_total = float(rng.uniform(minimum_length_m, maximum_length_m))
+    desired_steps = (
+        np.asarray([desired_total], dtype=np.float64)
+        if segment_count == 1
+        else desired_total * rng.dirichlet(np.full(segment_count, 2.0))
+    )
     controls = [start_xy]
     current = start_xy
     previous_bearing = start_yaw
     for segment_index in range(segment_count):
         distances = np.linalg.norm(candidates - current, axis=1)
-        minimum_step = 0.75 * minimum_length_m / segment_count
-        maximum_step = maximum_length_m / segment_count
-        eligible = (distances >= max(0.10, minimum_step)) & (distances <= maximum_step)
+        # Allocate a complete 1--3 m route budget before sampling individual
+        # controls. Independent per-segment radii frequently proposed chains
+        # whose total could never pass the final arc-length constraint.
+        minimum_step = max(0.10, 0.55 * float(desired_steps[segment_index]))
+        maximum_step = min(
+            maximum_length_m, 1.45 * float(desired_steps[segment_index])
+        )
+        eligible = (distances >= minimum_step) & (distances <= maximum_step)
+        if not np.any(eligible):
+            # Sparse maps may not contain a pixel in the preferred budget
+            # annulus. Fall back to the former broad geometric envelope; final
+            # geodesic arc length remains a hard acceptance condition.
+            fallback_minimum = (
+                0.75 * minimum_length_m
+                if segment_count == 1
+                else 0.25 * minimum_length_m / segment_count
+            )
+            fallback_maximum = maximum_length_m * (
+                1.0 if segment_count == 1 else 1.5 / segment_count
+            )
+            eligible = (
+                (distances >= max(0.10, fallback_minimum))
+                & (distances <= fallback_maximum)
+            )
         bearings = np.arctan2(
             candidates[:, 1] - current[1], candidates[:, 0] - current[0]
         )
@@ -438,13 +474,37 @@ def _sample_route_controls(
             if np.any(eligible & heading_eligible):
                 eligible &= heading_eligible
         elif segment_index > 0:
-            # Control points are a spatial prior, not permission for an
-            # instantaneous U-turn. Consecutive route bearings constrain the
-            # subsequently smoothed curve to physically trackable turns.
-            eligible &= np.abs(_wrap_angles(bearings - previous_bearing)) <= maximum_control_turn_rad
+            # Use the turn bound as a proposal prior when the map offers such a
+            # continuation. Do not turn it into a pre-planning dead end in a
+            # narrow corridor: exact angular speed and footprint validation
+            # remain hard gates on the resulting trajectory.
+            turn_eligible = (
+                np.abs(_wrap_angles(bearings - previous_bearing))
+                <= maximum_control_turn_rad
+            )
+            if np.any(eligible & turn_eligible):
+                eligible &= turn_eligible
         indices = np.flatnonzero(eligible)
         if not len(indices):
             return None
+        if transition_is_traversable is not None:
+            # Prefer controls connected by an exact footprint-safe chord. This
+            # removes proposals predictably incompatible with travel direction,
+            # but is not a hard straight-exit condition: without a safe tested
+            # chord, OG geodesic planning receives the original candidate set.
+            safe_indices = []
+            probe_order = rng.permutation(indices)[: min(64, len(indices))]
+            for candidate_index in probe_order:
+                chord = densify_polyline(
+                    np.stack((current, candidates[int(candidate_index)])),
+                    transition_validation_spacing_m,
+                )
+                if transition_is_traversable(chord):
+                    safe_indices.append(int(candidate_index))
+                    if len(safe_indices) >= 16:
+                        break
+            if safe_indices:
+                indices = np.asarray(safe_indices, dtype=np.int64)
         if prefer_guide and segment_index == 0 and guide_xy is not None:
             guide_indices = indices
             if family == "direct":
@@ -508,7 +568,8 @@ def _plan_route(
     is_path_traversable: PathValidator,
     *,
     line_validation_spacing_m: float,
-) -> tuple[FloatArray, float] | None:
+) -> tuple[FloatArray, FloatArray, float] | None:
+    planner_segments: list[FloatArray] = []
     shortcut_segments: list[FloatArray] = []
     geodesic_length = 0.0
     for start, goal in zip(controls[:-1], controls[1:], strict=True):
@@ -523,21 +584,23 @@ def _plan_route(
             planner_points = np.vstack((start, planner_points))
         if np.linalg.norm(planner_points[-1] - goal) > 1.0e-7:
             planner_points = np.vstack((planner_points, goal))
-        safe_planner_points = collision_safe_planner_polyline(
+        shortcut = shortcut_polyline(
             planner_points,
             is_path_traversable,
             validation_spacing_m=line_validation_spacing_m,
         )
-        if safe_planner_points is None:
+        if shortcut is None:
             return None
-        shortcut = shortcut_polyline(
-            safe_planner_points,
-            is_path_traversable,
-            validation_spacing_m=line_validation_spacing_m,
+        planner_segments.append(
+            planner_points if not planner_segments else planner_points[1:]
         )
         shortcut_segments.append(shortcut if not shortcut_segments else shortcut[1:])
         geodesic_length += float(segment_geodesic)
-    return np.concatenate(shortcut_segments, axis=0), geodesic_length
+    return (
+        np.concatenate(planner_segments, axis=0),
+        np.concatenate(shortcut_segments, axis=0),
+        geodesic_length,
+    )
 
 
 def _sample_robot_pool(
@@ -611,6 +674,8 @@ def _sample_robot_pool(
             guide_soft_scale_m=guide_soft_scale_m,
             guide_probability_floor=guide_probability_floor,
             prefer_guide=prefer_guide,
+            transition_is_traversable=is_path_traversable,
+            transition_validation_spacing_m=line_validation_spacing_m,
         )
         if controls is None:
             rejection_counts["no_control_candidates"] += 1
@@ -624,7 +689,7 @@ def _sample_robot_pool(
         if planned is None:
             rejection_counts["planner_or_strict_validation"] += 1
             continue
-        shortcut_path, geodesic_length = planned
+        planner_path, shortcut_path, geodesic_length = planned
         smoothed = smooth_collision_safe_path(
             shortcut_path,
             is_path_traversable,
@@ -648,7 +713,8 @@ def _sample_robot_pool(
             fps=fps,
             path_family=family,
             control_waypoints_xy=controls,
-            planner_path_xy=shortcut_path,
+            planner_path_xy=planner_path,
+            simplified_path_xy=shortcut_path,
             smoothed_path_xy=smooth_path,
             metadata={
                 "planner_geodesic_length_m": geodesic_length,

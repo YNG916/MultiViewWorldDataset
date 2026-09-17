@@ -13,8 +13,23 @@ robot:
 placement:
   minimum_pairwise_distance_m: 0.6
 
+# A smoke run still exercises a genuine multi-object DynamicConfiguration, but
+# fixes its size at the Dataset-v1.1 minimum so trajectory validation is not
+# dominated by six expensive native relation-sampling calls.
+configuration_sampling:
+  movable_fraction: 0.01
+  minimum_changed_objects: 2
+  maximum_changed_objects: 2
+
 trajectory:
-  # Eight nested sets divide this budget, yielding four paths per robot and 64
-  # joint combinations per round while retaining bounded shortest-path work.
   candidate_pool_size: 32
   sampling_maximum_attempts: 200
+
+navigation:
+  route_bank_target_size: 64
+  # Smoke-only diagnostic threshold. Twelve independent routes already yield
+  # 220 possible triplets; compatibility, PhysX, and GT-depth remain hard
+  # gates. Production keeps the stricter default of 24.
+  route_bank_minimum_size: 12
+  route_bank_max_raw_attempts: 1500
+  route_candidate_attempts_per_raw: 10

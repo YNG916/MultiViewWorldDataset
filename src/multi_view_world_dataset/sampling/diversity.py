@@ -256,8 +256,12 @@ def temporal_overlap_acceptance(
     allowed_isolation = int(
         regime_maximum_consecutive_isolated_keyframes[realized_regime]
     )
-    connected_target = float(regime_connected_fraction_target[regime])
-    shared_target = float(regime_shared_keyframe_fraction_target[regime])
+    if regime == "unclassified":
+        connected_target = 0.0
+        shared_target = 0.0
+    else:
+        connected_target = float(regime_connected_fraction_target[regime])
+        shared_target = float(regime_shared_keyframe_fraction_target[regime])
     checks = {
         "union_graph_connected": len(reached) == len(ids),
         "meaningful_shared_moment": meaningful_shared_count > 0,
@@ -284,7 +288,7 @@ def temporal_overlap_acceptance(
         "near_duplicate_keyframe_pair_count": near_duplicate_count,
         "requested_regime": regime,
         "realized_regime": realized_regime,
-        "regime_target_match": regime == realized_regime,
+        "regime_target_match": regime in {"unclassified", realized_regime},
         "regime": realized_regime,
     }
 

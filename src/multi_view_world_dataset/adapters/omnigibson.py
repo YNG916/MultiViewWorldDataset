@@ -25,6 +25,7 @@ from multi_view_world_dataset.sampling.interventions import (
     propose_rigid_relocation,
     propose_state_change,
 )
+from multi_view_world_dataset.sampling.navigation import NavigationContext
 from multi_view_world_dataset.sampling.diversity import (
     choose_weighted_label,
     complementary_hybrid_trajectory_sets,
@@ -246,6 +247,8 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         self._started = False
         self._runtime_findings: dict[str, Any] = {}
         self._canonical_floor_bounds: dict[int, tuple[float, float, float, float]] = {}
+        self._navigation_contexts: dict[int, NavigationContext] = {}
+        self._navigation_configuration_token: str | None = None
 
     def _configured_bev_sensor_names(self) -> list[str]:
         """Return all Replicator modalities needed by configured BEV captures."""
@@ -364,6 +367,8 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         self._development_camera_mounts.clear()
         self._relation_cache = None
         self._canonical_floor_bounds.clear()
+        self._navigation_contexts.clear()
+        self._navigation_configuration_token = None
         if scene_id not in self.discover_scenes():
             raise SimulatorUnavailableError(f"Scene is not installed: {scene_id}")
         camera = self.config["camera"]
@@ -1929,6 +1934,49 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             labels[missing] = [f"conceptual_{x:+04d}_{y:+04d}" for x, y in cells]
         return labels.astype(str)
 
+    def prepare_navigation_context(
+        self,
+        configuration_token: str,
+        seed: int,
+        *,
+        force: bool = False,
+    ) -> dict[int, NavigationContext]:
+        """Build one reusable footprint-aware context per feasible floor."""
+        from multi_view_world_dataset.adapters.navigation import (
+            build_navigation_contexts,
+        )
+
+        return build_navigation_contexts(
+            self, configuration_token, seed, force=force
+        )
+
+    def navigation_context_metadata(self) -> dict[str, Any]:
+        """Return JSON-safe configuration-level navigation diagnostics."""
+        return {
+            str(floor_index): context.metadata()
+            for floor_index, context in sorted(self._navigation_contexts.items())
+        }
+
+    def sample_route_first_trajectory_sets(
+        self,
+        seed: int,
+        *,
+        discouraged_region_ids: tuple[str, ...] = (),
+    ) -> tuple[
+        dict[str, float],
+        tuple[tuple[tuple[Trajectory, ...], dict[str, Any]], ...],
+    ]:
+        """Select and sparsely validate route triplets from the cached bank."""
+        from multi_view_world_dataset.adapters.navigation import (
+            sample_route_first_trajectory_sets,
+        )
+
+        return sample_route_first_trajectory_sets(
+            self,
+            seed,
+            discouraged_region_ids=discouraged_region_ids,
+        )
+
     def place_development_robots(
         self, seed: int, *, discouraged_region_ids: tuple[str, ...] = ()
     ) -> dict[str, float]:
@@ -3217,20 +3265,35 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         )
 
     def trajectory_traversability_inspection(self, floor_index: int) -> dict[str, Any]:
-        """Expose the exact static-eroded plus dynamic-obstacle planning raster."""
+        """Expose footprint-safe navigation, regions, footprint, and RouteBank."""
         scene = self._require_scene()
         trav_map = scene.trav_map
-        world_xy, _, _, _ = self._trajectory_traversability(
-            floor_index, self._env.robots[0]
-        )
-        traversable = np.zeros(tuple(trav_map.floor_map[floor_index].shape), dtype=np.uint8)
-        pixels = self._world_to_map_preserving_batch(trav_map, world_xy)
-        if len(pixels):
+        context = self._navigation_contexts.get(floor_index)
+        if context is None:
+            world_xy, _, _, _ = self._trajectory_traversability(
+                floor_index, self._env.robots[0]
+            )
+            traversable = np.zeros(
+                tuple(trav_map.floor_map[floor_index].shape), dtype=np.uint8
+            )
+            pixels = self._world_to_map_preserving_batch(trav_map, world_xy)
             traversable[pixels[:, 0], pixels[:, 1]] = 1
+            return {
+                "traversable": traversable,
+                "map_resolution_m": float(trav_map.map_resolution),
+                "map_size": int(trav_map.map_size),
+            }
         return {
-            "traversable": traversable,
+            "traversable": context.planner_mask.astype(np.uint8),
             "map_resolution_m": float(trav_map.map_resolution),
             "map_size": int(trav_map.map_size),
+            "region_label_grid": context.region_label_grid,
+            "region_graph": context.region_graph.metadata(),
+            "footprint_polygon_xy": context.footprint.polygon_xy,
+            "route_bank_paths_xy": [
+                route.trajectory.base_to_world[:, :2, 3]
+                for route in context.route_bank
+            ],
         }
 
     def place_robots_at_trajectory_frame(

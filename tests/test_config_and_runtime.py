@@ -31,12 +31,12 @@ def test_native_relation_attempt_budget_must_be_positive():
         validate_config(config)
 
 
-def test_regime_start_headroom_must_cover_all_regimes_and_be_non_negative():
+def test_navigation_route_bank_minimum_cannot_exceed_target():
     config = load_yaml_config(REPOSITORY / "configs" / "smoke.yaml")
-    config["placement"]["regime_trajectory_separation_headroom_m"].pop(
-        "exploratory"
+    config["navigation"]["route_bank_minimum_size"] = (
+        config["navigation"]["route_bank_target_size"] + 1
     )
-    with pytest.raises(ConfigurationError, match="regime_trajectory_separation"):
+    with pytest.raises(ConfigurationError, match="route-bank minimum"):
         validate_config(config)
 
 

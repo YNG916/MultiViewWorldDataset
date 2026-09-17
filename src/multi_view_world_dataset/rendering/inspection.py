@@ -29,7 +29,7 @@ def save_trajectory_inspection(
     path: Path,
     traversability: dict[str, Any],
     trajectories: tuple[Trajectory, ...],
-    temporal_overlap: dict[str, Any],
+    temporal_overlap: dict[str, Any] | None,
 ) -> None:
     """Draw the exact eroded planning map, paths, waypoints, headings, and overlap QA."""
     try:
@@ -39,6 +39,21 @@ def save_trajectory_inspection(
     mask = np.asarray(traversability["traversable"], dtype=bool)
     raster = np.full((*mask.shape, 3), 35, dtype=np.uint8)
     raster[mask] = (225, 225, 225)
+    region_labels = traversability.get("region_label_grid")
+    if region_labels is not None:
+        region_labels = np.asarray(region_labels).astype(str)
+        for index, label in enumerate(sorted(set(region_labels[mask]))):
+            if not label:
+                continue
+            color = np.asarray((
+                (53 * index + 80) % 180 + 45,
+                (97 * index + 30) % 180 + 45,
+                (151 * index + 10) % 180 + 45,
+            ))
+            selected = mask & (region_labels == label)
+            raster[selected] = (
+                0.72 * raster[selected] + 0.28 * color
+            ).astype(np.uint8)
     # OmniGibson traversability rows increase with world Y, while image rows
     # increase downwards. Flip the native map to match RGB BEV: +X right, +Y up.
     raster = np.flipud(raster).copy()
@@ -61,12 +76,62 @@ def save_trajectory_inspection(
         row = (map_height - 1.0 - native_row) * scale + banner_height
         return column, row
 
+    if region_labels is not None:
+        centroids = {}
+        for label in sorted(set(region_labels[mask])):
+            if not label:
+                continue
+            rows, columns = np.where(mask & (region_labels == label))
+            if len(rows):
+                centroids[str(label)] = (
+                    float(np.mean(columns)) * scale,
+                    (map_height - 1.0 - float(np.mean(rows))) * scale + banner_height,
+                )
+        graph = traversability.get("region_graph", {})
+        for left, right in graph.get('edges', ()):
+            if left in centroids and right in centroids:
+                draw.line(
+                    (*centroids[left], *centroids[right]),
+                    fill=(92, 65, 15), width=max(1, scale),
+                )
+        for label, center in centroids.items():
+            radius = max(3, scale)
+            draw.ellipse(
+                (center[0] - radius, center[1] - radius,
+                 center[0] + radius, center[1] + radius),
+                fill=(255, 220, 90), outline=(60, 45, 10),
+            )
+            draw.text((center[0] + radius + 1, center[1] - radius), label, fill=(35, 25, 5))
+
+    for route_path in traversability.get('route_bank_paths_xy', ()):
+        route_pixels = [pixel(point) for point in np.asarray(route_path)]
+        if len(route_pixels) >= 2:
+            draw.line(
+                route_pixels, fill=(155, 155, 155), width=max(1, scale)
+            )
+
     colors = ((220, 45, 45), (35, 105, 220), (25, 155, 80))
     for trajectory, color in zip(sorted(trajectories, key=lambda item: item.robot_id), colors, strict=True):
         xy = trajectory.base_to_world[:, :2, 3]
         pixels = [pixel(point) for point in xy]
         draw.line(pixels, fill=color, width=max(2, 2 * scale), joint="curve")
         radius = max(4, 2 * scale)
+
+        footprint = np.asarray(
+            traversability.get("footprint_polygon_xy", ()), dtype=np.float64
+        )
+        if footprint.ndim == 2 and footprint.shape[1:] == (2,) and len(footprint) >= 3:
+            start_yaw = float(np.arctan2(
+                trajectory.base_to_world[0, 1, 0],
+                trajectory.base_to_world[0, 0, 0],
+            ))
+            cosine, sine = np.cos(start_yaw), np.sin(start_yaw)
+            rotation = np.asarray(((cosine, -sine), (sine, cosine)))
+            footprint_world = footprint @ rotation.T + xy[0]
+            draw.polygon(
+                [pixel(point) for point in footprint_world], outline=color, width=max(1, scale)
+            )
+
         start_u, start_v = pixels[0]
         end_u, end_v = pixels[-1]
         draw.ellipse((start_u - radius, start_v - radius, start_u + radius, start_v + radius), fill=color, outline=(0, 0, 0))
@@ -87,24 +152,34 @@ def save_trajectory_inspection(
             draw.ellipse((tip[0] - 2, tip[1] - 2, tip[0] + 2, tip[1] + 2), fill=(0, 0, 0))
         draw.text((start_u + radius + 2, start_v - radius), f"{trajectory.robot_id} {trajectory.path_family}", fill=color)
 
-    connected_fraction = float(temporal_overlap["connected_fraction"])
-    maximum_isolation = temporal_overlap["maximum_consecutive_isolated_keyframes"]
-    requested_regime = temporal_overlap["requested_regime"]
-    realized_regime = temporal_overlap["realized_regime"]
-    union_edges = temporal_overlap["union_edges"]
-    draw.text((10, 8), "Robot-eroded traversability (not RGB BEV) | +X right, +Y up", fill=(0, 0, 0))
-    draw.text((10, 29), "circle=start square=end yellow=intermediate waypoint arrows=planned heading", fill=(0, 0, 0))
-    draw.text(
-        (10, 50),
-        f"G_t connected: {temporal_overlap['connected_keyframe_count']}/{temporal_overlap['keyframe_count']} ({connected_fraction:.3f}, soft target {temporal_overlap['connected_fraction_target']:.3f})",
-        fill=(0, 0, 0),
-    )
-    draw.text(
-        (10, 92),
-        f"G_union edges: {union_edges} | requested={requested_regime}, realized={realized_regime}",
-        fill=(0, 0, 0),
-    )
-    draw.text((10, 71), f"maximum consecutive isolated keyframes: {maximum_isolation}", fill=(0, 0, 0))
+    draw.text((10, 8), "Robot-footprint traversability (not RGB BEV) | +X right, +Y up", fill=(0, 0, 0))
+    draw.text((10, 29), "circle=start square=end yellow=waypoint arrows=heading; gold=RegionGraph", fill=(0, 0, 0))
+    if temporal_overlap is None:
+        graph = traversability.get("region_graph", {})
+        draw.text(
+            (10, 50),
+            f"RouteBank paths: {len(traversability.get('route_bank_paths_xy', ()))} | "
+            f"RegionGraph: {len(graph.get('nodes', ()))} nodes / {len(graph.get('edges', ()))} edges",
+            fill=(0, 0, 0),
+        )
+        draw.text((10, 71), "GT-depth temporal overlap: deferred to joint-route diagnostic", fill=(0, 0, 0))
+    else:
+        connected_fraction = float(temporal_overlap["connected_fraction"])
+        maximum_isolation = temporal_overlap["maximum_consecutive_isolated_keyframes"]
+        requested_regime = temporal_overlap["requested_regime"]
+        realized_regime = temporal_overlap["realized_regime"]
+        union_edges = temporal_overlap["union_edges"]
+        draw.text(
+            (10, 50),
+            f"G_t connected: {temporal_overlap['connected_keyframe_count']}/{temporal_overlap['keyframe_count']} ({connected_fraction:.3f}, soft target {temporal_overlap['connected_fraction_target']:.3f})",
+            fill=(0, 0, 0),
+        )
+        draw.text((10, 71), f"maximum consecutive isolated keyframes: {maximum_isolation}", fill=(0, 0, 0))
+        draw.text(
+            (10, 92),
+            f"G_union edges: {union_edges} | requested={requested_regime}, realized={realized_regime}",
+            fill=(0, 0, 0),
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(path)
 

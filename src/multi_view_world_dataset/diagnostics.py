@@ -9,8 +9,10 @@ from typing import Any
 import numpy as np
 
 from multi_view_world_dataset.adapters.omnigibson import OmniGibsonAdapter
+from multi_view_world_dataset.adapters.navigation import footprint_physx_diagnostic
 from multi_view_world_dataset.errors import SampleRejected
 from multi_view_world_dataset.generator import _temporal_overlap_preflight
+from multi_view_world_dataset.rendering.inspection import save_trajectory_inspection
 from multi_view_world_dataset.sampling.diversity import stable_seed
 from multi_view_world_dataset.utils.runtime import RuntimePaths
 from multi_view_world_dataset.utils.serialization import dump_json
@@ -59,6 +61,10 @@ def run_sampling_diagnostics(
         else bool(include_overlap_preflight)
     )
     accepted = 0
+    inspection_trajectories = None
+    inspection_overlap = None
+    inspection_floor_index = None
+    footprint_report = None
     try:
         adapter.start()
         selected_scene = scene_id or adapter.discover_scenes()[0]
@@ -73,15 +79,84 @@ def run_sampling_diagnostics(
         )
         snapshot = adapter.dump_snapshot()
         catalog = adapter.object_catalog_with_relations()
+        adapter.prepare_navigation_context(
+            "sampling-diagnostics",
+            stable_seed(int(config["seed"]), selected_scene, "navigation-context"),
+            force=True,
+        )
+        navigation_report = adapter.navigation_context_metadata()
         for index in range(requested):
             adapter.load_snapshot(snapshot)
             try:
-                adapter.place_development_robots(
-                    stable_seed(int(config["seed"]), selected_scene, "diagnostic-placement", index)
+                _, candidate_sets = adapter.sample_route_first_trajectory_sets(
+                    stable_seed(
+                        int(config["seed"]), selected_scene,
+                        "diagnostic-route-first", index,
+                    )
                 )
-                trajectories, metrics = adapter.sample_robot_trajectories(
-                    stable_seed(int(config["seed"]), selected_scene, "diagnostic-trajectory", index)
-                )
+                trajectories, metrics = candidate_sets[0]
+                if footprint_report is None:
+                    footprint_report = footprint_physx_diagnostic(
+                        adapter,
+                        int(metrics["floor_index"]),
+                        stable_seed(
+                            int(config["seed"]), selected_scene,
+                            "footprint-physx-diagnostic",
+                        ),
+                    )
+                overlap = None
+                if run_overlap:
+                    selected = None
+                    for candidate_rank, (
+                        candidate_trajectories,
+                        candidate_metrics,
+                    ) in enumerate(candidate_sets):
+                        overlap_evaluated += 1
+                        adapter.place_robots_at_trajectory_frame(
+                            candidate_trajectories, 0
+                        )
+                        try:
+                            candidate_overlap = _temporal_overlap_preflight(
+                                adapter,
+                                config,
+                                candidate_trajectories,
+                                catalog=catalog,
+                            )
+                        except SampleRejected as error:
+                            rejects[error.reason] += 1
+                            rejection_details.append({
+                                "sample_index": index,
+                                "candidate_rank": candidate_rank,
+                                "route_ids": candidate_metrics["route_ids"],
+                                "reason": error.reason,
+                                "details": error.details,
+                            })
+                            if inspection_trajectories is None:
+                                inspection_trajectories = candidate_trajectories
+                                inspection_overlap = (
+                                    error.details
+                                    if error.reason
+                                    == "trajectory_temporal_overlap_failed"
+                                    else None
+                                )
+                                inspection_floor_index = int(
+                                    candidate_metrics["floor_index"]
+                                )
+                            continue
+                        selected = (
+                            candidate_trajectories,
+                            candidate_metrics,
+                            candidate_overlap,
+                        )
+                        break
+                    if selected is None:
+                        accepted += 1
+                        continue
+                    trajectories, metrics, overlap = selected
+                    overlap_passed += 1
+                    inspection_trajectories = trajectories
+                    inspection_overlap = overlap
+                    inspection_floor_index = int(metrics["floor_index"])
             except SampleRejected as error:
                 rejects[error.reason] += 1
                 rejection_details.append({
@@ -91,7 +166,6 @@ def run_sampling_diagnostics(
                 })
                 continue
             accepted += 1
-            regimes[str(metrics["observation_regime"])] += 1
             regions.update(map(str, metrics["start_region_ids"]))
             joint = metrics["joint_diversity"]
             coverages.append(float(joint["spatial_coverage_bbox_area_m2"]))
@@ -121,16 +195,7 @@ def run_sampling_diagnostics(
                 tortuosities.append(float(robot["tortuosity"]))
                 yaw_changes.append(float(robot["cumulative_absolute_yaw_change_rad"]))
             if run_overlap:
-                overlap_evaluated += 1
-                adapter.place_robots_at_trajectory_frame(trajectories, 0)
-                try:
-                    overlap = _temporal_overlap_preflight(adapter, config, trajectories)
-                    overlap_passed += 1
-                except SampleRejected as error:
-                    if error.reason != "trajectory_temporal_overlap_failed":
-                        raise
-                    rejects[error.reason] += 1
-                    overlap = error.details
+                assert overlap is not None
                 connected_fractions.append(float(overlap["connected_fraction"]))
                 union_connected += int(bool(overlap["checks"]["union_graph_connected"]))
                 near_duplicate_keyframes += int(overlap["near_duplicate_keyframe_pair_count"])
@@ -141,6 +206,14 @@ def run_sampling_diagnostics(
                     )
                     overlap_topologies[topology] += 1
                     overlap_values.extend(float(value) for value in keyframe["overlaps"].values())
+                regimes[str(overlap["realized_regime"])] += 1
+            else:
+                regimes[str(metrics["observation_regime"])] += 1
+            if inspection_trajectories is None:
+                inspection_trajectories = trajectories
+                inspection_overlap = overlap if run_overlap else None
+                inspection_floor_index = int(metrics["floor_index"])
+
         movable = [obj for obj in catalog if obj.movable and not obj.structural]
         report = {
             "mode": (
@@ -183,6 +256,8 @@ def run_sampling_diagnostics(
             ),
             "spatial_coverage_m2": _summary(coverages),
             "minimum_inter_robot_distance_m": _summary(minimum_separations),
+            "navigation_context": navigation_report,
+            "footprint_physx_diagnostic": footprint_report,
             "configuration_candidates": {
                 "movable_non_structural": len(movable),
                 "categories": dict(Counter(obj.category for obj in movable)),
@@ -268,8 +343,20 @@ def run_sampling_diagnostics(
             requested < minimum_warning_samples
         )
         root = runtime.require_output()
+        if inspection_trajectories is not None and inspection_floor_index is not None:
+            inspection_name = "navigation_diagnostic.png"
+            save_trajectory_inspection(
+                root / inspection_name,
+                adapter.trajectory_traversability_inspection(
+                    inspection_floor_index
+                ),
+                inspection_trajectories,
+                inspection_overlap,
+            )
+            report["inspection_image"] = inspection_name
         path = root / str(config["sampling_diagnostics"]["output_name"])
         dump_json(path, report)
+        (root / "sampling_diagnostics_failure.json").unlink(missing_ok=True)
         return path, report
     except BaseException as error:
         root = runtime.require_output()
@@ -278,6 +365,9 @@ def run_sampling_diagnostics(
             {
                 "error_type": type(error).__name__,
                 "message": str(error),
+                "reason": getattr(error, "reason", None),
+                "details": getattr(error, "details", {}),
+                "runtime_findings": adapter.runtime_report(),
             },
         )
         traceback.print_exc()

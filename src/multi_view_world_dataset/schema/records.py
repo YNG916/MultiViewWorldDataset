@@ -177,6 +177,9 @@ class Trajectory:
     planner_path_xy: FloatArray = field(
         default_factory=lambda: np.empty((0, 2), dtype=np.float64)
     )
+    simplified_path_xy: FloatArray = field(
+        default_factory=lambda: np.empty((0, 2), dtype=np.float64)
+    )
     smoothed_path_xy: FloatArray = field(
         default_factory=lambda: np.empty((0, 2), dtype=np.float64)
     )
@@ -196,6 +199,7 @@ class Trajectory:
         for name in (
             "control_waypoints_xy",
             "planner_path_xy",
+            "simplified_path_xy",
             "smoothed_path_xy",
         ):
             points = np.asarray(getattr(self, name), dtype=np.float64)

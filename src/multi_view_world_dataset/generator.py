@@ -158,8 +158,10 @@ def _temporal_overlap_preflight(
     adapter: OmniGibsonAdapter,
     config: dict[str, Any],
     trajectories: tuple[Any, ...],
+    *,
+    catalog: tuple[ObjectState, ...] | None = None,
 ) -> dict[str, Any]:
-    """Validate sparse synchronized GT-depth overlap before full rollout capture."""
+    """Validate sparse GT overlap and target visibility before dense capture."""
     preflight = config["trajectory"]["overlap_preflight"]
     frame_count = trajectories[0].frames
     keyframe_indices = np.unique(
@@ -280,6 +282,46 @@ def _temporal_overlap_preflight(
     })
     if not metrics["passed"]:
         raise SampleRejected("trajectory_temporal_overlap_failed", metrics)
+    if catalog is not None:
+        sparse_instance_views: dict[str, dict[str, list[np.ndarray]]] = {
+            robot_id: {"instance": []} for robot_id in robot_ids
+        }
+        try:
+            for frame_index in keyframe_indices:
+                adapter.place_robots_at_trajectory_frame(
+                    trajectories, int(frame_index)
+                )
+                observations = adapter.robot_observations()
+                for robot_id, record in observations.items():
+                    modalities = record["modalities"]
+                    instance = modalities.get(
+                        "seg_instance_id", modalities.get("seg_instance")
+                    )
+                    if instance is None:
+                        raise SampleRejected(
+                            "intervention_visibility_preflight_missing_instance",
+                            {"robot_id": robot_id, "frame_index": int(frame_index)},
+                        )
+                    sparse_instance_views[robot_id]["instance"].append(
+                        np.asarray(instance).squeeze()
+                    )
+        finally:
+            adapter.place_robots_at_trajectory_frame(trajectories, 0)
+        visibility = _sparse_intervention_visibility_preflight(
+            catalog,
+            {
+                robot_id: {"instance": np.stack(values["instance"], axis=0)}
+                for robot_id, values in sparse_instance_views.items()
+            },
+            config,
+            sampled_frame_count=len(keyframe_indices),
+            full_frame_count=frame_count,
+        )
+        metrics["intervention_visibility_preflight"] = visibility
+        if not visibility["passed"]:
+            raise SampleRejected(
+                "no_visible_intervention_target_preflight", visibility
+            )
     return metrics
 def _robot_states(
     config: dict[str, Any],
@@ -474,6 +516,89 @@ def _intervention_visibility_table(
     return {
         "requirements": dict(requirements),
         "eligible_target_ids": [instance_id for _, instance_id in eligible],
+        "objects": table,
+    }
+
+
+def _sparse_intervention_visibility_preflight(
+    catalog: tuple[ObjectState, ...],
+    robot_views: dict[str, dict[str, np.ndarray]],
+    config: dict[str, Any],
+    *,
+    sampled_frame_count: int,
+    full_frame_count: int,
+) -> dict[str, Any]:
+    """Cheaply reject routes with no visible schema-eligible intervention target."""
+    requirements = config["intervention"]["target_visibility"]
+    minimum_pixels = int(requirements["minimum_pixels"])
+    minimum_robots = int(requirements["minimum_robots"])
+    minimum_frames = max(
+        1,
+        int(np.ceil(
+            int(requirements["minimum_frames"])
+            * sampled_frame_count
+            / max(1, full_frame_count)
+        )),
+    )
+    eligible_types: dict[str, list[str]] = {}
+    for intervention_type in InterventionType:
+        for obj in eligible_intervention_targets(catalog, intervention_type):
+            eligible_types.setdefault(obj.instance_id, []).append(
+                intervention_type.value
+            )
+    table: dict[str, Any] = {}
+    accepted_ids: list[str] = []
+    for public_id, obj in enumerate(
+        sorted(catalog, key=lambda item: item.instance_id), start=4
+    ):
+        if obj.instance_id not in eligible_types:
+            continue
+        per_robot: dict[str, Any] = {}
+        total_frames = 0
+        participating = 0
+        peak_pixels = 0
+        for robot_id, modalities in sorted(robot_views.items()):
+            masks = np.asarray(modalities["instance"]) == public_id
+            counts = masks.reshape(masks.shape[0], -1).sum(axis=1)
+            qualifying = int(np.count_nonzero(counts >= minimum_pixels))
+            maximum = int(counts.max(initial=0))
+            per_robot[robot_id] = {
+                "qualifying_frame_count": qualifying,
+                "maximum_pixels": maximum,
+            }
+            total_frames += qualifying
+            participating += int(qualifying > 0)
+            peak_pixels = max(peak_pixels, maximum)
+        accepted = (
+            total_frames >= minimum_frames
+            and participating >= minimum_robots
+        )
+        table[obj.instance_id] = {
+            "public_instance_id": public_id,
+            "category": obj.category,
+            "eligible_intervention_types": eligible_types[obj.instance_id],
+            "qualifying_frame_count": total_frames,
+            "participating_robot_count": participating,
+            "maximum_pixels": peak_pixels,
+            "per_robot": per_robot,
+            "accepted": accepted,
+        }
+        if accepted:
+            accepted_ids.append(obj.instance_id)
+    minimum_candidates = int(
+        config["navigation"]["minimum_visible_intervention_candidates"]
+    )
+    return {
+        "passed": len(accepted_ids) >= minimum_candidates,
+        "sampled_frame_count": sampled_frame_count,
+        "full_frame_count": full_frame_count,
+        "requirements": {
+            "minimum_pixels": minimum_pixels,
+            "minimum_sparse_frames": minimum_frames,
+            "minimum_robots": minimum_robots,
+            "minimum_visible_intervention_candidates": minimum_candidates,
+        },
+        "eligible_target_ids": accepted_ids,
         "objects": table,
     }
 
@@ -817,6 +942,12 @@ def generate_dataset(
                                 for catalog in accepted_catalogs
                             ):
                                 raise SampleRejected("near_duplicate_configuration")
+                            adapter.prepare_navigation_context(
+                                str(candidate["exact_state_hash"]),
+                                stable_seed(seed, "configuration-navigation-context"),
+                                force=True,
+                            )
+                            navigation_metadata = adapter.navigation_context_metadata()
                             environment_arrays, _ = _render_environment_floors(adapter, config)
                             world_state = WorldState(
                                 scene_id=selected_scene,
@@ -886,6 +1017,7 @@ def generate_dataset(
                                         )
                                         if key in candidate
                                     },
+                                    "navigation_context_ref": "navigation_context.json",
                                 },
                             )
                             writer.write_configuration(
@@ -893,6 +1025,10 @@ def generate_dataset(
                                 candidate["catalog"],
                                 snapshot=candidate["snapshot"],
                                 environment_bev=environment_arrays,
+                            )
+                            dump_json(
+                                configuration_root / "navigation_context.json",
+                                navigation_metadata,
                             )
                             accepted = candidate
                             accepted_catalogs.append(candidate["catalog"])
@@ -912,6 +1048,32 @@ def generate_dataset(
                         )
                 snapshot_path = configuration_root / "simulator_state.npy"
                 configuration_snapshot = np.load(snapshot_path, allow_pickle=False)
+                configuration_metadata = json.loads(
+                    (configuration_root / "config_meta.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                configuration_token = str(
+                    configuration_metadata["exact_state_hash"]
+                )
+                adapter.load_snapshot(configuration_snapshot)
+                adapter.prepare_navigation_context(
+                    configuration_token,
+                    stable_seed(
+                        int(config["seed"]),
+                        selected_scene,
+                        configuration_id,
+                        "configuration-navigation-context",
+                    ),
+                )
+                navigation_metadata_path = (
+                    configuration_root / "navigation_context.json"
+                )
+                if not navigation_metadata_path.is_file():
+                    dump_json(
+                        navigation_metadata_path,
+                        adapter.navigation_context_metadata(),
+                    )
                 existing_episodes = set(
                     writer.completed_episode_ids(selected_scene, configuration_id)
                 )
@@ -958,15 +1120,13 @@ def generate_dataset(
                         )
                         adapter.load_snapshot(configuration_snapshot)
                         try:
-                            heights = adapter.place_development_robots(
-                                stable_seed(episode_seed, "placement", placement_attempt),
-                                discouraged_region_ids=tuple(sorted(used_regions)),
-                            )
-                            base_trajectory_candidates = adapter.sample_robot_trajectory_sets(
-                                stable_seed(episode_seed, "trajectory", placement_attempt)
+                            heights, base_trajectory_candidates = (
+                                adapter.sample_route_first_trajectory_sets(
+                                    stable_seed(episode_seed, "route-first", placement_attempt),
+                                    discouraged_region_ids=tuple(sorted(used_regions)),
+                                )
                             )
                             trajectory_candidates = list(base_trajectory_candidates)
-                            base_candidate_count = len(trajectory_candidates)
                             candidate_failures: list[dict[str, Any]] = []
                             candidate_rank = 0
                             while candidate_rank < len(trajectory_candidates):
@@ -978,8 +1138,14 @@ def generate_dataset(
                                         candidate_trajectories, 0
                                     )
                                     candidate_graph, _ = _initial_overlap(adapter, config)
+                                    candidate_catalog = (
+                                        adapter.object_catalog_with_relations()
+                                    )
                                     candidate_overlap = _temporal_overlap_preflight(
-                                        adapter, config, candidate_trajectories
+                                        adapter,
+                                        config,
+                                        candidate_trajectories,
+                                        catalog=candidate_catalog,
                                     )
                                     requested_regime = str(
                                         candidate_overlap["requested_regime"]
@@ -1002,7 +1168,6 @@ def generate_dataset(
                                     candidate_metrics["temporal_preflight_candidate_rank"] = (
                                         candidate_rank
                                     )
-                                    candidate_catalog = adapter.object_catalog_with_relations()
                                     candidate_calibration = adapter.calibrated_floor_bounds(
                                         int(candidate_metrics["floor_index"]),
                                         float(config["bev"]["world_meters_per_pixel"]),
@@ -1057,23 +1222,6 @@ def generate_dataset(
                                         },
                                     })
                                     candidate_rank += 1
-                                    if candidate_rank == base_candidate_count:
-                                        trajectory_candidates.extend(
-                                            adapter.measured_overlap_bridge_trajectories(
-                                                base_trajectory_candidates,
-                                                candidate_failures,
-                                                stable_seed(
-                                                    episode_seed, "measured-overlap-bridge",
-                                                    placement_attempt,
-                                                ),
-                                            )
-                                        )
-                                        trajectory_candidates.extend(
-                                            adapter.complementary_trajectory_hybrids(
-                                                base_trajectory_candidates,
-                                                candidate_failures,
-                                            )
-                                        )
                             if before is None:
                                 raise SampleRejected(
                                     "trajectory_set_candidates_exhausted",

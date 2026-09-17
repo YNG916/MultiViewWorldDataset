@@ -47,43 +47,14 @@ bev:
 
 placement:
   minimum_pairwise_distance_m: 0.6
-  # Regime-aware start-only spacing; the hard per-frame minimum remains 0.6 m.
-  # These are lower bounds only and never impose a maximum cluster radius.
-  regime_trajectory_separation_headroom_m:
-    dense_shared: 0.30
-    partial_chain: 0.50
-    exploratory: 0.90
-  maximum_attempts: 200
-  region_adjacency_distance_m: 0.5
+  # Bounded exact-validation batches selected from a configuration RouteBank.
+  maximum_attempts: 4
   # Reject OG traversability pixels with no physical room-floor support. The
   # small tolerance only absorbs map/AABB discretization at doorway seams.
   floor_support_aabb_tolerance_m: 0.05
-  # Use the same footprint expansion for starts and paths. Applying a larger
-  # second start-only expansion can erase every feasible 3-robot placement in
-  # furnished rooms even though the path map and exact contact QA are safe.
-  dynamic_object_start_clearance_m: 0.45
-  # AABBs already include each object's body; add the robot half-width plus
-  # margin for paths. Execution still performs exact contact validation.
-  dynamic_object_path_clearance_m: 0.45
   dynamic_object_path_obstacle_height_m: 0.65
-  # Validate an exit over the same spatial scale as a valid trajectory. A
-  # sub-metre ray can point into a pocket that has no usable 1--3 m route and
-  # makes the expensive geodesic candidate pool fail repeatedly.
-  initial_heading_probe_min_m: 1.0
-  initial_heading_probe_max_m: 3.0
-  # Resolution for searching a scene direction compatible with every robot's
-  # individually traversable local exit.
-  heading_consensus_search_step_deg: 5.0
   sibling_region_reuse_penalty: 1.0
-  spatial_soft_probability_floor: 0.05
-  regime_spatial_soft_scale_m:
-    dense_shared: 1.75
-    partial_chain: 2.25
-    exploratory: null
-  # Dense and partial-chain starts share a desired scene direction. Each guide
-  # follows the closest robot-eroded local exit within the trajectory heading
-  # tolerance, so obstacles may induce different paths without lateral sliding.
-  lane_guide_distance_m: 2.0
+  # Targets for measured overlap labels, never placement or heading gates.
   observation_regime_weights:
     dense_shared: 0.30
     partial_chain: 0.50
@@ -92,6 +63,36 @@ placement:
     minimum_mean_heading_difference_deg: 8.0
     maximum_mean_path_similarity: 0.96
     minimum_spatial_coverage_m2: 1.0
+
+navigation:
+  footprint_yaw_bins: 32
+  footprint_safety_margin_m: 0.03
+  # Robot clearance is represented by the collision footprint, not a second
+  # large object-AABB expansion.
+  dynamic_obstacle_margin_m: 0.02
+  footprint_sampling_spacing_fraction: 0.5
+  footprint_physx_probe_count_per_category: 6
+  route_seed_minimum_yaw_fraction: 0.25
+  route_bank_target_size: 64
+  route_bank_minimum_size: 24
+  route_bank_max_raw_attempts: 1500
+  route_candidate_attempts_per_raw: 10
+  top_triplets_for_exact_validation: 12
+  joint_route_search_budget: 4096
+  # Reserve most exact-preflight slots for the strongest scene-aware overlap
+  # proxy candidates, while retaining a smaller combined diversity tranche.
+  joint_route_visibility_priority_fraction: 0.75
+  joint_route_visibility_score_weight: 4.0
+  sparse_physics_keyframes: [0, 10, 20, 30, 40, 50, 59]
+  cheap_visibility_keyframes: 7
+  cheap_visibility_ray_count: 121
+  cheap_visibility_max_range_m: 8.0
+  cheap_visibility_edge_threshold: 0.20
+  cheap_visibility_maximum_isolated_fraction: 0.85
+  require_connected_start_regions: true
+  start_blacklist_position_quantization_m: 0.05
+  start_blacklist_yaw_bins: 32
+  minimum_visible_intervention_candidates: 1
 
 configuration_sampling:
   movable_fraction: 0.15
