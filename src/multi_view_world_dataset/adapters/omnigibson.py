@@ -243,6 +243,10 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         self._development_bev_sensor: Any = None
         self._final_robot_capture_sensor: Any = None
         self._final_robot_fast_instance_annotator: Any = None
+        self._final_robot_renderer_label_cache: (
+            tuple[dict[str, str], dict[str, dict[str, str]]] | None
+        ) = None
+        self._public_label_catalog_cache: tuple[ObjectState, ...] | None = None
         self._syntheticdata_helpers: Any = None
         self._started = False
         self._runtime_findings: dict[str, Any] = {}
@@ -364,6 +368,8 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             self._og.clear()
         self._development_bev_sensor = None
         self._final_robot_capture_sensor = None
+        self._final_robot_renderer_label_cache = None
+        self._public_label_catalog_cache = None
         self._development_camera_mounts.clear()
         self._relation_cache = None
         self._canonical_floor_bounds.clear()
@@ -3710,7 +3716,17 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
     def _final_robot_renderer_labels(
         self,
     ) -> tuple[dict[str, str], dict[str, dict[str, str]]]:
-        """Map leaf renderer IDs to semantic parent paths and classes."""
+        """Map leaf renderer IDs to semantic parent paths and classes once per graph."""
+        if self._final_robot_renderer_label_cache is not None:
+            cache_hits = int(
+                self._runtime_findings.get(
+                    "final_robot_renderer_mapping_cache_hits", 0
+                )
+            )
+            self._runtime_findings["final_robot_renderer_mapping_cache_hits"] = (
+                cache_hits + 1
+            )
+            return self._final_robot_renderer_label_cache
         if self._syntheticdata_helpers is None:
             raise SimulatorUnavailableError(
                 "omni.syntheticdata helpers are unavailable"
@@ -3745,7 +3761,8 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             "renderer_id_count": len(id_to_path),
             "source": "omni.syntheticdata.helpers.get_instance_mappings",
         }
-        return id_to_path, id_to_semantic
+        self._final_robot_renderer_label_cache = (id_to_path, id_to_semantic)
+        return self._final_robot_renderer_label_cache
 
     def _final_robot_segmentation_observation(
         self, camera: Any
@@ -3818,7 +3835,11 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         renderer_info = info.get("seg_instance_id", info.get("seg_instance", {}))
         if instance is None or not isinstance(renderer_info, dict):
             return observation, info
-        catalog = self.object_catalog()
+        catalog = self._public_label_catalog_cache
+        if catalog is None:
+            catalog = self.object_catalog()
+            self._public_label_catalog_cache = catalog
+            self._runtime_findings["public_label_catalog_cache_size"] = len(catalog)
         robot_paths = {robot.name: str(robot.prim_path) for robot in self._env.robots}
         public_instance, public_semantic, mapping = remap_public_labels(
             self._native_value(instance), renderer_info, catalog, robot_paths
@@ -3923,6 +3944,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         camera = self._final_robot_capture_sensor
         if camera is None:
             return
+        self._final_robot_renderer_label_cache = None
         self._detach_final_robot_fast_instance_annotator(camera)
         camera.remove()
         self._final_robot_capture_sensor = None
@@ -4338,6 +4360,15 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             for _ in range(2):
                 self._og.sim.render()
             for frame_index in range(frames):
+                if (
+                    frame_index == 0
+                    or (frame_index + 1) % 10 == 0
+                    or frame_index == frames - 1
+                ):
+                    print(
+                        f"[mvwd] world BEV frame {frame_index + 1}/{frames}",
+                        flush=True,
+                    )
                 for robot_id, robot in robots.items():
                     planned = by_id[robot_id].base_to_world[frame_index]
                     position, orientation = self._transform_utils.mat2pose(
@@ -4602,6 +4633,15 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 "all_world_bev_frames_then_all_robot_view_frames"
             )
             for frame_index in range(frames):
+                if (
+                    frame_index == 0
+                    or (frame_index + 1) % 10 == 0
+                    or frame_index == frames - 1
+                ):
+                    print(
+                        f"[mvwd] ego frame {frame_index + 1}/{frames}",
+                        flush=True,
+                    )
                 for robot_id, robot in robots.items():
                     planned_base = by_id[robot_id].base_to_world[frame_index]
                     position, orientation = self._transform_utils.mat2pose(

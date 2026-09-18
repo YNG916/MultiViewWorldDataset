@@ -1,4 +1,5 @@
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -707,3 +708,67 @@ def test_single_robot_rescue_pool_reuses_validated_geodesic_sampler():
     assert np.array_equal(first.base_to_world, second.base_to_world)
     assert first.base_to_world[-1, 1, 3] == pytest.approx(1.0)
     assert trajectory_kinematic_metrics(first)["maximum_linear_speed_mps"] <= 0.8
+
+
+def test_final_robot_renderer_labels_cache_static_scene_mapping():
+    adapter = object.__new__(OmniGibsonAdapter)
+
+    class Helpers:
+        def __init__(self):
+            self.calls = 0
+
+        def get_instance_mappings(self):
+            self.calls += 1
+            return [
+                {
+                    "name": "/World/chair/mesh",
+                    "semanticLabel": "chair",
+                    "instanceIds": [17],
+                }
+            ]
+
+    helpers = Helpers()
+    adapter._syntheticdata_helpers = helpers
+    adapter._runtime_findings = {}
+    adapter._final_robot_renderer_label_cache = None
+
+    first = adapter._final_robot_renderer_labels()
+    second = adapter._final_robot_renderer_labels()
+
+    assert first is second
+    assert helpers.calls == 1
+    assert first[0]["17"] == "/World/chair/mesh"
+    assert adapter._runtime_findings["final_robot_renderer_mapping_cache_hits"] == 1
+
+
+def test_public_label_catalog_cache_uses_static_identity_only_once():
+    adapter = object.__new__(OmniGibsonAdapter)
+    catalog = (
+        SimpleNamespace(
+            instance_id="chair-state-id",
+            native_path="/World/chair",
+            category="chair",
+        ),
+    )
+    catalog_calls = {"count": 0}
+
+    def object_catalog():
+        catalog_calls["count"] += 1
+        return catalog
+
+    adapter.object_catalog = object_catalog
+    adapter._public_label_catalog_cache = None
+    adapter._runtime_findings = {}
+    adapter._env = SimpleNamespace(
+        robots=[SimpleNamespace(name="robot_00", prim_path="/World/robot_00")]
+    )
+    for _ in range(2):
+        observation = {
+            "seg_instance_id": np.asarray([[0, 4], [4, 0]], dtype=np.uint32)
+        }
+        info = {"seg_instance_id": {"0": "BACKGROUND", "4": "/World/chair/mesh"}}
+        public, _ = adapter._publicize_observation_labels(observation, info)
+        assert int(public["seg_instance_id"][0, 1]) == 4
+
+    assert catalog_calls["count"] == 1
+    assert adapter._runtime_findings["public_label_catalog_cache_size"] == 1
