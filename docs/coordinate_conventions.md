@@ -27,3 +27,9 @@ of pixels; no scene is resized to a fixed pixel shape. Each floor has independen
 
 Generation must abort if inverse/composition, camera round-trip, depth backprojection, or BEV round-trip checks fail.
 
+Navigation yaw is mathematical world yaw, `atan2(+Y,+X)`, discretized into
+`footprint_yaw_bins`. The adapter calibrates each raster neighbor direction
+through the installed traversability map's `map_to_world`; it does not assume
+that raster row direction equals world +Y. A rotation action validates every
+intermediate yaw bin at a fixed map cell. Stored moving poses use the forward
+path tangent; stored stop-and-turn poses repeat XY while yaw changes.

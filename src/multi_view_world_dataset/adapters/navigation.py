@@ -21,9 +21,16 @@ from multi_view_world_dataset.sampling.navigation import (
     sample_footprint_interior,
     select_joint_route_candidates,
 )
+from multi_view_world_dataset.sampling.se2 import (
+    SE2GridPlan,
+    plan_se2_waypoints,
+    se2_plan_is_safe,
+)
 from multi_view_world_dataset.sampling.trajectories import (
-    sample_geodesic_robot_trajectory_pool,
+    _normalised_family_distribution,
+    _sample_route_controls,
     densify_polyline,
+    trajectory_from_se2_poses,
     trajectory_from_spatial_path,
 )
 from multi_view_world_dataset.schema.records import Trajectory
@@ -130,6 +137,138 @@ def _map_points(adapter: Any, points_xy: np.ndarray) -> np.ndarray:
     return adapter._world_to_map_preserving_batch(
         adapter._require_scene().trav_map, np.asarray(points_xy, dtype=np.float64)
     )
+
+
+def _calibrated_heading_primitives(
+    adapter: Any, yaw_bins: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Calibrate global mathematical yaw against the installed map axes."""
+    cache = getattr(adapter, "_se2_heading_steps_cache", None)
+    if cache is None:
+        cache = {}
+        adapter._se2_heading_steps_cache = cache
+    scene_key = (str(getattr(adapter, "_scene_id", "")), int(yaw_bins))
+    if scene_key in cache:
+        return cache[scene_key]
+    trav_map = adapter._require_scene().trav_map
+    shape = np.asarray(trav_map.floor_map[0].shape, dtype=np.int64)
+    center = shape // 2
+    deltas = np.asarray([
+        [-1, -1], [-1, 0], [-1, 1], [0, -1],
+        [0, 1], [1, -1], [1, 0], [1, 1],
+    ], dtype=np.int64)
+    pixels = np.vstack((center, center[None, :] + deltas))
+    world = adapter._native_value(
+        trav_map.map_to_world(adapter._th.as_tensor(pixels, dtype=adapter._th.int64))
+    ).astype(np.float64)
+    directions = world[1:, :2] - world[0, :2]
+    angles = np.arctan2(directions[:, 1], directions[:, 0])
+    desired = 2.0 * np.pi * np.arange(yaw_bins, dtype=np.float64) / yaw_bins
+    difference = np.abs(
+        (desired[:, None] - angles[None, :] + np.pi) % (2.0 * np.pi) - np.pi
+    )
+    best = np.argmin(difference, axis=1)
+    calibrated = deltas[best]
+    # With 32 footprint bins and an 8-neighbor raster, only eight orientations
+    # have a forward primitive. Intermediate bins remain essential for swept
+    # collision checking during stop-and-turn actions, but allowing them to
+    # translate would introduce up to 22.5 degrees of lateral slip.
+    forward_enabled = difference[np.arange(yaw_bins), best] <= 1.0e-7
+    cache[scene_key] = (calibrated, forward_enabled)
+    return cache[scene_key]
+
+
+def _se2_route_candidate(
+    adapter: Any,
+    safe_masks: np.ndarray,
+    controls_xy: np.ndarray,
+    *,
+    robot_id: str,
+    floor_z: float,
+    camera_mount: np.ndarray,
+    path_family: str,
+) -> tuple[Trajectory, SE2GridPlan] | None:
+    """Plan and time-parameterize all control segments in true SE(2)."""
+    navigation = adapter.config["navigation"]
+    trajectory_config = adapter.config["trajectory"]
+    cells = _map_points(adapter, controls_xy)
+    heading_steps, forward_enabled = _calibrated_heading_primitives(
+        adapter, len(safe_masks)
+    )
+    plan = plan_se2_waypoints(
+        safe_masks,
+        cells,
+        heading_steps=heading_steps,
+        forward_enabled_by_yaw=forward_enabled,
+        rotation_cost_cells=float(navigation["se2_rotation_cost_cells"]),
+        yaw_freedom_penalty=float(navigation["yaw_freedom_ranking_weight"]),
+        maximum_expansions=int(navigation["se2_maximum_expansions"]),
+    )
+    if plan is None or not se2_plan_is_safe(plan, safe_masks):
+        return None
+    state_pixels = np.asarray(
+        [[state.row, state.column] for state in plan.states], dtype=np.int64
+    )
+    world_xy = adapter._native_value(
+        adapter._require_scene().trav_map.map_to_world(
+            adapter._th.as_tensor(state_pixels, dtype=adapter._th.int64)
+        )
+    ).astype(np.float64)
+    yaws = 2.0 * np.pi * np.asarray(
+        [state.yaw_index for state in plan.states], dtype=np.float64
+    ) / len(safe_masks)
+    # Unwrap adjacent one-bin rotations while leaving translations unchanged.
+    yaws = np.unwrap(yaws)
+    poses = np.column_stack((world_xy[:, :2], yaws))
+    try:
+        trajectory = trajectory_from_se2_poses(
+            robot_id,
+            poses,
+            floor_z,
+            camera_mount,
+            frames=int(adapter.config["dataset"]["frames"]),
+            fps=float(adapter.config["dataset"]["fps"]),
+            maximum_linear_speed_mps=float(
+                trajectory_config["maximum_linear_speed_mps"]
+            ),
+            maximum_angular_speed_radps=float(
+                trajectory_config["maximum_angular_speed_radps"]
+            ),
+            maximum_acceleration_mps2=float(
+                trajectory_config["maximum_acceleration_mps2"]
+            ),
+            path_family=path_family,
+            control_waypoints_xy=controls_xy,
+            planner_path_xy=world_xy[:, :2],
+            metadata={
+                "planner": "project_se2_orientation_lattice",
+                "se2_expanded_state_count": plan.expanded_state_count,
+                "se2_rotation_angle_rad": plan.rotation_angle_rad,
+                "se2_contains_stationary_turn": plan.contains_stationary_turn,
+                "planner_geodesic_length_m": plan.translation_length_cells
+                * float(adapter._require_scene().trav_map.map_resolution),
+            },
+        )
+    except ValueError:
+        return None
+    # Revalidate every physical output frame against its exact orientation bin.
+    frame_cells = _map_points(adapter, trajectory.base_to_world[:, :2, 3])
+    frame_yaws = np.arctan2(
+        trajectory.base_to_world[:, 1, 0], trajectory.base_to_world[:, 0, 0]
+    )
+    bins = np.rint(
+        (frame_yaws % (2.0 * np.pi)) * len(safe_masks) / (2.0 * np.pi)
+    ).astype(np.int64) % len(safe_masks)
+    height, width = safe_masks.shape[1:]
+    inside = (
+        (frame_cells[:, 0] >= 0) & (frame_cells[:, 0] < height)
+        & (frame_cells[:, 1] >= 0) & (frame_cells[:, 1] < width)
+    )
+    if not np.all(inside) or not np.all(
+        safe_masks[bins, frame_cells[:, 0], frame_cells[:, 1]]
+    ):
+        return None
+    return trajectory, plan
 
 
 def _path_validator(adapter: Any, context_masks: np.ndarray):
@@ -300,8 +439,9 @@ def _cheap_visibility_metrics(
     keyframe and no individual pair is required to overlap throughout.  The
     union graph must connect all robots, every robot must participate in at
     least one edge, and no robot may remain isolated for almost the entire
-    route.  Failed combinations receive a non-finite score so the bounded
-    selector excludes them before PhysX or rendering.
+    route. Failed combinations retain a finite, penalized score: if no proxy
+    candidate passes, the physically best Top-K still reaches exact GT-depth
+    preflight instead of turning an approximate proxy into a hard gate.
     """
     route_indices = {route.route_id: index for index, route in enumerate(routes)}
     indices = [route_indices[route.route_id] for route in selected]
@@ -310,7 +450,7 @@ def _cheap_visibility_metrics(
     if robot_count < 2 or frame_count == 0:
         return {
             "passed": False,
-            "score": float("-inf"),
+            "score": -1.0e6,
             "failure_reason": "empty_visibility_proxy",
             "keyframe_count": frame_count,
         }
@@ -396,7 +536,8 @@ def _cheap_visibility_metrics(
         + 1.5 * minimum_participation_fraction
         + 0.5 * useful_overlap
         - worst_isolated_fraction
-    ) if passed else float("-inf")
+        - (0.0 if passed else 2.0)
+    )
     failure_reasons = []
     if not union_connected:
         failure_reasons.append("union_graph_disconnected")
@@ -430,7 +571,7 @@ def _cheap_visibility_score_from_pairwise(
     edge_threshold: float,
     maximum_isolated_fraction: float,
 ) -> float:
-    # Fast hard-gate / score over precomputed route-pair overlap values.
+    # Fast soft score over precomputed route-pair overlap values.
     robot_count = len(selected_indices)
     frame_count = (
         int(overlap_by_keyframe.shape[2])
@@ -438,7 +579,7 @@ def _cheap_visibility_score_from_pairwise(
         else 0
     )
     if robot_count < 2 or frame_count == 0:
-        return float("-inf")
+        return -1.0e6
     index = np.asarray(selected_indices, dtype=np.int64)
     pairwise = overlap_by_keyframe[index[:, None], index[None, :], :]
     identity = np.eye(robot_count, dtype=bool)
@@ -488,8 +629,6 @@ def _cheap_visibility_score_from_pairwise(
         and np.all(participates)
         and np.all(maximum_isolated_runs <= allowed_isolated)
     )
-    if not passed:
-        return float("-inf")
     mean_overlap = float(np.mean(pairwise[upper]))
     useful_overlap = min(mean_overlap / max(edge_threshold, 1e-9), 1.0)
     return float(
@@ -499,6 +638,7 @@ def _cheap_visibility_score_from_pairwise(
         + 1.5 * float(np.min(participation_counts)) / frame_count
         + 0.5 * useful_overlap
         - float(np.max(maximum_isolated_runs)) / frame_count
+        - (0.0 if passed else 2.0)
     )
 
 
@@ -576,20 +716,13 @@ def _build_floor_context(
     point_free = _point_free_mask(adapter, floor_index)
     offsets = _footprint_offsets(adapter, footprint, floor_index)
     safe_masks = oriented_safe_masks(point_free, offsets)
-    # A cell that admits only one arbitrary yaw is too fragile for an XY
-    # shortest-path proposal: the planner can cross it in a direction that the
-    # actual rectangular robot cannot assume. Keep the permissive union for
-    # diagnostics, but plan on cells with a configurable amount of yaw freedom.
-    # The final tangent-derived yaw is still densely checked against the exact
-    # orientation bin, so this improves proposals without relaxing collisions.
+    # Pose validity is defined by safe_masks[yaw,row,column]. The union is only
+    # a 2-D visualization / seed surface; yaw freedom is a soft A* ranking term
+    # and must never delete a genuinely feasible SE(2) pose.
     permissive_mask = np.any(safe_masks, axis=0)
     yaw_freedom = np.mean(safe_masks, axis=0)
-    seed_mask = permissive_mask & (
-        yaw_freedom >= float(navigation["route_seed_minimum_yaw_fraction"])
-    )
-    if np.count_nonzero(seed_mask) < 3:
-        seed_mask = permissive_mask.copy()
-    planner_mask = seed_mask.copy()
+    seed_mask = permissive_mask.copy()
+    planner_mask = permissive_mask.copy()
     component_labels, component_sizes = connected_components(planner_mask)
     pixels = np.argwhere(planner_mask)
     if not len(pixels):
@@ -603,8 +736,6 @@ def _build_floor_context(
     label_grid = np.full(planner_mask.shape, "", dtype=object)
     label_grid[pixels[:, 0], pixels[:, 1]] = world_labels
     region_graph, label_grid = build_region_graph(planner_mask, label_grid)
-    path_valid = _path_validator(adapter, safe_masks)
-    plan_segment = _planner(adapter, floor_index, planner_mask)
     rng = np.random.default_rng(seed)
     region_pixels = {
         region: np.argwhere(seed_mask & (label_grid == region))
@@ -618,6 +749,9 @@ def _build_floor_context(
     maximum_attempts = int(navigation["route_bank_max_raw_attempts"])
     attempts_per_raw = int(navigation["route_candidate_attempts_per_raw"])
     floor_z = float(scene.get_floor_height(floor_index))
+    families, family_probabilities = _normalised_family_distribution(
+        trajectory_config["path_family_weights"]
+    )
     for raw_attempt in range(maximum_attempts):
         if len(routes) >= target_size:
             break
@@ -646,60 +780,52 @@ def _build_floor_context(
         start_xy = adapter._native_value(
             trav_map.map_to_world(adapter._th.as_tensor(start_pixel, dtype=adapter._th.int64))
         ).astype(np.float64)
-        start = np.eye(4, dtype=np.float64)
-        start[:2, 3] = start_xy
-        start[2, 3] = floor_z
         route_seed = stable_seed(seed, "route", raw_attempt)
-        try:
-            pool = sample_geodesic_robot_trajectory_pool(
-                f"route_{raw_attempt:04d}",
-                start,
-                np.eye(4, dtype=np.float64),
+        route_rng = np.random.default_rng(route_seed)
+        trajectory = None
+        for _ in range(attempts_per_raw):
+            family = str(route_rng.choice(families, p=family_probabilities))
+            controls = _sample_route_controls(
+                start_xy,
+                0.0,
                 candidates,
-                floor_z,
-                np.random.default_rng(route_seed),
-                frames=int(adapter.config["dataset"]["frames"]),
-                fps=float(adapter.config["dataset"]["fps"]),
-                path_length_range_m=(
-                    float(trajectory_config["path_length_min_m"]),
-                    float(trajectory_config["path_length_max_m"]),
-                ),
-                maximum_linear_speed_mps=float(
-                    trajectory_config["maximum_linear_speed_mps"]
-                ),
-                maximum_angular_speed_radps=float(
-                    trajectory_config["maximum_angular_speed_radps"]
-                ),
-                maximum_acceleration_mps2=float(
-                    trajectory_config["maximum_acceleration_mps2"]
-                ),
-                plan_segment=plan_segment,
-                is_path_traversable=path_valid,
-                path_family_weights=trajectory_config["path_family_weights"],
-                initial_heading_tolerance_rad=np.pi,
-                derive_initial_heading_from_tangent=True,
+                family,
+                float(trajectory_config["path_length_min_m"]),
+                float(trajectory_config["path_length_max_m"]),
+                np.pi,
+                np.deg2rad(float(trajectory_config["maximum_control_turn_deg"])),
+                route_rng,
+                soft_initial_heading=True,
                 initial_heading_probability_floor=1.0,
-                maximum_control_turn_rad=np.deg2rad(
-                    float(trajectory_config["maximum_control_turn_deg"])
-                ),
-                line_validation_spacing_m=float(
-                    trajectory_config["line_validation_spacing_m"]
-                ),
-                smoothing_validation_spacing_m=float(
-                    trajectory_config["smoothing_validation_spacing_m"]
-                ),
-                smoothing_strengths=trajectory_config["smoothing_strengths"],
-                candidate_pool_size=1,
-                maximum_attempts=attempts_per_raw,
             )
-        except SampleRejected as error:
-            reject_counts[error.reason] += 1
-            for nested_reason, count in error.details.get(
-                "rejection_counts", {}
-            ).items():
-                reject_counts[f"{error.reason}:{nested_reason}"] += int(count)
+            if controls is None:
+                reject_counts["se2_no_control_candidates"] += 1
+                continue
+            result = _se2_route_candidate(
+                adapter,
+                safe_masks,
+                controls,
+                robot_id=f"route_{raw_attempt:04d}",
+                floor_z=floor_z,
+                camera_mount=np.eye(4, dtype=np.float64),
+                path_family=family,
+            )
+            if result is None:
+                reject_counts["se2_plan_or_time_parameterization"] += 1
+                continue
+            candidate, _ = result
+            arc_length = float(candidate.metadata["smoothed_arc_length_m"])
+            if not (
+                float(trajectory_config["path_length_min_m"])
+                <= arc_length
+                <= float(trajectory_config["path_length_max_m"])
+            ):
+                reject_counts["se2_arc_length"] += 1
+                continue
+            trajectory = candidate
+            break
+        if trajectory is None:
             continue
-        trajectory = pool[0]
         goal_pixel = _map_points(adapter, trajectory.base_to_world[-1:, :2, 3])[0]
         signature = (
             int(start_pixel[0]), int(start_pixel[1]), int(goal_pixel[0]), int(goal_pixel[1])
@@ -723,62 +849,6 @@ def _build_floor_context(
         )
         routes.append(route)
         route_counts_by_start[route.start_region] += 1
-        # The opposite traversal direction is a distinct, useful route and is
-        # almost free to propose. Recompute tangent yaw and revalidate it because
-        # the final robot footprint is not assumed to be 180-degree symmetric.
-        if len(routes) < target_size:
-            reverse_id = f"route_{len(routes):04d}"
-            reverse_path = trajectory.smoothed_path_xy[::-1].copy()
-            reverse_trajectory = trajectory_from_spatial_path(
-                reverse_id,
-                reverse_path,
-                floor_z,
-                np.eye(4, dtype=np.float64),
-                frames=int(adapter.config["dataset"]["frames"]),
-                fps=float(adapter.config["dataset"]["fps"]),
-                path_family=trajectory.path_family,
-                control_waypoints_xy=trajectory.control_waypoints_xy[::-1].copy(),
-                planner_path_xy=trajectory.planner_path_xy[::-1].copy(),
-                simplified_path_xy=trajectory.simplified_path_xy[::-1].copy(),
-                smoothed_path_xy=reverse_path,
-                metadata={
-                    **trajectory.metadata,
-                    "route_variant": "time_reverse",
-                },
-            )
-            reverse_start_pixel = goal_pixel
-            reverse_goal_pixel = start_pixel
-            reverse_signature = (
-                int(reverse_start_pixel[0]), int(reverse_start_pixel[1]),
-                int(reverse_goal_pixel[0]), int(reverse_goal_pixel[1]),
-            )
-            if (
-                reverse_signature not in signatures
-                and path_valid(densify_polyline(
-                    reverse_trajectory.base_to_world[:, :2, 3],
-                    float(trajectory_config["smoothing_validation_spacing_m"]),
-                ))
-            ):
-                signatures.add(reverse_signature)
-                reverse_route = route_candidate_from_trajectory(
-                    reverse_id,
-                    floor_index,
-                    reverse_trajectory,
-                    stable_seed(route_seed, "time-reverse"),
-                    lambda points: _region_labels_for_points(
-                        adapter, label_grid, points
-                    ),
-                    minimum_footprint_clearance_m=_minimum_route_footprint_clearance_m(
-                        adapter,
-                        safe_masks,
-                        reverse_trajectory,
-                        float(navigation["footprint_safety_margin_m"]),
-                    ),
-                )
-                routes.append(reverse_route)
-                route_counts_by_start[reverse_route.start_region] += 1
-            else:
-                reject_counts["reverse_variant_invalid"] += 1
     compatibility = compute_pairwise_route_compatibility(
         routes,
         minimum_pairwise_distance_m=float(
@@ -845,7 +915,7 @@ def build_navigation_contexts(
     footprint = _robot_footprint(adapter)
     contexts: dict[int, NavigationContext] = {}
     failures: dict[int, dict[str, Any]] = {}
-    minimum_routes = int(adapter.config["navigation"]["route_bank_minimum_size"])
+    route_count_target = int(adapter.config["navigation"]["route_bank_target_size"])
     for floor_index in range(int(adapter._require_scene().n_floors)):
         try:
             context = _build_floor_context(
@@ -854,25 +924,17 @@ def build_navigation_contexts(
                 floor_index,
                 stable_seed(seed, "navigation-floor", floor_index),
             )
-            if len(context.route_bank) < minimum_routes:
-                raise SampleRejected(
-                    "navigation_route_bank_too_small",
-                    {
-                        "floor_index": floor_index,
-                        "accepted_routes": len(context.route_bank),
-                        "required_routes": minimum_routes,
-                        **context.diagnostics,
-                    },
-                )
+            context.diagnostics["route_count_target"] = route_count_target
+            context.diagnostics["route_count_target_met"] = bool(
+                len(context.route_bank) >= route_count_target
+            )
             probe = select_joint_route_candidates(
                 context.route_bank,
                 context.compatibility,
                 np.random.default_rng(stable_seed(seed, "joint-feasibility", floor_index)),
                 top_k=1,
                 search_budget=int(adapter.config["navigation"]["joint_route_search_budget"]),
-                minimum_waypoint_trajectories=int(
-                    adapter.config["trajectory"]["minimum_waypoint_trajectories"]
-                ),
+                minimum_waypoint_trajectories=0,
                 region_graph=(
                     context.region_graph
                     if adapter.config["navigation"][
@@ -1001,11 +1063,7 @@ def _sparse_physics_preflight(
 ) -> None:
     by_id = {trajectory.robot_id: trajectory for trajectory in trajectories}
     robots = {robot.name: robot for robot in adapter._env.robots}
-    floors = [
-        obj
-        for obj in adapter._require_scene().objects
-        if str(getattr(obj, "category", "")) == "floors"
-    ]
+    floors = adapter._robot_support_surfaces()
     configured = adapter.config["navigation"]["sparse_physics_keyframes"]
     frames = trajectories[0].frames
     keyframes = sorted({min(frames - 1, int(frame)) for frame in configured})
@@ -1053,10 +1111,7 @@ def footprint_physx_diagnostic(
     context = adapter._navigation_contexts[floor_index]
     robots = sorted(adapter._env.robots, key=lambda robot: robot.name)
     robot = robots[0]
-    floors = [
-        obj for obj in adapter._require_scene().objects
-        if str(getattr(obj, "category", "")) == "floors"
-    ]
+    floors = adapter._robot_support_surfaces()
     saved_poses = [adapter._pose_matrix(item) for item in robots]
     peer_xy = np.asarray([pose[:2, 3] for pose in saved_poses[1:]])
     peer_exclusion_radius_m = (
@@ -1072,17 +1127,51 @@ def footprint_physx_diagnostic(
                  max(0, -column_delta): free.shape[1] - max(0, column_delta)]
         )
     yaw_bins = len(context.footprint_safe_masks)
+    any_yaw = np.any(context.footprint_safe_masks, axis=0)
+    yaw_freedom = np.mean(context.footprint_safe_masks, axis=0)
+    boundary = free & ~any_yaw
+    # Separate movable-furniture proximity from static wall proximity using
+    # the same current-state AABBs used to construct the point map.
+    all_pixels = np.indices(free.shape).reshape(2, -1).T
+    world_grid = adapter._native_value(
+        adapter._require_scene().trav_map.map_to_world(
+            adapter._th.as_tensor(all_pixels, dtype=adapter._th.int64)
+        )
+    ).astype(np.float64)
+    furniture_near = np.zeros(len(all_pixels), dtype=bool)
+    radius = context.footprint.circumscribed_radius_m
+    for obj in adapter.object_catalog():
+        if obj.structural:
+            continue
+        low = np.asarray(obj.bbox_min_world[:2], dtype=np.float64) - radius
+        high = np.asarray(obj.bbox_max_world[:2], dtype=np.float64) + radius
+        furniture_near |= np.all(
+            (world_grid[:, :2] >= low) & (world_grid[:, :2] <= high), axis=1
+        )
+    furniture_near = furniture_near.reshape(free.shape)
+    blocked_neighbors = np.zeros(free.shape, dtype=np.int64)
+    for row_delta, column_delta in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        shifted = np.zeros_like(free)
+        shifted[max(0, row_delta): free.shape[0] + min(0, row_delta),
+                max(0, column_delta): free.shape[1] + min(0, column_delta)] = (
+            ~free[max(0, -row_delta): free.shape[0] - max(0, row_delta),
+                  max(0, -column_delta): free.shape[1] - max(0, column_delta)]
+        )
+        blocked_neighbors += shifted
+    connector = np.isin(
+        context.region_label_grid,
+        np.asarray(context.region_graph.connector_nodes, dtype=object),
+    )
+    category_masks = {
+        "open": np.broadcast_to(np.all(context.footprint_safe_masks, axis=0), context.footprint_safe_masks.shape),
+        "wall": np.broadcast_to(boundary & ~furniture_near, context.footprint_safe_masks.shape),
+        "furniture": np.broadcast_to(boundary & furniture_near, context.footprint_safe_masks.shape),
+        "corridor": np.broadcast_to(any_yaw & (yaw_freedom <= 0.50), context.footprint_safe_masks.shape),
+        "door": np.broadcast_to(any_yaw & connector, context.footprint_safe_masks.shape),
+        "corner": np.broadcast_to(boundary & (blocked_neighbors >= 2), context.footprint_safe_masks.shape),
+    }
     triples: dict[str, np.ndarray] = {
-        "open": np.argwhere(context.footprint_safe_masks),
-        "boundary": np.argwhere(
-            (~context.footprint_safe_masks)
-            & free[None, :, :]
-            & near_free[None, :, :]
-        ),
-        "blocked": np.column_stack((
-            np.zeros(np.count_nonzero((~free) & near_free), dtype=np.int64),
-            np.argwhere((~free) & near_free),
-        )),
+        name: np.argwhere(mask) for name, mask in category_masks.items()
     }
     rng = np.random.default_rng(seed)
     requested = int(
@@ -1218,9 +1307,7 @@ def sample_route_first_trajectory_sets(
             adapter.config["navigation"]["joint_route_visibility_score_weight"]
         ),
         search_budget=int(adapter.config["navigation"]["joint_route_search_budget"]),
-        minimum_waypoint_trajectories=int(
-            adapter.config["trajectory"]["minimum_waypoint_trajectories"]
-        ),
+        minimum_waypoint_trajectories=0,
         discouraged_regions=discouraged_region_ids,
         region_graph=(
             context.region_graph
@@ -1326,6 +1413,24 @@ def sample_route_first_trajectory_sets(
                 "assignment_indices": list(assignment),
             },
         }
+        family_counts = Counter(
+            route.trajectory.path_family for route in selected_routes
+        )
+        metrics["route_family_diversity"] = {
+            "counts": dict(family_counts),
+            "unique_family_count": len(family_counts),
+            "waypoint_route_count": sum(
+                route.trajectory.path_family != "direct"
+                for route in selected_routes
+            ),
+            "hard_minimum_enforced": False,
+        }
+        metrics["joint_route_search"]["cheap_proxy_passed"] = bool(
+            metrics["cheap_scene_visibility"].get("passed", False)
+        )
+        metrics["joint_route_search"]["proxy_fallback_to_exact_gt"] = bool(
+            not metrics["cheap_scene_visibility"].get("passed", False)
+        )
         accepted.append((trajectories, metrics))
     if not accepted:
         raise SampleRejected(

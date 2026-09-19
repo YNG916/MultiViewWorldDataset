@@ -65,6 +65,11 @@ placement:
     minimum_spatial_coverage_m2: 1.0
 
 navigation:
+  # Full sweeps isolate every scene in a fresh process. Retry infrastructure
+  # failures (for example Vulkan device loss), but never relabel them as scene
+  # infeasibility. The timeout is above the slowest observed healthy scene.
+  scene_worker_timeout_s: 3600
+  scene_worker_max_attempts: 2
   footprint_yaw_bins: 32
   footprint_safety_margin_m: 0.03
   # Robot clearance is represented by the collision footprint, not a second
@@ -72,8 +77,14 @@ navigation:
   dynamic_obstacle_margin_m: 0.02
   footprint_sampling_spacing_fraction: 0.5
   footprint_physx_probe_count_per_category: 6
+  # Deprecated diagnostic only; it is never a pose-validity gate.
   route_seed_minimum_yaw_fraction: 0.25
+  yaw_freedom_ranking_weight: 0.05
+  se2_rotation_cost_cells: 0.12
+  se2_maximum_expansions: 250000
   route_bank_target_size: 64
+  # Deprecated diagnostic target; floor feasibility is based on a valid
+  # compatible 3-route combination, not a universal bank-size threshold.
   route_bank_minimum_size: 24
   route_bank_max_raw_attempts: 1500
   route_candidate_attempts_per_raw: 10

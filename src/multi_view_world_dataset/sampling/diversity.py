@@ -368,8 +368,6 @@ def complementary_hybrid_trajectory_sets(
                     pools[source_index][0][robot_id]
                     for robot_id, source_index in zip(robot_ids, source_indices)
                 )
-                if sum(item.path_family != "direct" for item in trajectories) < minimum_waypoint_trajectories:
-                    continue
                 metrics = joint_trajectory_metrics(
                     trajectories, camera_hfov_deg=camera_hfov_deg
                 )
@@ -451,4 +449,3 @@ def complementary_hybrid_trajectory_sets(
         (trajectories, source_by_robot, metrics)
         for _, _, trajectories, source_by_robot, metrics in selected[:maximum_candidates]
     )
-

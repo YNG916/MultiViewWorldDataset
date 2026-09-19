@@ -300,6 +300,154 @@ def trajectory_from_spatial_path(
     )
 
 
+def trajectory_from_se2_poses(
+    robot_id: str,
+    poses_xy_yaw: ArrayLike,
+    floor_z: float,
+    camera_to_robot_base: ArrayLike,
+    *,
+    frames: int,
+    fps: float,
+    maximum_linear_speed_mps: float,
+    maximum_angular_speed_radps: float,
+    maximum_acceleration_mps2: float,
+    path_family: str = "unspecified",
+    control_waypoints_xy: ArrayLike | None = None,
+    planner_path_xy: ArrayLike | None = None,
+    metadata: Mapping[str, object] | None = None,
+) -> Trajectory:
+    """Time-parameterize forward and stationary-turn SE(2) primitives."""
+    source = np.asarray(poses_xy_yaw, dtype=np.float64)
+    if source.ndim != 2 or source.shape[1] != 3 or len(source) < 2:
+        raise ValueError("poses_xy_yaw must have shape [N,3], N >= 2")
+    if frames < 2 or fps <= 0.0:
+        raise ValueError("frames and fps must be positive")
+    if min(maximum_linear_speed_mps, maximum_angular_speed_radps, maximum_acceleration_mps2) <= 0.0:
+        raise ValueError("kinematic limits must be positive")
+    source = source.copy()
+    source[:, 2] = np.unwrap(source[:, 2])
+    primitive_types: list[str] = []
+    for left, right in zip(source[:-1], source[1:], strict=True):
+        distance = float(np.linalg.norm(right[:2] - left[:2]))
+        angle = abs(float(right[2] - left[2]))
+        if distance > 1.0e-9 and angle > 1.0e-9:
+            raise ValueError("SE(2) primitives must translate or rotate, not both")
+        primitive_types.append("translate" if distance > 1.0e-9 else "rotate")
+
+    # Merge cell-wise forward moves and successive one-bin rotations into
+    # physical rest-to-rest events, instead of stopping at every map pixel.
+    events: list[tuple[str, np.ndarray, np.ndarray]] = []
+    event_start = source[0]
+    event_type = primitive_types[0]
+    previous = source[0]
+    for index, primitive_type in enumerate(primitive_types):
+        current = source[index + 1]
+        can_merge = primitive_type == event_type
+        if can_merge and event_type == "translate":
+            prior_delta = previous[:2] - event_start[:2]
+            next_delta = current[:2] - previous[:2]
+            cross = float(prior_delta[0] * next_delta[1] - prior_delta[1] * next_delta[0])
+            can_merge = bool(
+                abs(current[2] - event_start[2]) <= 1.0e-9
+                and (np.linalg.norm(prior_delta) <= 1.0e-9 or abs(cross) <= 1.0e-9)
+                and float(np.dot(prior_delta, next_delta)) >= -1.0e-9
+            )
+        elif can_merge:
+            prior_angle = previous[2] - event_start[2]
+            next_angle = current[2] - previous[2]
+            can_merge = bool(
+                np.linalg.norm(current[:2] - event_start[:2]) <= 1.0e-9
+                and (abs(prior_angle) <= 1.0e-9 or prior_angle * next_angle >= 0.0)
+            )
+        if not can_merge:
+            events.append((event_type, event_start.copy(), previous.copy()))
+            event_start = previous.copy()
+            event_type = primitive_type
+        previous = current
+    events.append((event_type, event_start.copy(), source[-1].copy()))
+
+    minimum_intervals: list[int] = []
+    nominal_durations: list[float] = []
+    for event_type, left, right in events:
+        if event_type == "translate":
+            distance = float(np.linalg.norm(right[:2] - left[:2]))
+            duration = max(
+                2.0 * distance / maximum_linear_speed_mps,
+                np.sqrt(6.0 * distance / maximum_acceleration_mps2),
+            )
+        else:
+            angle = abs(float(right[2] - left[2]))
+            duration = 2.0 * angle / maximum_angular_speed_radps
+        nominal_durations.append(duration)
+        minimum_intervals.append(max(1, int(np.ceil(duration * fps))))
+    available = frames - 1
+    required = sum(minimum_intervals)
+    if required > available:
+        raise ValueError(
+            f"SE(2) path needs {required + 1} frames for kinematic limits, got {frames}"
+        )
+    allocations = np.asarray(minimum_intervals, dtype=np.int64)
+    remaining = available - required
+    if remaining:
+        weights = np.asarray(nominal_durations, dtype=np.float64)
+        weights = weights / weights.sum() if weights.sum() > 0.0 else np.full(len(events), 1.0 / len(events))
+        exact = remaining * weights
+        allocations += np.floor(exact).astype(np.int64)
+        leftover = remaining - int(np.floor(exact).sum())
+        order = np.argsort(-(exact - np.floor(exact)), kind="stable")
+        allocations[order[:leftover]] += 1
+
+    samples: list[np.ndarray] = [events[0][1].copy()]
+    event_records: list[dict[str, object]] = []
+    frame_cursor = 0
+    for (event_type, left, right), intervals in zip(events, allocations, strict=True):
+        u = np.arange(1, int(intervals) + 1, dtype=np.float64) / int(intervals)
+        progress = 10.0 * u**3 - 15.0 * u**4 + 6.0 * u**5
+        values = left[None, :] + progress[:, None] * (right - left)[None, :]
+        samples.extend(values)
+        event_records.append({
+            "type": event_type,
+            "start_frame": int(frame_cursor),
+            "end_frame": int(frame_cursor + intervals),
+            "duration_s": float(intervals / fps),
+        })
+        frame_cursor += int(intervals)
+    sampled = np.asarray(samples, dtype=np.float64)
+    sampled[:, 2] = np.unwrap(sampled[:, 2])
+    bases = np.stack([
+        pose_from_xy_yaw(float(x), float(y), floor_z, float(yaw))
+        for x, y, yaw in sampled
+    ])
+    camera_relative = np.asarray(camera_to_robot_base, dtype=np.float64)
+    cameras = np.stack([compose_transforms(base, camera_relative) for base in bases])
+    empty = np.empty((0, 2), dtype=np.float64)
+    moving_source = np.r_[True, np.linalg.norm(np.diff(source[:, :2], axis=0), axis=1) > 1.0e-9]
+    spatial = source[moving_source, :2]
+    stationary_events = [item for item in event_records if item["type"] == "rotate"]
+    return Trajectory(
+        robot_id=robot_id,
+        fps=fps,
+        base_to_world=bases,
+        camera_to_world=cameras,
+        path_family=path_family,
+        control_waypoints_xy=empty if control_waypoints_xy is None else control_waypoints_xy,
+        planner_path_xy=spatial if planner_path_xy is None else planner_path_xy,
+        simplified_path_xy=spatial,
+        smoothed_path_xy=spatial,
+        metadata={
+            "velocity_profile": "piecewise_quintic_rest_to_rest",
+            "se2_motion_events": event_records,
+            "stationary_turn_count": len(stationary_events),
+            "stationary_turn_duration_frames": int(sum(
+                int(item["end_frame"]) - int(item["start_frame"])
+                for item in stationary_events
+            )),
+            "smoothed_arc_length_m": float(np.linalg.norm(np.diff(source[:, :2], axis=0), axis=1).sum()),
+            **dict(metadata or {}),
+        },
+    )
+
+
 def minimum_separation_event(
     trajectories: Sequence[Trajectory],
 ) -> dict[str, object]:
@@ -375,7 +523,29 @@ def trajectory_kinematic_metrics(trajectory: Trajectory) -> dict[str, float]:
     accelerations = np.diff(velocities, axis=0) * trajectory.fps
     yaws = np.unwrap(np.arctan2(trajectory.base_to_world[:, 1, 0], trajectory.base_to_world[:, 0, 0]))
     yaw_steps = np.diff(yaws)
-    curvature = np.abs(yaw_steps) / np.maximum(planar_steps, 1.0e-9)
+    moving = planar_steps > 1.0e-7
+    stationary_turning = (~moving) & (np.abs(yaw_steps) > 1.0e-7)
+    curvature = np.abs(yaw_steps[moving]) / np.maximum(planar_steps[moving], 1.0e-9)
+    tangent_error = np.empty(0, dtype=np.float64)
+    if np.any(moving):
+        tangent = np.arctan2(np.diff(positions[:, 1]), np.diff(positions[:, 0]))
+        tangent_error = np.abs(
+            (yaws[:-1][moving] - tangent[moving] + np.pi) % (2.0 * np.pi) - np.pi
+        )
+    turn_runs = 0
+    maximum_turn_run = 0
+    current_turn_run = 0
+    for active in stationary_turning:
+        if active:
+            if current_turn_run == 0:
+                turn_runs += 1
+            current_turn_run += 1
+            maximum_turn_run = max(maximum_turn_run, current_turn_run)
+        else:
+            current_turn_run = 0
+    forward = np.column_stack((np.cos(yaws[:-1]), np.sin(yaws[:-1])))
+    lateral = np.column_stack((-forward[:, 1], forward[:, 0]))
+    lateral_slip = np.abs(np.sum(np.diff(positions[:, :2], axis=0) * lateral, axis=1))
     return {
         "arc_path_length_m": arc_length,
         "path_length_m": arc_length,
@@ -388,6 +558,14 @@ def trajectory_kinematic_metrics(trajectory: Trajectory) -> dict[str, float]:
         "maximum_linear_speed_mps": float(np.linalg.norm(velocities[:, :2], axis=1).max(initial=0.0)),
         "maximum_angular_speed_radps": float(np.abs(yaw_steps * trajectory.fps).max(initial=0.0)),
         "maximum_acceleration_mps2": float(np.linalg.norm(accelerations[:, :2], axis=1).max(initial=0.0)),
+        "moving_frame_count": int(np.count_nonzero(moving)),
+        "moving_maximum_yaw_tangent_error_rad": float(tangent_error.max(initial=0.0)),
+        "stationary_turn_count": int(turn_runs),
+        "stationary_turn_frame_count": int(np.count_nonzero(stationary_turning)),
+        "stationary_turn_duration_s": float(np.count_nonzero(stationary_turning) / trajectory.fps),
+        "maximum_continuous_stationary_turn_frames": int(maximum_turn_run),
+        "cumulative_stationary_rotation_rad": float(np.abs(yaw_steps[stationary_turning]).sum()),
+        "maximum_lateral_slip_m": float(lateral_slip.max(initial=0.0)),
     }
 
 
@@ -962,9 +1140,6 @@ def sample_geodesic_trajectory_set(
                 trajectory.path_family != "direct"
                 for trajectory in trajectories
             )
-            if waypoint_count < minimum_waypoint_trajectories:
-                waypoint_rejections += 1
-                continue
             separation_event = minimum_separation_event(trajectories)
             candidate_minimum_distance = float(separation_event["distance_m"])
             if (

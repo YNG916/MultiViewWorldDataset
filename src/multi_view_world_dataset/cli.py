@@ -5,7 +5,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-from multi_view_world_dataset.diagnostics import run_sampling_diagnostics
+from multi_view_world_dataset.diagnostics import (
+    run_navigation_sweep,
+    run_sampling_diagnostics,
+)
 from multi_view_world_dataset.dataset_diagnostics import summarize_generated_dataset
 from multi_view_world_dataset.generator import generate_dataset
 from multi_view_world_dataset.pipeline import inspect_simulator_runtime, run_simulator_probe
@@ -61,6 +64,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also render sparse GT-depth keyframes and report temporal overlap topology",
     )
     _machine_arguments(diagnostics, output=True)
+    navigation_sweep = subparsers.add_parser(
+        "navigation-sweep",
+        help="Run final-robot SE(2) feasibility over discovered scenes without RGB rollouts",
+    )
+    navigation_sweep.add_argument("--config", required=True)
+    navigation_sweep.add_argument(
+        "--scene", help="Optional single-scene microtest; omit for the full installed sweep"
+    )
+    _machine_arguments(navigation_sweep, output=True)
     dataset_diagnostics = subparsers.add_parser(
         "dataset-diagnostics",
         help="Aggregate finalized Dataset-v1.1 episodes without the simulator",
@@ -115,6 +127,16 @@ def main(argv: list[str] | None = None) -> int:
             include_overlap_preflight=bool(args.with_overlap_preflight),
         )
         print(json.dumps({"status": "pass", "output": str(output), **report}, indent=2, sort_keys=True))
+        return 0
+    if args.command == "navigation-sweep":
+        output, report = run_navigation_sweep(
+            runtime, config, scene_id=args.scene
+        )
+        print(json.dumps({
+            "status": "pass", "output": str(output),
+            "scene_count": report["scene_count"],
+            "classification_counts": report["classification_counts"],
+        }, indent=2, sort_keys=True))
         return 0
     if args.command == "generate":
         output, result = generate_dataset(

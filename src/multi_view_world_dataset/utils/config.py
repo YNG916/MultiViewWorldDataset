@@ -267,12 +267,15 @@ def validate_config(config: dict[str, Any]) -> None:
     for key in (
         "footprint_yaw_bins",
         "footprint_physx_probe_count_per_category",
+        "scene_worker_timeout_s",
+        "scene_worker_max_attempts",
         "route_bank_target_size",
         "route_bank_minimum_size",
         "route_bank_max_raw_attempts",
         "route_candidate_attempts_per_raw",
         "top_triplets_for_exact_validation",
         "joint_route_search_budget",
+        "se2_maximum_expansions",
         "cheap_visibility_keyframes",
         "cheap_visibility_ray_count",
         "start_blacklist_yaw_bins",
@@ -286,12 +289,6 @@ def validate_config(config: dict[str, Any]) -> None:
         and navigation["footprint_yaw_bins"] < 4
     ):
         errors.append("navigation.footprint_yaw_bins must be at least 4")
-    if (
-        isinstance(navigation.get("route_bank_target_size"), int)
-        and isinstance(navigation.get("route_bank_minimum_size"), int)
-        and navigation["route_bank_minimum_size"] > navigation["route_bank_target_size"]
-    ):
-        errors.append("navigation route-bank minimum cannot exceed target size")
     cheap_edge_threshold = navigation.get("cheap_visibility_edge_threshold")
     if not isinstance(cheap_edge_threshold, (int, float)) or not (
         0.0 <= float(cheap_edge_threshold) <= 1.0
@@ -336,6 +333,7 @@ def validate_config(config: dict[str, Any]) -> None:
     for key in (
         "footprint_safety_margin_m",
         "dynamic_obstacle_margin_m",
+        "yaw_freedom_ranking_weight",
     ):
         value = navigation.get(key)
         if not isinstance(value, (int, float)) or float(value) < 0.0:
@@ -344,6 +342,7 @@ def validate_config(config: dict[str, Any]) -> None:
         "footprint_sampling_spacing_fraction",
         "cheap_visibility_max_range_m",
         "start_blacklist_position_quantization_m",
+        "se2_rotation_cost_cells",
     ):
         value = navigation.get(key)
         if not isinstance(value, (int, float)) or float(value) <= 0.0:
@@ -432,4 +431,3 @@ def validate_config(config: dict[str, Any]) -> None:
         )
     if errors:
         raise ConfigurationError("Invalid dataset configuration:\n- " + "\n- ".join(errors))
-

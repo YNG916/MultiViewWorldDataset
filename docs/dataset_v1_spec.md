@@ -33,8 +33,12 @@ actual producing sensor pose; mounted and shared-capture poses plus their alignm
 mast.
 
 `B_env` is a robot-free whole-floor **true orthographic** render. Each floor is separate, at 0.02 m/px with RGB,
-linear depth, height above floor, normals, semantic, instance, occupancy, and a separate robot-eroded traversability
-mask. Occupancy is observed geometry and is never used as a synonym for navigability. Only RGB is the default
+linear depth, height above floor, normals, semantic, instance, occupancy, and
+three separate navigation layers: `point_traversability`,
+`any_yaw_navigable`, and continuous `yaw_freedom`. The legacy
+`traversability` key is only an alias of `any_yaw_navigable`; it is not claimed
+to be an exact all-orientation erosion. Occupancy is observed geometry and is
+never used as a synonym for navigability. Only RGB is the default
 input. A configuration stores `B_env_before` once and its episodes reference it.
 
 `B_world_before[t]` and `B_world_after[t]` are mandatory GT at 0.04 m/px and include all three rendered robot bodies.
@@ -54,16 +58,23 @@ of near-duplicate views, and no requirement that any individual keyframe graph b
 shared-keyframe fractions are soft targets that distinguish requested from realized observation regimes. Neither all
 pairs nor all frames must overlap. Full overlap matrices and graph topology are persisted.
 
-At 10 FPS, 60 frames span 6 seconds with smooth acceleration/cruise/deceleration, collision-free independent paths of
-1–3 m geodesic/smoothed arc length. Height, pitch, roll, and
+At 10 FPS, 60 frames span 6 seconds with collision-free independent paths of
+1–3 m translated geodesic/continuous arc length. The orientation-aware planner
+supports forward travel and collision-checked stationary left/right turns;
+every intermediate rotation bin is safe. Moving yaw follows its path tangent,
+while stationary yaw changes are reported separately. Linear/angular speed,
+linear acceleration, lateral slip, and complete physical-frame poses are
+checked. Height, pitch, roll, and
 intrinsics stay fixed. Exact robot-base and camera poses are stored at every `t`.
 
 ## Counterfactual intervention
 
 Each v1.1 episode has exactly one atomic event: accepted-sample quotas target 60% rigid relocation, 30% articulation,
 and 10% meaningful visible state change. The event type is fixed before resampling and never silently falls back.
-Rigid relocation targets about 0.3–1.5 m and 30–120°, normally on the same floor and in the same room while preserving
-support/containment. Add/remove and special mid-video sequences are excluded.
+Rigid relocation targets about 0.3–1.5 m and 30–120° while preserving a verified
+`OnFloor`, `OnTop`, or `Inside` relation. `Open` is joint-backed and is always
+an articulation, never a generic state change. Add/remove and special
+mid-video sequences are excluded.
 
 The configuration is restored; `W0`, `V0`, and `B_world_before` are produced on trajectory `T_all`; the same base state
 is restored, one event creates `W1`, and **that same** `T_all` is validated and rendered after. If invalid, resample the
@@ -78,3 +89,7 @@ IDs, a renderer→native path→ObjectState ID→public integer mapping, non-emp
 references. Do not repeat unchanged full object state per frame. Catalogs use Parquet where available, trajectories use
 NPZ, dense arrays use Zarr, and small metadata uses JSON/YAML.
 
+Every canonical catalog and exact state hash contains the complete current
+relation set for every object. Relations are recomputed after configuration
+changes, settling, interventions, and snapshot restore; scene-level stale
+relation caches are forbidden.

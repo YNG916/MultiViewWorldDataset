@@ -702,7 +702,9 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             native_states = getattr(obj, "states", {})
             available_states = tuple(sorted(state_type.__name__ for state_type in native_states))
             meaningful_boolean_states = {
-                "Open", "ToggledOn", "Cooked", "Burnt", "Frozen", "Heated", "OnFire"
+                # Open is joint-backed in BEHAVIOR assets and therefore belongs
+                # to ARTICULATION, never the generic STATE_CHANGE taxonomy.
+                "ToggledOn", "Cooked", "Burnt", "Frozen", "Heated", "OnFire"
             }
             semantic_states: dict[str, bool] = {}
             for state_type, state in native_states.items():
@@ -807,7 +809,10 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                     )
                     vertically_close = abs(float(target_low[2] - reference_high[2])) <= 0.25
                     if np.all(overlap_xy > 0.0) and vertically_close:
-                        state_specs.append(("OnTop", self._on_top_type))
+                        state_specs.append((
+                            "OnFloor" if reference.category == "floors" else "OnTop",
+                            self._on_top_type,
+                        ))
                 for predicate, state_type in state_specs:
                     try:
                         active = bool(native_target.states[state_type].get_value(native_reference))
@@ -837,10 +842,23 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         )
 
     def object_catalog_with_relations(self) -> tuple[ObjectState, ...]:
+        """Return a complete relation snapshot for the current physical state.
+
+        Relations are dynamic object states. Reusing a scene-level cache after
+        relocation, articulation, settling, or snapshot restore silently
+        attaches stale edges, so every source-of-truth catalog is recomputed.
+        ``_relation_cache`` remains only the latest diagnostic/candidate set.
+        """
         catalog = self.object_catalog()
-        if self._relation_cache is None:
-            self._relation_cache = self.relation_candidates(catalog)
+        self._relation_cache = self.relation_candidates(catalog)
         return self._attach_relations(catalog, self._relation_cache)
+
+    def _relation_state_type(self, predicate: str) -> Any:
+        if predicate in {"OnTop", "OnFloor"}:
+            return self._on_top_type
+        if predicate == "Inside":
+            return self._inside_type
+        raise ValueError(f"Unsupported rigid relation predicate: {predicate}")
 
     @staticmethod
     def _catalog_restore_metrics(
@@ -967,15 +985,14 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 {"accepted_changes": len(changes), "requested_changes": requested},
             )
         accepted_snapshot = self.dump_snapshot()
-        combined_relations = tuple(change for change in changes)
-        catalog = self._attach_relations(self.object_catalog(), combined_relations)
+        catalog = self.object_catalog_with_relations()
         self.load_snapshot(accepted_snapshot)
-        restored = self._attach_relations(self.object_catalog(), combined_relations)
+        restored = self.object_catalog_with_relations()
         restored_native = self._native_objects_by_path()
         relations_preserved = all(
             bool(
                 restored_native[relation["target_native_path"]].states[
-                    self._on_top_type if relation["predicate"] == "OnTop" else self._inside_type
+                    self._relation_state_type(str(relation["predicate"]))
                 ].get_value(restored_native[relation["reference_native_path"]])
             )
             for relation in changes
@@ -1056,7 +1073,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             native_by_path = self._native_objects_by_path()
             target_native = native_by_path[relation["target_native_path"]]
             reference_native = native_by_path[relation["reference_native_path"]]
-            state_type = self._on_top_type if relation["predicate"] == "OnTop" else self._inside_type
+            state_type = self._relation_state_type(str(relation["predicate"]))
             self._th.manual_seed(int(seed + attempt_index))
             sampler_macros = self._object_state_utils.m
             previous_high = int(sampler_macros.DEFAULT_HIGH_LEVEL_SAMPLING_ATTEMPTS)
@@ -1075,7 +1092,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                         True,
                         reset_before_sampling=True,
                         use_trav_map=(
-                            relation["predicate"] == "OnTop" and relation["reference_category"] == "floors"
+                            relation["predicate"] == "OnFloor"
                         ),
                     )
                 )
@@ -1097,8 +1114,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             if not bool(target_native.states[state_type].get_value(reference_native)):
                 failures.append({"reason": "relation_lost_after_settle", **relation})
                 continue
-            raw_catalog = self.object_catalog()
-            catalog = self._attach_relations(raw_catalog, (relation,))
+            catalog = self.object_catalog_with_relations()
             after_by_id = {obj.instance_id: obj for obj in catalog}
             before_target = baseline_by_id[relation["target_instance_id"]]
             after_target = after_by_id[relation["target_instance_id"]]
@@ -1137,7 +1153,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 continue
             accepted_snapshot = self.dump_snapshot()
             self.load_snapshot(accepted_snapshot)
-            restored_catalog = self._attach_relations(self.object_catalog(), (relation,))
+            restored_catalog = self.object_catalog_with_relations()
             maximum_restore_error, restored_discrete_state = self._catalog_restore_metrics(
                 catalog,
                 restored_catalog,
@@ -1228,8 +1244,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                     obj
                     for obj in candidates
                     if any(
-                        relation.get("predicate") == "OnTop"
-                        and relation.get("reference_category") == "floors"
+                        relation.get("predicate") in {"OnFloor", "OnTop", "Inside"}
                         for relation in obj.relations
                     )
                 ]
@@ -1261,30 +1276,63 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                         relation = next(
                             relation
                             for relation in target.relations
-                            if relation.get("predicate") == "OnTop"
-                            and relation.get("reference_category") == "floors"
+                            if relation.get("predicate") in {
+                                "OnFloor", "OnTop", "Inside"
+                            }
                         )
                         reference = baseline_by_id[str(relation["reference_instance_id"])]
                         native_reference = native_by_path[reference.native_path]
-                        delta_xy = np.asarray(event.parameters["translation_xy_m"], dtype=np.float64)
-                        yaw_delta = float(event.parameters["yaw_delta_rad"])
-                        candidate_transform = target.object_to_world.copy()
-                        candidate_transform[:2, 3] += delta_xy
-                        cosine, sine = np.cos(yaw_delta), np.sin(yaw_delta)
-                        yaw_rotation = np.asarray(
-                            [[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]]
+                        relation_state_type = self._relation_state_type(
+                            str(relation["predicate"])
                         )
-                        candidate_transform[:3, :3] = yaw_rotation @ candidate_transform[:3, :3]
-                        position, orientation = self._transform_utils.mat2pose(
-                            self._th.as_tensor(candidate_transform, dtype=self._th.float32)
-                        )
-                        native_target.set_position_orientation(position=position, orientation=orientation)
+                        if relation["predicate"] == "OnFloor":
+                            delta_xy = np.asarray(
+                                event.parameters["translation_xy_m"], dtype=np.float64
+                            )
+                            yaw_delta = float(event.parameters["yaw_delta_rad"])
+                            candidate_transform = target.object_to_world.copy()
+                            candidate_transform[:2, 3] += delta_xy
+                            cosine, sine = np.cos(yaw_delta), np.sin(yaw_delta)
+                            yaw_rotation = np.asarray([
+                                [cosine, -sine, 0.0],
+                                [sine, cosine, 0.0],
+                                [0.0, 0.0, 1.0],
+                            ])
+                            candidate_transform[:3, :3] = (
+                                yaw_rotation @ candidate_transform[:3, :3]
+                            )
+                            position, orientation = self._transform_utils.mat2pose(
+                                self._th.as_tensor(
+                                    candidate_transform, dtype=self._th.float32
+                                )
+                            )
+                            native_target.set_position_orientation(
+                                position=position, orientation=orientation
+                            )
+                        else:
+                            sampled = bool(
+                                native_target.states[relation_state_type].set_value(
+                                    native_reference,
+                                    True,
+                                    reset_before_sampling=True,
+                                    use_trav_map=False,
+                                )
+                            )
+                            if not sampled:
+                                failures.append({
+                                    "reason": "rigid_relation_resampling_failed",
+                                    "predicate": relation["predicate"],
+                                    "target": target.instance_id,
+                                })
+                                continue
                         for native_object in list(self._require_scene().objects):
                             if hasattr(native_object, "keep_still"):
                                 native_object.keep_still()
                         self._og.sim.step_physics()
                         relation_valid = bool(
-                            native_target.states[self._on_top_type].get_value(native_reference)
+                            native_target.states[relation_state_type].get_value(
+                                native_reference
+                            )
                         )
                         extra_collision = bool(
                             self._rigid_contact_api.is_in_contact(
@@ -1314,6 +1362,30 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                             value.detach().clone()
                             for value in native_target.get_position_orientation()
                         )
+                        validated_transform = self._pose_matrix(native_target)
+                        realized_xy = (
+                            validated_transform[:2, 3]
+                            - target.object_to_world[:2, 3]
+                        )
+                        realized_yaw = float(np.arctan2(
+                            validated_transform[1, 0], validated_transform[0, 0]
+                        ) - np.arctan2(
+                            target.object_to_world[1, 0], target.object_to_world[0, 0]
+                        ))
+                        realized_yaw = float(
+                            (realized_yaw + np.pi) % (2.0 * np.pi) - np.pi
+                        )
+                        event = replace(event, parameters={
+                            **event.parameters,
+                            "translation_xy_m": realized_xy.tolist(),
+                            "yaw_delta_rad": realized_yaw,
+                            "preserved_relation": dict(relation),
+                            "placement_backend": (
+                                "direct_floor_pose"
+                                if relation["predicate"] == "OnFloor"
+                                else "omnigibson_native_relation_sampler"
+                            ),
+                        })
                         self.load_snapshot(baseline_snapshot)
                         atomic_baseline_catalog = self.object_catalog_with_relations()
                         native_target.set_position_orientation(
@@ -1601,6 +1673,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             self._runtime_findings["development_snapshot_sensor_lifecycle"] = (
                 "scene_root_retained+lightweight_robot_restore+changed_registry_entries_restored+graph_retained"
             )
+        self._relation_cache = None
 
     def _restore_robot_snapshot_lightweight(self, robot: Any, state: dict[str, Any]) -> None:
         """Restore robot physics state without reloading controllers or sensor graphs."""
@@ -1791,7 +1864,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
     def _external_robot_contact_pairs(
         self,
         robot: Any,
-        floors: list[Any],
+        support_surfaces: list[Any],
     ) -> list[list[str]]:
         contact_pairs = sorted(
             self._rigid_contact_api.get_contact_pairs(
@@ -1803,7 +1876,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         )
         ignored_prefixes = (
             str(robot.prim_path),
-            *(str(floor.prim_path) for floor in floors),
+            *(str(surface.prim_path) for surface in support_surfaces),
         )
         return [
             [query_path, other_path]
@@ -1812,6 +1885,15 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 other_path == prefix or other_path.startswith(prefix + "/")
                 for prefix in ignored_prefixes
             )
+        ]
+
+    def _robot_support_surfaces(self) -> list[Any]:
+        """Return scene objects whose contact physically supports robot motion."""
+        return [
+            obj
+            for obj in self._require_scene().objects
+            if str(getattr(obj, "category", "")).lower()
+            in {"floor", "floors", "lawn"}
         ]
 
     def _preflight_trajectory_contacts(
@@ -1885,26 +1967,50 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
     def traversability_bev(
         self, floor_index: int, calibration: BEVCalibration
     ) -> np.ndarray:
-        """Rasterize robot-eroded navigability in the canonical BEV frame."""
+        """Backward-compatible alias for any-yaw footprint navigability."""
+        return self.traversability_bev_layers(floor_index, calibration)[
+            "any_yaw_navigable"
+        ]
+
+    def traversability_bev_layers(
+        self, floor_index: int, calibration: BEVCalibration
+    ) -> dict[str, np.ndarray]:
+        """Rasterize point support and orientation-aware footprint semantics."""
+        from multi_view_world_dataset.adapters.navigation import (
+            _footprint_offsets,
+            _point_free_mask,
+            _robot_footprint,
+        )
+        from multi_view_world_dataset.sampling.navigation import oriented_safe_masks
+
+        point_free = _point_free_mask(self, floor_index)
+        footprint = _robot_footprint(self)
+        safe_masks = oriented_safe_masks(
+            point_free, _footprint_offsets(self, footprint, floor_index)
+        )
+        native_layers = {
+            "point_traversability": point_free.astype(np.float32),
+            "any_yaw_navigable": np.any(safe_masks, axis=0).astype(np.float32),
+            "yaw_freedom": np.mean(safe_masks, axis=0, dtype=np.float32),
+        }
         rows, columns = np.indices((calibration.height, calibration.width))
         pixels = np.column_stack((columns.ravel(), rows.ravel()))
         world = calibration.pixel_to_world(pixels)[:, :2]
         trav_map = self._require_scene().trav_map
-        world_xy, _, _, _ = self._trajectory_traversability(
-            floor_index, self._env.robots[0]
-        )
-        native = np.zeros(tuple(trav_map.floor_map[floor_index].shape), dtype=bool)
-        native_pixels = self._world_to_map_preserving_batch(trav_map, world_xy)
-        if len(native_pixels):
-            native[native_pixels[:, 0], native_pixels[:, 1]] = True
         mapped = self._world_to_map_preserving_batch(trav_map, world)
+        shape = point_free.shape
         valid = (
-            (mapped[:, 0] >= 0) & (mapped[:, 0] < native.shape[0])
-            & (mapped[:, 1] >= 0) & (mapped[:, 1] < native.shape[1])
+            (mapped[:, 0] >= 0) & (mapped[:, 0] < shape[0])
+            & (mapped[:, 1] >= 0) & (mapped[:, 1] < shape[1])
         )
-        output = np.zeros(len(mapped), dtype=np.uint8)
-        output[valid] = native[mapped[valid, 0], mapped[valid, 1]].astype(np.uint8)
-        return output.reshape(calibration.height, calibration.width)
+        result: dict[str, np.ndarray] = {}
+        for name, native in native_layers.items():
+            output = np.zeros(len(mapped), dtype=np.float32)
+            output[valid] = native[mapped[valid, 0], mapped[valid, 1]]
+            result[name] = output.reshape(
+                calibration.height, calibration.width
+            )
+        return result
 
     def _observation_region_labels(
         self, floor_index: int, world_xy: np.ndarray
@@ -2363,7 +2469,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             robot.set_position_orientation(position=self._th.as_tensor(point, dtype=self._th.float32), orientation=orientation)
             self._restore_final_robot_mast_mount(robot)
             robot.keep_still()
-        floors = [obj for obj in scene.objects if str(getattr(obj, "category", "")) == "floors"]
+        floors = self._robot_support_surfaces()
         for robot in robots:
             pairs = self._external_robot_contact_pairs(robot, floors)
             if pairs:
@@ -3291,6 +3397,14 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             }
         return {
             "traversable": context.planner_mask.astype(np.uint8),
+            "point_traversability": context.point_free_mask.astype(np.uint8),
+            "any_yaw_navigable": np.any(
+                context.footprint_safe_masks, axis=0
+            ).astype(np.uint8),
+            "yaw_freedom": np.mean(
+                context.footprint_safe_masks, axis=0
+            ).astype(np.float32),
+            "orientation_safe_masks": context.footprint_safe_masks.astype(np.uint8),
             "map_resolution_m": float(trav_map.map_resolution),
             "map_size": int(trav_map.map_size),
             "region_label_grid": context.region_label_grid,
@@ -3845,7 +3959,10 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             self._native_value(instance), renderer_info, catalog, robot_paths
         )
         like = instance
-        if hasattr(like, "device"):
+        # NumPy 2.x arrays expose ``device``; explicitly recognize tensors.
+        torch_module = getattr(self, "_th", None)
+        tensor_type = getattr(torch_module, "Tensor", ()) if torch_module is not None else ()
+        if tensor_type and isinstance(like, tensor_type):
             public_instance_value = self._th.as_tensor(public_instance, device=like.device)
             public_semantic_value = self._th.as_tensor(public_semantic, device=like.device)
         else:
@@ -4274,7 +4391,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             for obj in scene.objects
             if str(getattr(obj, "category", "")) in {"ceilings", "roof"}
         ]
-        floors = [obj for obj in scene.objects if str(getattr(obj, "category", "")) == "floors"]
+        floors = self._robot_support_surfaces()
         self._preflight_trajectory_contacts(by_id, robots, floors, frames)
         hidden: list[tuple[Any, bool]] = []
         world_frames: dict[str, list[np.ndarray]] = {name: [] for name in world_modalities}

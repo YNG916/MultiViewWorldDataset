@@ -15,7 +15,17 @@ The mast has four physical positions corresponding to camera heights 0.8, 1.0, 1
 height per robot and keeps its mast joint fixed for all frames. Pitch is −5°, roll 0°, and changing height cannot be
 implemented by moving an invisible camera independently of the rendered mast.
 
-This document is the final-robot design contract. The current project-owned USDA template adds visible mast and
-camera geometry over Nova Carter, but it does not yet contain a runtime-verified prismatic mast joint. Consequently
-`mobile_sensor_robot_v1` must not be selected for accepted generation until gate-11 articulation and collision QA
-passes; development probes use Turtlebot.
+The final robot is the production morphology. Its size is frozen during the
+current feasibility study: code must first distinguish real geometric
+infeasibility from the former XY-only planner's false rejections. The collision
+footprint is the convex union of every enabled collision link, including caster
+links, at the authored configuration, expanded only by the configured 0.03 m
+safety margin. Metadata records source links, raw/expanded polygons, caster
+treatment, width, length, area, radius, and the old reset-AABB dimensions.
+
+Navigation uses orientation masks and an SE(2) lattice. A pose is valid exactly
+when its `(x,y,yaw_bin)` footprint is safe; the fraction of safe yaws is only a
+ranking diagnostic. PhysX calibration probes open, wall, furniture, corridor,
+door, and corner categories and reports raster false-safe and conservative
+predictions. Robot dimensions may be reconsidered only after the full
+navigation-only scene sweep, never as an automatic rejection workaround.

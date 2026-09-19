@@ -36,9 +36,23 @@ def save_trajectory_inspection(
         from PIL import Image, ImageDraw
     except ImportError as error:
         raise RuntimeError("Inspection images require the 'inspection' extra with Pillow") from error
-    mask = np.asarray(traversability["traversable"], dtype=bool)
+    mask = np.asarray(
+        traversability.get("any_yaw_navigable", traversability["traversable"]),
+        dtype=bool,
+    )
     raster = np.full((*mask.shape, 3), 35, dtype=np.uint8)
-    raster[mask] = (225, 225, 225)
+    point_mask = np.asarray(
+        traversability.get("point_traversability", mask), dtype=bool
+    )
+    raster[point_mask] = (80, 88, 102)
+    yaw_freedom = np.asarray(
+        traversability.get("yaw_freedom", mask.astype(np.float32)),
+        dtype=np.float32,
+    )
+    intensity = np.clip(110.0 + 145.0 * yaw_freedom, 0, 255).astype(np.uint8)
+    raster[mask] = np.column_stack((
+        intensity[mask], intensity[mask], intensity[mask]
+    ))
     region_labels = traversability.get("region_label_grid")
     if region_labels is not None:
         region_labels = np.asarray(region_labels).astype(str)
@@ -152,7 +166,7 @@ def save_trajectory_inspection(
             draw.ellipse((tip[0] - 2, tip[1] - 2, tip[0] + 2, tip[1] + 2), fill=(0, 0, 0))
         draw.text((start_u + radius + 2, start_v - radius), f"{trajectory.robot_id} {trajectory.path_family}", fill=color)
 
-    draw.text((10, 8), "Robot-footprint traversability (not RGB BEV) | +X right, +Y up", fill=(0, 0, 0))
+    draw.text((10, 8), "SE(2) navigation: dark=point-only, light=greater yaw freedom | +X right, +Y up", fill=(0, 0, 0))
     draw.text((10, 29), "circle=start square=end yellow=waypoint arrows=heading; gold=RegionGraph", fill=(0, 0, 0))
     if temporal_overlap is None:
         graph = traversability.get("region_graph", {})

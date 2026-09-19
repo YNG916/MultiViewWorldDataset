@@ -6,6 +6,7 @@ from multi_view_world_dataset.adapters.navigation import (
     _cheap_visibility_metrics,
     _cheap_visibility_score_from_pairwise,
 )
+from multi_view_world_dataset.diagnostics import _kit_log_has_gpu_device_loss
 from multi_view_world_dataset.sampling.diversity import temporal_overlap_acceptance
 from multi_view_world_dataset.sampling.navigation import (
     RouteCandidate,
@@ -17,7 +18,16 @@ from multi_view_world_dataset.sampling.navigation import (
     route_start_regions_connected,
     select_joint_route_candidates,
 )
-from multi_view_world_dataset.sampling.trajectories import trajectory_from_spatial_path
+from multi_view_world_dataset.sampling.se2 import (
+    plan_se2_grid,
+    se2_plan_is_safe,
+    swept_rotation_is_safe,
+)
+from multi_view_world_dataset.sampling.trajectories import (
+    trajectory_from_se2_poses,
+    trajectory_from_spatial_path,
+    trajectory_kinematic_metrics,
+)
 from multi_view_world_dataset.utils.config import load_yaml_config
 
 
@@ -55,6 +65,17 @@ def test_route_first_config_has_no_straight_exit_or_shared_heading_gate():
     assert "initial_heading_probe_max_m" not in config["placement"]
     assert "heading_consensus_search_step_deg" not in config["placement"]
     assert "regime_trajectory_separation_headroom_m" not in config["placement"]
+
+
+def test_kit_log_device_loss_detection_is_specific(tmp_path: Path):
+    log = tmp_path / "kit_test.log"
+    log.write_text("ordinary renderer warning\n", encoding="utf-8")
+    assert not _kit_log_has_gpu_device_loss(log)
+    log.write_text(
+        "ordinary renderer warning\nVkResult: ERROR_DEVICE_LOST\n",
+        encoding="utf-8",
+    )
+    assert _kit_log_has_gpu_device_loss(log)
 
 
 def test_route_can_turn_immediately_and_yaw_follows_accepted_tangent():
@@ -104,6 +125,92 @@ def test_orientation_aware_footprint_mask_blocks_wall_contact():
     safe = oriented_safe_masks(free, offsets)
     assert not safe[0, 4, 6]
     assert safe[1, 4, 6]
+
+
+def _right_angle_se2_masks() -> np.ndarray:
+    masks = np.zeros((8, 7, 7), dtype=bool)
+    masks[0, 3, 1:4] = True
+    masks[:, 3, 3] = True
+    masks[2, 3:6, 3] = True
+    return masks
+
+
+def test_se2_planner_supports_collision_checked_stop_and_turn():
+    masks = _right_angle_se2_masks()
+    plan = plan_se2_grid(
+        masks, (3, 1), (5, 3), start_yaw_index=0,
+        rotation_cost_cells=0.1,
+    )
+    assert plan is not None
+    assert plan.contains_stationary_turn
+    assert plan.actions == (
+        "forward", "forward", "rotate_left", "rotate_left", "forward", "forward"
+    )
+    assert se2_plan_is_safe(plan, masks)
+    assert np.isclose(plan.translation_length_cells, 4.0)
+
+
+def test_swept_rotation_rejects_unsafe_intermediate_yaw():
+    masks = np.ones((8, 3, 3), dtype=bool)
+    masks[1, 1, 1] = False
+    assert not swept_rotation_is_safe(
+        masks, 1, 1, 0, 2, direction=1
+    )
+    assert swept_rotation_is_safe(
+        masks, 1, 1, 0, 2, direction=-1
+    )
+
+
+def test_se2_planner_is_seed_free_deterministic_and_never_uses_unsafe_pose():
+    masks = _right_angle_se2_masks()
+    first = plan_se2_grid(masks, (3, 1), (5, 3), start_yaw_index=0)
+    second = plan_se2_grid(masks, (3, 1), (5, 3), start_yaw_index=0)
+    assert first == second
+    assert first is not None
+    assert all(masks[item.yaw_index, item.row, item.column] for item in first.states)
+
+
+def test_se2_forward_primitive_never_approximates_a_misaligned_yaw():
+    masks = np.ones((16, 5, 5), dtype=bool)
+    # yaw bin 1 is 22.5 degrees, but an 8-neighbor raster has no matching
+    # direction. The planner must rotate to a true tangent before translating.
+    plan = plan_se2_grid(
+        masks, (2, 1), (2, 3), start_yaw_index=1,
+        rotation_cost_cells=0.1,
+    )
+    assert plan is not None
+    assert plan.actions[0].startswith("rotate_")
+    for left, right, action in zip(
+        plan.states[:-1], plan.states[1:], plan.actions, strict=True
+    ):
+        if action == "forward":
+            yaw = 2.0 * np.pi * left.yaw_index / 16
+            tangent = np.arctan2(right.row - left.row, right.column - left.column)
+            assert abs((yaw - tangent + np.pi) % (2.0 * np.pi) - np.pi) < 1.0e-9
+
+
+def test_se2_time_parameterization_has_stationary_turns_without_lateral_slip():
+    poses = np.asarray([
+        [0.0, 0.0, 0.0],
+        [0.5, 0.0, 0.0],
+        [0.5, 0.0, np.pi / 2.0],
+        [0.5, 0.5, np.pi / 2.0],
+    ])
+    trajectory = trajectory_from_se2_poses(
+        "robot_00", poses, 0.0, np.eye(4), frames=60, fps=10.0,
+        maximum_linear_speed_mps=0.8,
+        maximum_angular_speed_radps=1.2,
+        maximum_acceleration_mps2=1.5,
+        path_family="one_waypoint",
+    )
+    metrics = trajectory_kinematic_metrics(trajectory)
+    assert trajectory.frames == 60
+    assert metrics["stationary_turn_count"] == 1
+    assert metrics["stationary_turn_frame_count"] > 0
+    assert metrics["maximum_lateral_slip_m"] < 1.0e-9
+    assert metrics["maximum_linear_speed_mps"] <= 0.8
+    assert metrics["maximum_angular_speed_radps"] <= 1.2
+    assert metrics["maximum_acceleration_mps2"] <= 1.5
 
 
 def test_region_graph_uses_cell_topology_and_preserves_connector():
@@ -285,7 +392,8 @@ def test_cheap_visibility_rejects_robot_that_never_participates():
     assert not metrics["passed"]
     assert "union_graph_disconnected" in metrics["failure_reasons"]
     assert "robot_never_participates" in metrics["failure_reasons"]
-    assert not np.isfinite(metrics["score"])
+    assert np.isfinite(metrics["score"])
+    assert metrics["score"] < 0.0
 
 def test_cheap_visibility_score_prefers_persistent_robot_participation():
     routes = (
@@ -378,4 +486,3 @@ def test_precomputed_cheap_visibility_score_matches_detailed_score():
         maximum_isolated_fraction=0.67,
     )
     assert np.isclose(fast, detailed["score"])
-

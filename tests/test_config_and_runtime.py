@@ -31,13 +31,12 @@ def test_native_relation_attempt_budget_must_be_positive():
         validate_config(config)
 
 
-def test_navigation_route_bank_minimum_cannot_exceed_target():
+def test_navigation_route_bank_minimum_is_deprecated_diagnostic_only():
     config = load_yaml_config(REPOSITORY / "configs" / "smoke.yaml")
     config["navigation"]["route_bank_minimum_size"] = (
         config["navigation"]["route_bank_target_size"] + 1
     )
-    with pytest.raises(ConfigurationError, match="route-bank minimum"):
-        validate_config(config)
+    validate_config(config)
 
 
 def test_runtime_path_precedence_and_failure(tmp_path):

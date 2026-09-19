@@ -310,9 +310,12 @@ def test_joint_sampler_caps_expensive_valid_combination_scoring():
         assert trajectory.metadata["joint_combination_evaluated_count"] >= 1
 
 
-def test_joint_set_enforces_configured_waypoint_minimum():
-    with pytest.raises(SampleRejected, match="trajectory_joint_separation_failed"):
-        _sample_parallel_trajectories(17, minimum_waypoint_trajectories=1)
+def test_joint_set_treats_configured_waypoint_minimum_as_deprecated_diagnostic():
+    trajectories = _sample_parallel_trajectories(
+        17, minimum_waypoint_trajectories=1
+    )
+    assert len(trajectories) == 3
+    assert all(item.path_family == "direct" for item in trajectories)
 
 
 def test_waypoint_controls_reject_untrackable_direction_reversal():
@@ -772,3 +775,59 @@ def test_public_label_catalog_cache_uses_static_identity_only_once():
 
     assert catalog_calls["count"] == 1
     assert adapter._runtime_findings["public_label_catalog_cache_size"] == 1
+    assert isinstance(public["seg_instance_id"], np.ndarray)
+
+
+def test_public_labels_use_explicit_torch_tensor_detection_when_available():
+    torch = pytest.importorskip("torch")
+    adapter = object.__new__(OmniGibsonAdapter)
+    adapter._th = torch
+    adapter._public_label_catalog_cache = (
+        SimpleNamespace(
+            instance_id="chair-state-id",
+            native_path="/World/chair",
+            category="chair",
+        ),
+    )
+    adapter._runtime_findings = {}
+    adapter._env = SimpleNamespace(
+        robots=[SimpleNamespace(name="robot_00", prim_path="/World/robot_00")]
+    )
+    observation = {"seg_instance_id": torch.tensor([[0, 4]], dtype=torch.int64)}
+    info = {"seg_instance_id": {"0": "BACKGROUND", "4": "/World/chair/mesh"}}
+    public, _ = adapter._publicize_observation_labels(observation, info)
+    assert isinstance(public["seg_instance_id"], torch.Tensor)
+    assert public["seg_instance_id"].device == observation["seg_instance_id"].device
+
+
+def test_complete_relation_catalog_is_recomputed_and_preserves_unchanged_edges():
+    adapter = object.__new__(OmniGibsonAdapter)
+    target = make_object("obj_target")
+    reference = replace(
+        make_object("obj_reference", x=1.0),
+        category="table",
+        native_path="/World/table",
+    )
+    adapter.object_catalog = lambda: (target, reference)
+    current = {"predicate": "OnTop"}
+    calls = {"count": 0}
+
+    def relations(_catalog):
+        calls["count"] += 1
+        return ({
+            "predicate": current["predicate"],
+            "target_instance_id": target.instance_id,
+            "reference_instance_id": reference.instance_id,
+            "reference_category": reference.category,
+        },)
+
+    adapter.relation_candidates = relations
+    adapter._relation_cache = None
+    first = adapter.object_catalog_with_relations()
+    current["predicate"] = "Inside"
+    second = adapter.object_catalog_with_relations()
+    assert calls["count"] == 2
+    assert first[0].relations[0]["predicate"] == "OnTop"
+    assert second[0].relations[0]["predicate"] == "Inside"
+    assert second[1].relations == ()
+    assert exact_state_hash(first) != exact_state_hash(second)

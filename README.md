@@ -64,6 +64,32 @@ mvwd sampling-diagnostics --config configs/final_robot_preview.yaml --scene Rs_i
   --samples 20 --with-overlap-preflight --output-root /path/to/overlap-diagnostics
 ```
 
+Before any new 60-frame smoke, run the orientation-aware navigation-only
+feasibility gates. The first two commands are micro/regression scenes; omit
+`--scene` only after they pass to sweep every installed scene. These commands
+do not render dense RGB rollouts:
+
+```bash
+mvwd navigation-sweep --config configs/final_robot_preview.yaml --scene Rs_int \
+  --output-root /path/to/nav-rs-int
+mvwd navigation-sweep --config configs/final_robot_preview.yaml --scene Beechwood_0_int \
+  --output-root /path/to/nav-beechwood
+mvwd navigation-sweep --config configs/final_robot_preview.yaml \
+  --output-root /path/to/nav-all-scenes
+```
+
+The full sweep runs scene discovery and every scene in separate spawned
+processes. This is required by the installed Isaac Sim / OmniGibson runtime:
+cross-scene `og.clear()` leaves stale renderer and physics graph nodes. Results
+are checkpointed after every scene under `navigation_sweep_records/`; rerunning
+the same command and output root resumes completed scenes after verifying the
+scene list and navigation configuration manifest.
+
+Each sweep writes `navigation_sweep.json`, `navigation_sweep.csv`, and
+`navigation_sweep.html`, including route-bank/compatible-triplet metrics,
+point-vs-any-yaw free space, exact footprint/caster evidence, PhysX false-safe
+counts, timings, and healthy/constrained/marginal/infeasible classification.
+
 After generation, aggregate every finalized configuration/episode (including
 room coverage, trajectory distributions, overlap topology, intervention
 visibility/effect, stable IDs, calibration evidence, rejects, and storage):
@@ -107,6 +133,8 @@ The full profile is never started automatically. See [the environment guide](doc
 - All machine paths are resolved centrally from CLI overrides and environment variables.
 - Dense arrays are derived products; structured state, snapshots, trajectories, and events are canonical.
 - Each floor has one static canonical extent shared by all environment/world BEVs; resolution may differ.
-- BEV occupancy and robot-eroded traversability are distinct stored modalities.
+- BEV occupancy, point traversability, any-yaw robot navigability, and yaw
+  freedom are distinct stored modalities; `traversability` is a deprecated
+  alias of `any_yaw_navigable`.
 - Renderer IDs are remapped through native paths and stable ObjectState IDs into documented public integers.
 - Scene-family-disjoint splits are assigned before configuration generation.

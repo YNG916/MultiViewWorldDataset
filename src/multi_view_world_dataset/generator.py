@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import traceback
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -108,9 +109,15 @@ def _render_environment_floors(
         prefix = f"floor_{floor_index:02d}"
         for name, value in render.modalities.items():
             arrays[f"{prefix}/{name}"] = np.asarray(value)
-        arrays[f"{prefix}/traversability"] = adapter.traversability_bev(
+        navigation_layers = adapter.traversability_bev_layers(
             floor_index, calibration
         )
+        for layer_name, layer in navigation_layers.items():
+            arrays[f"{prefix}/{layer_name}"] = layer
+        # Schema compatibility only. New consumers must use the explicit key.
+        arrays[f"{prefix}/traversability"] = navigation_layers[
+            "any_yaw_navigable"
+        ]
         arrays[f"{prefix}/calibration_world_bounds"] = np.asarray(calibration.world_bounds)
         arrays[f"{prefix}/calibration_pixel_to_world"] = calibration.pixel_to_world_transform
         arrays[f"{prefix}/calibration_world_to_pixel"] = calibration.world_to_pixel_transform
@@ -160,6 +167,7 @@ def _temporal_overlap_preflight(
     trajectories: tuple[Any, ...],
     *,
     catalog: tuple[ObjectState, ...] | None = None,
+    requested_regime: str | None = None,
 ) -> dict[str, Any]:
     """Validate sparse GT overlap and target visibility before dense capture."""
     preflight = config["trajectory"]["overlap_preflight"]
@@ -280,6 +288,11 @@ def _temporal_overlap_preflight(
         "robot_ids": list(robot_ids),
         "keyframes": keyframes,
     })
+    if requested_regime is not None:
+        metrics["requested_regime"] = str(requested_regime)
+        metrics["regime_target_match"] = bool(
+            metrics["realized_regime"] == requested_regime
+        )
     if not metrics["passed"]:
         raise SampleRejected("trajectory_temporal_overlap_failed", metrics)
     if catalog is not None:
@@ -323,6 +336,23 @@ def _temporal_overlap_preflight(
                 "no_visible_intervention_target_preflight", visibility
             )
     return metrics
+
+
+def _soft_requested_overlap_regime(
+    weights: dict[str, float],
+    global_counts: Counter[str],
+    split_counts: Counter[str],
+) -> str:
+    """Prefer current global/split deficits without making them hard gates."""
+    global_total = sum(global_counts.values()) + 1
+    split_total = sum(split_counts.values()) + 1
+    return max(
+        sorted(weights),
+        key=lambda name: (
+            global_total * float(weights[name]) - global_counts[name]
+            + split_total * float(weights[name]) - split_counts[name]
+        ),
+    )
 def _robot_states(
     config: dict[str, Any],
     heights: dict[str, float],
@@ -775,7 +805,10 @@ def generate_dataset(
             },
             "bev_conventions": {
                 "occupancy": "observed geometry above floor; not traversability",
-                "traversability": "robot-footprint-eroded navigation mask",
+                "point_traversability": "floor-supported point navigability before robot footprint",
+                "any_yaw_navigable": "at least one exact footprint yaw is collision-free",
+                "yaw_freedom": "fraction of discretized footprint yaw bins collision-free",
+                "traversability": "deprecated alias of any_yaw_navigable",
                 "environment_resolution_mpp": float(config["bev"]["environment_meters_per_pixel"]),
                 "world_resolution_mpp": float(config["bev"]["world_meters_per_pixel"]),
             },
@@ -821,6 +854,10 @@ def generate_dataset(
     adapter = OmniGibsonAdapter(runtime, config)
     accepted_configurations = 0
     accepted_episodes = 0
+    requested_regime_counts: Counter[str] = Counter()
+    realized_regime_counts: Counter[str] = Counter()
+    requested_regime_counts_by_split: dict[str, Counter[str]] = {}
+    realized_regime_counts_by_split: dict[str, Counter[str]] = {}
     try:
         _write_status(root, status="running", stage="launch_simulator", profile=profile)
         adapter.start()
@@ -1087,6 +1124,21 @@ def generate_dataset(
                     try:
                         prior_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
                         used_regions.update(prior_metrics["trajectory"].get("start_region_ids", []))
+                        prior_trajectory = prior_metrics["trajectory"]
+                        prior_requested = str(prior_trajectory.get(
+                            "requested_observation_regime", "unclassified"
+                        ))
+                        prior_realized = str(prior_trajectory.get(
+                            "observation_regime", "unclassified"
+                        ))
+                        requested_regime_counts[prior_requested] += 1
+                        realized_regime_counts[prior_realized] += 1
+                        requested_regime_counts_by_split.setdefault(
+                            splits[selected_scene], Counter()
+                        )[prior_requested] += 1
+                        realized_regime_counts_by_split.setdefault(
+                            splits[selected_scene], Counter()
+                        )[prior_realized] += 1
                     except (OSError, KeyError, json.JSONDecodeError):
                         pass
                 for episode_index in range(requested_episodes):
@@ -1106,6 +1158,14 @@ def generate_dataset(
                     trajectory_metrics = None
                     temporal_overlap_metrics = None
                     visibility_table = None
+                    split_name = splits[selected_scene]
+                    requested_overlap_regime = _soft_requested_overlap_regime(
+                        config["placement"]["observation_regime_weights"],
+                        requested_regime_counts,
+                        requested_regime_counts_by_split.setdefault(
+                            split_name, Counter()
+                        ),
+                    )
                     for placement_attempt in range(int(config["placement"]["maximum_attempts"])):
                         _write_status(
                             root,
@@ -1146,6 +1206,7 @@ def generate_dataset(
                                         config,
                                         candidate_trajectories,
                                         catalog=candidate_catalog,
+                                        requested_regime=requested_overlap_regime,
                                     )
                                     requested_regime = str(
                                         candidate_overlap["requested_regime"]
@@ -1165,6 +1226,21 @@ def generate_dataset(
                                             "observation_regime"
                                         ] = realized_regime
                                     candidate_metrics["temporal_overlap"] = candidate_overlap
+                                    candidate_metrics["overlap_regime_distribution"] = {
+                                        "target_weights": config["placement"]["observation_regime_weights"],
+                                        "global_requested_before_accept": dict(requested_regime_counts),
+                                        "global_realized_before_accept": dict(realized_regime_counts),
+                                        "split": split_name,
+                                        "split_requested_before_accept": dict(
+                                            requested_regime_counts_by_split[split_name]
+                                        ),
+                                        "split_realized_before_accept": dict(
+                                            realized_regime_counts_by_split.setdefault(
+                                                split_name, Counter()
+                                            )
+                                        ),
+                                        "selection_policy": "soft_global_plus_split_deficit_preference",
+                                    }
                                     candidate_metrics["temporal_preflight_candidate_rank"] = (
                                         candidate_rank
                                     )
@@ -1589,6 +1665,18 @@ def generate_dataset(
                         transaction.finalize()
                     used_targets.add(intervention["event"].target_instance_id)
                     accepted_intervention_types[fixed_intervention_type.value] += 1
+                    requested_regime_counts[
+                        str(trajectory_metrics["requested_observation_regime"])
+                    ] += 1
+                    realized_regime_counts[
+                        str(trajectory_metrics["observation_regime"])
+                    ] += 1
+                    requested_regime_counts_by_split[split_name][
+                        str(trajectory_metrics["requested_observation_regime"])
+                    ] += 1
+                    realized_regime_counts_by_split.setdefault(
+                        split_name, Counter()
+                    )[str(trajectory_metrics["observation_regime"])] += 1
                     used_regions.update(trajectory_metrics.get("start_region_ids", []))
                     for region_ids in trajectory_metrics.get("traversed_region_ids", {}).values():
                         used_regions.update(region_ids)
@@ -1609,6 +1697,16 @@ def generate_dataset(
             "scenes": scenes,
             "accepted_configurations": accepted_configurations,
             "accepted_episodes": accepted_episodes,
+            "requested_overlap_regime_counts": dict(requested_regime_counts),
+            "realized_overlap_regime_counts": dict(realized_regime_counts),
+            "requested_overlap_regime_counts_by_split": {
+                name: dict(values)
+                for name, values in requested_regime_counts_by_split.items()
+            },
+            "realized_overlap_regime_counts_by_split": {
+                name: dict(values)
+                for name, values in realized_regime_counts_by_split.items()
+            },
             "scope": "development profiles only; full generation not started",
         }
         dump_json(root / "generation_result.json", result)

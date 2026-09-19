@@ -84,6 +84,8 @@ class RobotFootprintModel:
     safety_margin_m: float
     yaw_bins: int
     old_reset_aabb_extent_xy_m: tuple[float, float]
+    caster_collision_links: tuple[str, ...] = ()
+    caster_treatment: str = "collision_geometry_union_at_authored_configuration"
 
     def __post_init__(self) -> None:
         for name in ("polygon_xy", "raw_polygon_xy"):
@@ -106,6 +108,8 @@ class RobotFootprintModel:
             "safety_margin_m": self.safety_margin_m,
             "yaw_bins": self.yaw_bins,
             "old_reset_aabb_extent_xy_m": list(self.old_reset_aabb_extent_xy_m),
+            "caster_collision_links": list(self.caster_collision_links),
+            "caster_treatment": self.caster_treatment,
         }
 
 
@@ -142,6 +146,9 @@ def build_robot_footprint_model(
         old_reset_aabb_extent_xy_m=tuple(
             map(float, np.asarray(old_reset_aabb_extent_xy_m).reshape(2))
         ),
+        caster_collision_links=tuple(sorted(
+            name for name in usable if "caster" in name.lower()
+        )),
     )
 
 
@@ -690,8 +697,6 @@ def select_joint_route_candidates(
             region_graph is not None
             and not route_start_regions_connected(selected, region_graph)
         ):
-            continue
-        if sum(route.trajectory.path_family != "direct" for route in selected) < minimum_waypoint_trajectories:
             continue
         score = _triplet_score(selected)
         visibility_score = 0.0

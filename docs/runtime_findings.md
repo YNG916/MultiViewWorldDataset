@@ -1,6 +1,6 @@
 # Installed API findings and gate status
 
-This report records the stack inspected on 2026-08-26. It is evidence for this checkout, not a promise that every
+This report records the stack inspected through 2026-09-18. It is evidence for this checkout, not a promise that every
 OmniGibson release exposes identical APIs.
 
 ## Installed stack and APIs
@@ -43,7 +43,24 @@ Gates 0-4, 6, 7, and the gate-14 simulator probe have executable evidence. Simul
 configuration hashing, trajectories, rigid/articulation/state event proposals, paired QA, atomic episode writing, and
 resume guards exist for gates 5, 8, 10, 12, and 13.
 
-Gates 5, 8-13, and 15 have **not** passed end-to-end simulator acceptance. In particular, the project-owned Nova
-Carter layer is a portable visual/template asset, but its physical prismatic mast and OmniGibson robot registration
-still require runtime articulation QA before gate 11 can pass. No full, pilot, or 1x5x3 integration generation was
-started.
+The final `mobile_sensor_robot_v1` completed a prior 1×1×1, 60-frame Beechwood
+regression (`final_robot_routefirst_graph_v22_labelcache_gpu4_20260917`) with
+all QA passing and byte-identical before/after trajectories. That run predates
+the present SE(2) redesign and is a regression reference, not validation of the
+new planner.
+
+The 2026-09-18 redesign fixes NumPy-2 tensor detection, removes yaw-freedom,
+route-bank-size, and waypoint-family hard gates, adds project-side SE(2)
+forward/stop-turn planning, complete relation refresh, explicit BEV navigation
+layers, six-category PhysX footprint calibration, finite-score proxy fallback,
+and a navigation-only all-scene sweep command. CPU tests and microtests must
+pass first. The required next simulator order is: `Rs_int` navigation sweep,
+Beechwood regression sweep, full discovered-scene navigation sweep, evidence
+review, then (only if healthy) a clean 1×1×1 smoke. No pilot or full generation
+is authorized by these changes, and robot geometry has not been changed.
+
+OmniGibson 3.9.2 / Isaac Sim 5 does not reliably support loading a different
+scene after `og.clear()` in the same process: stale SyntheticData nodes can
+raise `Invalid NodeObj`, and PhysX/USD prim cleanup can fail. Full navigation
+sweeps therefore isolate discovery and every scene in separate spawned
+processes and persist each result before `SimulationApp.close()`.
