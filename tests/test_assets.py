@@ -32,12 +32,28 @@ def test_materializes_final_robot_as_omnigibson_overlay(tmp_path: Path) -> None:
     assert "sliding_sleeve" in usd
     assert "sensor_head_housing" in usd
     assert "sensor_head_top_cap" in usd
+    assert "lower_chassis_center" in usd
+    assert "lower_chassis_front_cap" in usd
+    assert "lower_chassis_rear_cap" in usd
+    assert "chassis_identity_deck" in usd
+    assert "chassis_identity_left" in usd
     assert "front_lens" in usd
     assert "visibility = \"invisible\"" in usd
     assert "lower edge is 0.775 m" in usd
+    assert usd.count("float inputs:opacity = 1") == 6
+    assert "double3 xformOp:scale = (0.64, 0.44, 0.055)" in usd
+    assert "double3 xformOp:translate = (-0.23, 0, 0.315)" in usd
+    assert "closed capsule-like" in usd
     for material in ("accent_orange", "accent_blue", "accent_green"):
         assert f'def Material "{material}"' in usd
     for visual_prim in (
+        "integration_base_plate",
+        "lower_chassis_center",
+        "lower_chassis_front_cap",
+        "lower_chassis_rear_cap",
+        "chassis_identity_deck",
+        "chassis_identity_left",
+        "chassis_identity_right",
         "tower_outer_shell",
         "tower_accent_band",
         "sliding_sleeve",

@@ -19,6 +19,7 @@ def Xform "mobile_sensor_robot_v1" (
                 uniform token info:id = "UsdPreviewSurface"
                 color3f inputs:diffuseColor = (0.18, 0.20, 0.23)
                 float inputs:metallic = 0.32
+                float inputs:opacity = 1
                 float inputs:roughness = 0.38
                 token outputs:surface
             }
@@ -31,6 +32,7 @@ def Xform "mobile_sensor_robot_v1" (
                 uniform token info:id = "UsdPreviewSurface"
                 color3f inputs:diffuseColor = (0.035, 0.045, 0.055)
                 float inputs:metallic = 0.18
+                float inputs:opacity = 1
                 float inputs:roughness = 0.48
                 token outputs:surface
             }
@@ -44,6 +46,7 @@ def Xform "mobile_sensor_robot_v1" (
                 color3f inputs:diffuseColor = (0.008, 0.018, 0.028)
                 color3f inputs:emissiveColor = (0.015, 0.055, 0.085)
                 float inputs:metallic = 0.1
+                float inputs:opacity = 1
                 float inputs:roughness = 0.12
                 token outputs:surface
             }
@@ -56,6 +59,7 @@ def Xform "mobile_sensor_robot_v1" (
                 uniform token info:id = "UsdPreviewSurface"
                 color3f inputs:diffuseColor = (0.95, 0.31, 0.055)
                 float inputs:metallic = 0.12
+                float inputs:opacity = 1
                 float inputs:roughness = 0.30
                 token outputs:surface
             }
@@ -68,6 +72,7 @@ def Xform "mobile_sensor_robot_v1" (
                 uniform token info:id = "UsdPreviewSurface"
                 color3f inputs:diffuseColor = (0.04, 0.34, 0.92)
                 float inputs:metallic = 0.12
+                float inputs:opacity = 1
                 float inputs:roughness = 0.30
                 token outputs:surface
             }
@@ -80,6 +85,7 @@ def Xform "mobile_sensor_robot_v1" (
                 uniform token info:id = "UsdPreviewSurface"
                 color3f inputs:diffuseColor = (0.05, 0.62, 0.25)
                 float inputs:metallic = 0.12
+                float inputs:opacity = 1
                 float inputs:roughness = 0.30
                 token outputs:surface
             }
@@ -99,8 +105,78 @@ def Xform "mobile_sensor_robot_v1" (
             {
                 double size = 1
                 rel material:binding = </mobile_sensor_robot_v1/Looks/body_shell>
-                double3 xformOp:scale = (0.30, 0.24, 0.055)
-                double3 xformOp:translate = (0, 0, 0.315)
+                double3 xformOp:scale = (0.64, 0.44, 0.055)
+                double3 xformOp:translate = (-0.23, 0, 0.315)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            }
+            # Nova Carter's functional chassis is an open frame spanning
+            # approximately x=[-0.587, 0.120], y=[-0.239, 0.239] in the robot
+            # frame. The old 0.30 m plate covered only its front portion and
+            # made the wheel/caster assemblies appear to hang from empty space.
+            # These overlapping render-only pieces form one closed capsule-like
+            # lower body while leaving the wheels and rear casters visible.
+            def Cube "lower_chassis_center" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                double size = 1
+                rel material:binding = </mobile_sensor_robot_v1/Looks/body_shell>
+                double3 xformOp:scale = (0.46, 0.39, 0.18)
+                double3 xformOp:translate = (-0.23, 0, 0.215)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            }
+            def Cylinder "lower_chassis_front_cap" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                token axis = "Z"
+                double radius = 0.195
+                double height = 0.18
+                rel material:binding = </mobile_sensor_robot_v1/Looks/body_shell>
+                double3 xformOp:scale = (0.61, 1, 1)
+                double3 xformOp:translate = (0, 0, 0.215)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            }
+            def Cylinder "lower_chassis_rear_cap" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                token axis = "Z"
+                double radius = 0.195
+                double height = 0.18
+                rel material:binding = </mobile_sensor_robot_v1/Looks/body_shell>
+                double3 xformOp:scale = (0.61, 1, 1)
+                double3 xformOp:translate = (-0.46, 0, 0.215)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            }
+            def Cube "chassis_identity_deck" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                double size = 1
+                rel material:binding = </mobile_sensor_robot_v1/Looks/accent_orange>
+                double3 xformOp:scale = (0.40, 0.30, 0.012)
+                double3 xformOp:translate = (-0.26, 0, 0.3485)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            }
+            def Cube "chassis_identity_left" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                double size = 1
+                rel material:binding = </mobile_sensor_robot_v1/Looks/accent_orange>
+                double3 xformOp:scale = (0.40, 0.014, 0.10)
+                double3 xformOp:translate = (-0.23, 0.202, 0.225)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            }
+            def Cube "chassis_identity_right" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                double size = 1
+                rel material:binding = </mobile_sensor_robot_v1/Looks/accent_orange>
+                double3 xformOp:scale = (0.40, 0.014, 0.10)
+                double3 xformOp:translate = (-0.23, -0.202, 0.225)
                 uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
             }
             def Cylinder "tower_outer_shell" (

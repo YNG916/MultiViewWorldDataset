@@ -10,13 +10,16 @@ The project-local overlay under
 `assets/robots/mobile_sensor_robot_v1` adds a calibrated physical mast camera
 and a lightweight product-style visual superstructure:
 
-- a mounting plate and lower/upper collars integrate the tower with the chassis;
+- a closed graphite lower fairing spans the full Nova wheel/caster frame,
+  replacing the former undersized plate that exposed the open reference frame;
+- an expanded mounting deck and lower/upper collars integrate the tower with
+  that lower body;
 - a fixed graphite outer tower encloses the lower mechanism;
 - a long sliding inner sleeve remains overlapped with the outer tower at every
   allowed height, eliminating the former visible floating gap;
 - a compact sensor housing, front lens, and front marker make heading obvious;
 - a broad color-matched sensor-head top cap makes identity legible from above;
-- broad tower/head accent surfaces remain visible in ego images and world BEV.
+- broad deck, side, tower, and head identity surfaces remain visible in ego
 
 The new shell and color parts are render-only and intentionally have no
 `PhysicsCollisionAPI`. The previously validated Nova Carter footprint and the

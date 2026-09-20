@@ -116,10 +116,11 @@ regime gate. Before and after branches still use the exact same accepted
 trajectory bytes.
 
 The official robot remains Nova Carter based. Its project overlay now uses an
-integrated fixed tower shroud, overlapping sliding sleeve, clean sensor housing,
-broad color identity top cap, and front lens/heading marker. These additions
-are visual-only and preserve the
-validated footprint and camera frame. Canonical appearance identity is
+opaque closed lower-chassis fairing aligned to the full Nova wheel/caster
+frame, an expanded mounting deck, integrated fixed tower shroud, overlapping
+sliding sleeve, clean sensor housing, broad color identity surfaces, and a
+front lens/heading marker. These additions are visual-only and preserve the
+validated collision footprint and camera frame. Canonical appearance identity is
 `robot_00` orange, `robot_01` blue, and `robot_02` green. New RGB and normal
 outputs are exactly three channels (RGB and camera-space XYZ respectively).
 

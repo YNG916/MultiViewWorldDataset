@@ -69,6 +69,14 @@ bind to five visual-only prims per robot. The later BEV identity top-cap
 refinement is 0.19×0.14×0.012 m and has no collision API; the focused runtime
 validator again reported unchanged collision geometry and camera-frame errors
 below 1e-6-scale numerical noise.
+The lower-chassis closure was then validated by
+`final_robot_asset_v9_closed_base_gpu0_20260920`. The opaque body spans
+x=[-0.579, 0.119], y=[-0.195, 0.195] m; all lower visual parts remain inside
+the native collision XY envelope, have no collision API, and overlap the
+mounting plate by 0.0175 m. All six project materials report opacity 1.0, all
+three identities bind eight accent prims, and all nine front/side/rear close-up
+renders were produced. The validator passed with collision geometry unchanged
+and maximum camera-rotation drift below 2e-7 across all four mast heights.
 
 The final CPU suite passes 115 tests. No pilot or full generation was run, and
 full generation has not been started.

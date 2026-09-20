@@ -373,6 +373,9 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             return
         accent_relative_paths = (
             "chassis_link/mvwd_sensor_rig/tower_accent_band",
+            "chassis_link/mvwd_sensor_rig/chassis_identity_deck",
+            "chassis_link/mvwd_sensor_rig/chassis_identity_left",
+            "chassis_link/mvwd_sensor_rig/chassis_identity_right",
             "mast_carriage/sliding_sleeve_accent",
             "mast_carriage/sensor_head_accent",
             "mast_carriage/sensor_head_top_cap",

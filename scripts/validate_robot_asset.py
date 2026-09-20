@@ -10,6 +10,7 @@ import numpy as np
 
 from multi_view_world_dataset.adapters.omnigibson import OmniGibsonAdapter
 from multi_view_world_dataset.assets import ROBOT_APPEARANCE_VARIANTS
+from multi_view_world_dataset.rendering.inspection import save_rgb
 from multi_view_world_dataset.utils.config import load_yaml_config
 from multi_view_world_dataset.utils.runtime import resolve_runtime_paths
 from multi_view_world_dataset.utils.serialization import dump_json
@@ -94,9 +95,270 @@ def _place_validation_robots(
             raise RuntimeError(
                 f"{robot.name} validation placement collides: {contact_pairs[:10]}"
             )
-
-
     return initial_heights, positions
+
+
+def _authored_visual_bounds(prim: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Return local axis-aligned bounds for an unrotated project visual."""
+    translate_attr = prim.GetAttribute("xformOp:translate")
+    scale_attr = prim.GetAttribute("xformOp:scale")
+    translate_value = translate_attr.Get() if translate_attr.IsValid() else None
+    scale_value = scale_attr.Get() if scale_attr.IsValid() else None
+    center = np.asarray(
+        translate_value if translate_value is not None else (0.0, 0.0, 0.0),
+        dtype=np.float64,
+    )
+    scale = np.abs(
+        np.asarray(
+            scale_value if scale_value is not None else (1.0, 1.0, 1.0),
+            dtype=np.float64,
+        )
+    )
+    if prim.GetTypeName() == "Cube":
+        size = float(prim.GetAttribute("size").Get())
+        half_extent = 0.5 * size * scale
+    elif prim.GetTypeName() == "Cylinder":
+        if str(prim.GetAttribute("axis").Get()) != "Z":
+            raise RuntimeError(f"unexpected chassis cylinder axis: {prim.GetPath()}")
+        radius = float(prim.GetAttribute("radius").Get())
+        height = float(prim.GetAttribute("height").Get())
+        half_extent = np.asarray(
+            [radius * scale[0], radius * scale[1], 0.5 * height * scale[2]]
+        )
+    else:
+        raise RuntimeError(
+            f"unsupported authored chassis visual type: {prim.GetTypeName()}"
+        )
+    return center - half_extent, center + half_extent
+
+
+def _validate_chassis_visuals(
+    adapter: OmniGibsonAdapter,
+    stage: Any,
+    root: str,
+) -> dict[str, Any]:
+    relative_paths = (
+        "integration_base_plate",
+        "lower_chassis_center",
+        "lower_chassis_front_cap",
+        "lower_chassis_rear_cap",
+        "chassis_identity_deck",
+        "chassis_identity_left",
+        "chassis_identity_right",
+    )
+    rig_root = f"{root}/chassis_link/mvwd_sensor_rig"
+    bounds: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for name in relative_paths:
+        prim = stage.GetPrimAtPath(f"{rig_root}/{name}")
+        if not prim.IsValid():
+            raise RuntimeError(f"lower chassis visual is missing: {prim.GetPath()}")
+        if any(
+            "PhysicsCollisionAPI" in schema
+            for schema in prim.GetAppliedSchemas()
+        ):
+            raise RuntimeError(f"lower chassis visual gained collision API: {name}")
+        bounds[name] = _authored_visual_bounds(prim)
+
+    material_opacity: dict[str, float] = {}
+    for material_name in (
+        "body_shell",
+        "trim_dark",
+        "lens",
+        "accent_orange",
+        "accent_blue",
+        "accent_green",
+    ):
+        shader = stage.GetPrimAtPath(f"{root}/Looks/{material_name}/Shader")
+        if not shader.IsValid():
+            raise RuntimeError(f"visual material shader is missing: {material_name}")
+        opacity = shader.GetAttribute("inputs:opacity").Get()
+        if opacity is None or abs(float(opacity) - 1.0) > 1.0e-7:
+            raise RuntimeError(
+                f"visual material {material_name} is not explicitly opaque: {opacity}"
+            )
+        material_opacity[material_name] = float(opacity)
+
+    shell_min = np.min(np.stack([value[0] for value in bounds.values()]), axis=0)
+    shell_max = np.max(np.stack([value[1] for value in bounds.values()]), axis=0)
+    robot = adapter._env.robots[0]
+    world_to_base = np.linalg.inv(adapter._pose_matrix(robot))
+    disabled = set(getattr(robot, "disabled_collision_link_names", ()))
+    collision_points = []
+    collision_links = []
+    for link_name, link in sorted(robot.links.items()):
+        if (
+            link_name in disabled
+            or not bool(getattr(link, "has_collision_meshes", False))
+        ):
+            continue
+        points = getattr(link, "collision_boundary_points_world", None)
+        if points is None:
+            continue
+        points = adapter._native_value(points).astype(np.float64)
+        if points.ndim != 2 or points.shape[1] != 3 or not len(points):
+            continue
+        local = np.column_stack((points, np.ones(len(points)))) @ world_to_base.T
+        collision_points.append(local[:, :3])
+        collision_links.append(str(link_name))
+    if not collision_points:
+        raise RuntimeError("robot exposes no collision boundary points")
+    collision = np.concatenate(collision_points)
+    collision_min = collision.min(axis=0)
+    collision_max = collision.max(axis=0)
+    tolerance_m = 0.015
+    if np.any(shell_min[:2] < collision_min[:2] - tolerance_m) or np.any(
+        shell_max[:2] > collision_max[:2] + tolerance_m
+    ):
+        raise RuntimeError(
+            "visual lower chassis exceeds the existing collision XY envelope: "
+            f"visual={shell_min[:2], shell_max[:2]}, "
+            f"collision={collision_min[:2], collision_max[:2]}"
+        )
+
+    body_names = (
+        "lower_chassis_center",
+        "lower_chassis_front_cap",
+        "lower_chassis_rear_cap",
+    )
+    body_min = np.min(np.stack([bounds[name][0] for name in body_names]), axis=0)
+    body_max = np.max(np.stack([bounds[name][1] for name in body_names]), axis=0)
+    plate_min, plate_max = bounds["integration_base_plate"]
+    deck_min, _ = bounds["chassis_identity_deck"]
+    body_plate_overlap = float(body_max[2] - plate_min[2])
+    plate_deck_gap = float(deck_min[2] - plate_max[2])
+    if body_plate_overlap <= 0.0:
+        raise RuntimeError("lower chassis body does not overlap its mounting plate")
+    if abs(plate_deck_gap) > 1.0e-6:
+        raise RuntimeError(
+            f"identity deck is not seated on the mounting plate: {plate_deck_gap}"
+        )
+    return {
+        "visual_prim_paths": [f"{rig_root}/{name}" for name in relative_paths],
+        "all_visual_prims_collision_free": True,
+        "material_opacity": material_opacity,
+        "visual_envelope_local_m": {
+            "minimum": shell_min.tolist(),
+            "maximum": shell_max.tolist(),
+        },
+        "body_envelope_local_m": {
+            "minimum": body_min.tolist(),
+            "maximum": body_max.tolist(),
+        },
+        "native_collision_envelope_local_m": {
+            "minimum": collision_min.tolist(),
+            "maximum": collision_max.tolist(),
+            "source_links": collision_links,
+        },
+        "body_plate_overlap_m": body_plate_overlap,
+        "plate_deck_gap_m": plate_deck_gap,
+    }
+
+
+def _usd_look_at(position: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """Build a USD camera transform whose local -Z axis looks at target."""
+    forward = np.asarray(target, dtype=np.float64) - np.asarray(
+        position, dtype=np.float64
+    )
+    forward /= np.linalg.norm(forward)
+    right = np.cross(forward, np.asarray([0.0, 0.0, 1.0]))
+    right /= np.linalg.norm(right)
+    up = np.cross(right, forward)
+    transform = np.eye(4)
+    transform[:3, :3] = np.column_stack((right, up, -forward))
+    transform[:3, 3] = position
+    return transform
+
+
+def _render_chassis_validation_views(
+    adapter: OmniGibsonAdapter,
+    output_root: Path,
+) -> dict[str, list[str]]:
+    """Render unobstructed close views without changing robot physics."""
+    camera = adapter._final_robot_capture_sensor
+    if camera is None:
+        raise RuntimeError("final robot capture sensor is unavailable")
+    adapter._configure_final_robot_ego_capture(camera)
+    stage = adapter._og.sim.stage
+    pxr = adapter._lazy.pxr
+    robot_paths = {str(robot.prim_path) for robot in adapter._env.robots}
+    with adapter._og.sim.editing_usd():
+        for obj in adapter._require_scene().objects:
+            if str(getattr(obj, "category", "")) == "floors":
+                continue
+            path = str(obj.prim_path)
+            if path in robot_paths:
+                continue
+            prim = stage.GetPrimAtPath(path)
+            if prim.IsValid():
+                pxr.UsdGeom.Imageable(prim).MakeInvisible()
+        light = pxr.UsdLux.DistantLight.Define(
+            stage, "/World/mvwd_robot_asset_validation_light"
+        )
+        light.CreateIntensityAttr(2500.0)
+
+    robots = sorted(adapter._env.robots, key=lambda item: item.name)
+    for robot in robots:
+        joint = next(
+            joint
+            for name, joint in robot.joints.items()
+            if name.endswith("mvwd_mast_joint")
+        )
+        adapter._development_camera_mounts[robot.name][2, 3] = 0.8
+        joint.set_pos(0.0, drive=False)
+        adapter._restore_final_robot_mast_mount(robot)
+        robot.keep_still()
+    adapter._og.sim.step_physics()
+
+    views = {
+        "front_right": np.asarray([1.15, -1.15, 0.80]),
+        "right_side": np.asarray([0.0, -1.35, 0.62]),
+        "rear_left": np.asarray([-1.45, 1.00, 0.75]),
+    }
+    target_local = np.asarray([-0.23, 0.0, 0.30, 1.0])
+    output: dict[str, list[str]] = {}
+    view_root = output_root / "inspection" / "robot_asset_views"
+    for robot in robots:
+        with adapter._og.sim.editing_usd():
+            for candidate in robots:
+                imageable = pxr.UsdGeom.Imageable(
+                    stage.GetPrimAtPath(str(candidate.prim_path))
+                )
+                if candidate is robot:
+                    imageable.MakeVisible()
+                else:
+                    imageable.MakeInvisible()
+        base_to_world = adapter._pose_matrix(robot)
+        target_world = (base_to_world @ target_local)[:3]
+        output[robot.name] = []
+        for view_name, offset in views.items():
+            camera_position = (
+                base_to_world
+                @ np.asarray([offset[0], offset[1], offset[2], 1.0])
+            )[:3]
+            camera_to_world = _usd_look_at(camera_position, target_world)
+            position, orientation = adapter._transform_utils.mat2pose(
+                adapter._th.as_tensor(
+                    camera_to_world, dtype=adapter._th.float32
+                )
+            )
+            camera.set_position_orientation(
+                position=position, orientation=orientation
+            )
+            for _ in range(4):
+                adapter._og.sim.render()
+            observation, _ = camera.get_obs()
+            rgb = adapter._reshape_vision_observation(
+                camera, "rgb", observation["rgb"]
+            )
+            rgb = adapter._native_value(rgb)
+            if float(np.std(rgb[..., :3])) < 2.0:
+                raise RuntimeError(
+                    f"asset validation view is blank: {robot.name}/{view_name}"
+                )
+            path = view_root / f"{robot.name}_{view_name}.png"
+            save_rgb(path, rgb)
+            output[robot.name].append(str(path.relative_to(output_root)))
+    return output
 
 
 def validate_robot_asset(
@@ -136,6 +398,7 @@ def validate_robot_asset(
             )
 
         root = str(adapter._env.robots[0].prim_path)
+        chassis_visual_qa = _validate_chassis_visuals(adapter, stage, root)
         outer = stage.GetPrimAtPath(
             f"{root}/chassis_link/mvwd_sensor_rig/tower_outer_shell"
         )
@@ -266,6 +529,7 @@ def validate_robot_asset(
                 "shroud_overlap_m": overlap,
                 "robots": per_robot,
             })
+        rendered_views = _render_chassis_validation_views(adapter, output_root)
 
         report.update({
             "status": "pass",
@@ -284,6 +548,8 @@ def validate_robot_asset(
             "visual_shell_collision_geometry_changed": False,
             "bev_identity_top_cap_scale_m": top_cap_scale,
             "front_visual_local_x_m": front_x,
+            "lower_chassis_visual_qa": chassis_visual_qa,
+            "rendered_chassis_views": rendered_views,
         })
         return report
     except BaseException as error:
