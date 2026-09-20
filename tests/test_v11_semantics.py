@@ -1,15 +1,26 @@
 import json
+from collections import Counter
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-from multi_view_world_dataset.errors import ConfigurationError
+import multi_view_world_dataset.rendering.labels as label_module
+from multi_view_world_dataset.adapters.omnigibson import OmniGibsonAdapter
+from multi_view_world_dataset.errors import ConfigurationError, SampleRejected, SimulatorUnavailableError
 from multi_view_world_dataset.generator import (
+    _gt_valid_candidate_soft_score,
+    _robot_states,
     _sparse_intervention_visibility_preflight,
     _temporal_overlap_preflight,
 )
-from multi_view_world_dataset.rendering.labels import remap_public_labels, stable_semantic_id
+from multi_view_world_dataset.rendering.labels import (
+    SemanticIDCollisionError,
+    remap_public_labels,
+    stable_semantic_id,
+    validate_semantic_id_uniqueness,
+)
+from multi_view_world_dataset.rendering.inspection_v11 import save_robot_appearance_summary
 from multi_view_world_dataset.sampling.diversity import (
     complementary_hybrid_trajectory_sets,
     joint_trajectory_metrics,
@@ -18,7 +29,7 @@ from multi_view_world_dataset.sampling.diversity import (
     temporal_overlap_acceptance,
 )
 from multi_view_world_dataset.sampling.trajectories import trajectory_from_spatial_path
-from multi_view_world_dataset.schema.records import ObjectState
+from multi_view_world_dataset.schema.records import ObjectState, RobotState
 from multi_view_world_dataset.storage.writer import DatasetWriter
 
 
@@ -608,3 +619,124 @@ def test_camera_view_proxy_rewards_shared_scene_content_not_parallel_headings():
     ) > regime_trajectory_soft_score(
         sparse, "dense_shared", saturation, view_connectivity_weights=weights,
     )
+
+def test_realized_regime_soft_score_prefers_running_deficit_without_hard_gate():
+    weights = {"dense_shared": 0.30, "partial_chain": 0.50, "exploratory": 0.20}
+    global_counts = Counter({"dense_shared": 6, "partial_chain": 4})
+    split_counts = Counter({"dense_shared": 3, "partial_chain": 2})
+    metrics = {"cheap_scene_visibility": {"score": 1.0}}
+    exploratory = _gt_valid_candidate_soft_score(
+        metrics, 0, 3, "exploratory", weights, global_counts, split_counts,
+        lambda_regime=0.75,
+    )
+    dense = _gt_valid_candidate_soft_score(
+        metrics, 0, 3, "dense_shared", weights, global_counts, split_counts,
+        lambda_regime=0.75,
+    )
+    assert exploratory["realized_regime_deficit_preference"] > 0.0
+    assert exploratory["final_score"] > dense["final_score"]
+    feasible_only = _gt_valid_candidate_soft_score(
+        metrics, 2, 3, "dense_shared", weights, global_counts, split_counts,
+        lambda_regime=0.75,
+    )
+    assert np.isfinite(feasible_only["final_score"])
+
+
+def test_robot_state_serializes_mast_extension_consistently():
+    config = {
+        "robot": {
+            "use_final_robot": True,
+            "final_model": "mobile_sensor_robot_v1",
+            "development_model": "turtlebot",
+        },
+        "camera": {"heights_m": [0.8, 1.0, 1.2, 1.4]},
+    }
+    robot_ids = ("robot_00", "robot_01", "robot_02")
+    heights = {"robot_00": 0.8, "robot_01": 1.0, "robot_02": 1.4}
+    trajectories = tuple(
+        SimpleNamespace(robot_id=robot_id, base_to_world=np.eye(4)[None])
+        for robot_id in robot_ids
+    )
+    states = _robot_states(config, heights, trajectories)
+    assert all(isinstance(state, RobotState) for state in states)
+    assert [state.mast_joint_value_m for state in states] == pytest.approx(
+        [0.0, 0.2, 0.6]
+    )
+    assert all(
+        state.camera_height_m == pytest.approx(0.8 + state.mast_joint_value_m)
+        for state in states
+    )
+
+
+def test_semantic_hash_collision_raises_and_writer_persists_context(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(label_module, "stable_semantic_id", lambda category: 99)
+    with pytest.raises(SemanticIDCollisionError, match="chair.*table"):
+        validate_semantic_id_uniqueness(["chair", "table"])
+
+    writer = DatasetWriter(tmp_path / "dataset")
+    writer.initialize({"schema_version": "1.1.0"})
+    catalog = (
+        _object("chair_a", "/World/chair_a", "chair"),
+        _object("table_a", "/World/table_a", "table"),
+    )
+    with pytest.raises(ConfigurationError, match="semantic ID collision"):
+        writer.update_scene_taxonomy("scene", catalog)
+    diagnostic = json.loads(
+        (writer.root / "semantic_id_collision.json").read_text(encoding="utf-8")
+    )
+    assert diagnostic["semantic_id"] == 99
+    assert diagnostic["category_names"] == ["chair", "table"]
+    assert diagnostic["scene_id"] == "scene"
+
+
+def test_legacy_sampler_entry_points_emit_deprecation_warnings():
+    adapter = object.__new__(OmniGibsonAdapter)
+    adapter._started = False
+    with pytest.warns(DeprecationWarning, match="legacy compatibility"):
+        with pytest.raises(SimulatorUnavailableError):
+            adapter.place_development_robots(1)
+
+    observations = {
+        "robot_00": {
+            "base_to_world": np.eye(4),
+            "camera_to_base": np.eye(4),
+        }
+    }
+    with pytest.warns(DeprecationWarning, match="legacy compatibility"):
+        with pytest.raises(AttributeError):
+            adapter.sample_robot_trajectories(
+                1, observations_override=observations
+            )
+
+    adapter.config = {
+        "trajectory": {
+            "trajectory_sets_per_placement": 0,
+        }
+    }
+    adapter.robot_observations = lambda: {}
+    with pytest.warns(DeprecationWarning, match="legacy compatibility"):
+        with pytest.raises(SampleRejected, match="trajectory_set_pool_exhausted"):
+            adapter.sample_robot_trajectory_sets(1)
+
+
+def test_robot_appearance_summary_writes_three_variant_panel(tmp_path):
+    rgb = np.full((64, 96, 3), 180, dtype=np.uint8)
+    instances = np.zeros((64, 96), dtype=np.int32)
+    instances[8:24, 8:24] = 1
+    instances[24:40, 36:52] = 2
+    instances[40:56, 68:84] = 3
+    rgb[instances == 1] = (242, 79, 14)
+    rgb[instances == 2] = (10, 87, 235)
+    rgb[instances == 3] = (13, 158, 64)
+
+    output = tmp_path / "robot_appearance_summary.png"
+    save_robot_appearance_summary(output, rgb, instances)
+
+    assert output.is_file()
+    from PIL import Image
+
+    with Image.open(output) as image:
+        assert image.mode == "RGB"
+        assert image.size == (960, 540)

@@ -1,6 +1,6 @@
 # Installed API findings and gate status
 
-This report records the stack inspected through 2026-09-18. It is evidence for this checkout, not a promise that every
+This report records the stack inspected through 2026-09-20. It is evidence for this checkout, not a promise that every
 OmniGibson release exposes identical APIs.
 
 ## Installed stack and APIs
@@ -43,21 +43,35 @@ Gates 0-4, 6, 7, and the gate-14 simulator probe have executable evidence. Simul
 configuration hashing, trajectories, rigid/articulation/state event proposals, paired QA, atomic episode writing, and
 resume guards exist for gates 5, 8, 10, 12, and 13.
 
-The final `mobile_sensor_robot_v1` completed a prior 1×1×1, 60-frame Beechwood
-regression (`final_robot_routefirst_graph_v22_labelcache_gpu4_20260917`) with
-all QA passing and byte-identical before/after trajectories. That run predates
-the present SE(2) redesign and is a regression reference, not validation of the
-new planner.
-
 The 2026-09-18 redesign fixes NumPy-2 tensor detection, removes yaw-freedom,
 route-bank-size, and waypoint-family hard gates, adds project-side SE(2)
 forward/stop-turn planning, complete relation refresh, explicit BEV navigation
 layers, six-category PhysX footprint calibration, finite-score proxy fallback,
-and a navigation-only all-scene sweep command. CPU tests and microtests must
-pass first. The required next simulator order is: `Rs_int` navigation sweep,
-Beechwood regression sweep, full discovered-scene navigation sweep, evidence
-review, then (only if healthy) a clean 1×1×1 smoke. No pilot or full generation
-is authorized by these changes, and robot geometry has not been changed.
+and a navigation-only all-scene sweep command.
+
+The isolated all-scene navigation sweep completed all 51 discovered scenes with
+38 healthy, 12 constrained, one infeasible, and zero runtime classifications.
+This establishes installed-stack coverage without dense RGB rollout cost.
+
+The final Nova-Carter-based `mobile_sensor_robot_v1` completed a clean 1×1×1,
+60-frame Beechwood smoke at
+`final_robot_dataset_v11_visual_softregime_smoke_beechwood_gpu5_20260920`.
+All eight episode QA checks passed. Before/after trajectory matrix and position
+errors were exactly zero; all RGB and normal outputs were exactly three channel;
+the temporal graph connected at 2/7 keyframes with all three union edges and a
+maximum isolated run of five. One rigid relocation changed exactly one object
+and produced 57,178 changed target pixels at mean RGB delta 81.72.
+
+The official shrouded appearance was separately validated on all three robots
+and all four camera heights by
+`final_robot_asset_v8_topcap_gpu0_20260920`. Orange, blue, and green materials
+bind to five visual-only prims per robot. The later BEV identity top-cap
+refinement is 0.19×0.14×0.012 m and has no collision API; the focused runtime
+validator again reported unchanged collision geometry and camera-frame errors
+below 1e-6-scale numerical noise.
+
+The final CPU suite passes 115 tests. No pilot or full generation was run, and
+full generation has not been started.
 
 OmniGibson 3.9.2 / Isaac Sim 5 does not reliably support loading a different
 scene after `og.clear()` in the same process: stale SyntheticData nodes can

@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 
+from multi_view_world_dataset.assets import ROBOT_APPEARANCE_VARIANTS
 from multi_view_world_dataset.schema.records import Trajectory
 from multi_view_world_dataset.utils.serialization import dump_json
 
@@ -124,7 +125,10 @@ def save_trajectory_inspection(
                 route_pixels, fill=(155, 155, 155), width=max(1, scale)
             )
 
-    colors = ((220, 45, 45), (35, 105, 220), (25, 155, 80))
+    colors = tuple(
+        ROBOT_APPEARANCE_VARIANTS[robot_id]["rgb8"]
+        for robot_id in sorted(ROBOT_APPEARANCE_VARIANTS)
+    )
     for trajectory, color in zip(sorted(trajectories, key=lambda item: item.robot_id), colors, strict=True):
         xy = trajectory.base_to_world[:, :2, 3]
         pixels = [pixel(point) for point in xy]

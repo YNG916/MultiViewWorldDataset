@@ -5,6 +5,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from multi_view_world_dataset.assets import ROBOT_APPEARANCE_VARIANTS
 
 def _record_value(record: Any, key: str, default: Any = None) -> Any:
     if isinstance(record, Mapping):
@@ -165,9 +166,8 @@ def save_overlap_graph_inspection(
         ("robot_01", "robot_02"),
     )
     colors = {
-        "robot_00": (220, 45, 45),
-        "robot_01": (35, 105, 220),
-        "robot_02": (25, 155, 80),
+        robot_id: values["rgb8"]
+        for robot_id, values in ROBOT_APPEARANCE_VARIANTS.items()
     }
     for panel_index, keyframe in enumerate(keyframes):
         origin_x = panel_index * panel_width
@@ -227,6 +227,91 @@ def save_overlap_graph_inspection(
                 (origin_x + 7, banner_height + 132 + row * 16),
                 f"{left[-2:]}-{right[-2:]}: {float(value):.3f}",
                 fill=(0, 0, 0),
+            )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path)
+
+
+def save_robot_appearance_summary(
+    path: Path,
+    world_rgb: np.ndarray,
+    world_instance: np.ndarray,
+) -> None:
+    """Save a world overview and instance-derived close-up for every robot."""
+    try:
+        from PIL import Image, ImageDraw, ImageOps
+    except ImportError as error:
+        raise RuntimeError(
+            "Inspection images require the 'inspection' extra with Pillow"
+        ) from error
+    rgb = np.asarray(world_rgb)[..., :3].astype(np.uint8, copy=False)
+    instances = np.asarray(world_instance)
+    if rgb.ndim != 3 or instances.ndim != 2:
+        raise ValueError(
+            "robot appearance summary expects one RGB and instance frame"
+        )
+    overview = ImageOps.contain(
+        Image.fromarray(rgb).convert("RGB"), (720, 430)
+    )
+    canvas = Image.new("RGB", (960, 540), (245, 245, 245))
+    canvas.paste(overview, ((720 - overview.width) // 2, 58))
+    draw = ImageDraw.Draw(canvas)
+    draw.text(
+        (12, 10),
+        "Final-robot appearance QA | BEV RGB and public-instance crops",
+        fill=(0, 0, 0),
+    )
+    draw.text(
+        (12, 31),
+        "visual colors only; collision geometry, footprint, and camera unchanged",
+        fill=(45, 45, 45),
+    )
+    panel_x = 730
+    for index, (robot_id, specification) in enumerate(
+        ROBOT_APPEARANCE_VARIANTS.items(), start=1
+    ):
+        y = 58 + (index - 1) * 157
+        color = tuple(int(value) for value in specification["rgb8"])
+        draw.rounded_rectangle(
+            (panel_x, y, panel_x + 218, y + 145),
+            radius=8,
+            fill=(255, 255, 255),
+            outline=(175, 175, 175),
+        )
+        draw.rectangle(
+            (panel_x + 8, y + 8, panel_x + 38, y + 32), fill=color
+        )
+        draw.text(
+            (panel_x + 46, y + 11),
+            f"{robot_id} | {specification['display_name']}",
+            fill=(0, 0, 0),
+        )
+        mask = instances == index
+        if bool(mask.any()):
+            rows, columns = np.nonzero(mask)
+            pad = 18
+            crop = Image.fromarray(rgb).crop(
+                (
+                    max(0, int(columns.min()) - pad),
+                    max(0, int(rows.min()) - pad),
+                    min(rgb.shape[1], int(columns.max()) + pad + 1),
+                    min(rgb.shape[0], int(rows.max()) + pad + 1),
+                )
+            )
+            crop = ImageOps.contain(crop, (202, 98))
+            canvas.paste(
+                crop,
+                (
+                    panel_x + 8 + (202 - crop.width) // 2,
+                    y + 40 + (98 - crop.height) // 2,
+                ),
+            )
+        else:
+            draw.text(
+                (panel_x + 109, y + 91),
+                "not visible in t=000 BEV",
+                anchor="mm",
+                fill=(90, 90, 90),
             )
     path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(path)

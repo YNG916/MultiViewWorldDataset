@@ -41,7 +41,7 @@ Generate or resume an accepted development dataset with an explicit output root:
 ```bash
 mvwd generate --config configs/smoke.yaml --scene Rs_int --output-root /path/to/smoke-output
 mvwd generate --config configs/integration.yaml --scene Rs_int --output-root /path/to/integration-output
-# Required final-robot integration gate after the 1x1x1 preview passes:
+# Next clean final-robot integration step after a fresh 1x1x1 regression:
 mvwd generate --config configs/integration_final_robot.yaml --scene Rs_int \
   --output-root /path/to/new-final-robot-integration-output
 ```
@@ -109,8 +109,19 @@ regime. It does not optimize for the most compact or most parallel three-robot f
 nested pool of trajectory sets; temporal acceptance uses the union overlap graph, meaningful shared moments, robot
 participation, regime-aware isolation-run limits, and near-duplicate rejection as hard constraints. Per-keyframe graph
 connectivity and shared-keyframe fractions are soft regime targets used to label both the requested and realized
-regime; they are persisted for QA but do not recreate a compact-formation gate. Before and after branches still use the
-exact same accepted trajectory bytes.
+regime; they are persisted for QA but do not recreate a compact-formation gate. When several candidates pass the
+GT-depth hard checks, the generator softly re-ranks them by route quality plus
+the running global/split deficit of the realized regime. This is never a hard
+regime gate. Before and after branches still use the exact same accepted
+trajectory bytes.
+
+The official robot remains Nova Carter based. Its project overlay now uses an
+integrated fixed tower shroud, overlapping sliding sleeve, clean sensor housing,
+broad color identity top cap, and front lens/heading marker. These additions
+are visual-only and preserve the
+validated footprint and camera frame. Canonical appearance identity is
+`robot_00` orange, `robot_01` blue, and `robot_02` green. New RGB and normal
+outputs are exactly three channels (RGB and camera-space XYZ respectively).
 
 Visualize every stored image modality for one episode in a single command:
 

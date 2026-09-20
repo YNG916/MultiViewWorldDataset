@@ -9,23 +9,156 @@ def Xform "mobile_sensor_robot_v1" (
     prepend references = @__NOVA_CARTER_USD__@
 )
 {
-    # Project-owned geometry. The installed NVIDIA layer is referenced, never modified.
+    def Scope "Looks"
+    {
+        def Material "body_shell"
+        {
+            token outputs:surface.connect = </mobile_sensor_robot_v1/Looks/body_shell/Shader.outputs:surface>
+            def Shader "Shader"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.18, 0.20, 0.23)
+                float inputs:metallic = 0.32
+                float inputs:roughness = 0.38
+                token outputs:surface
+            }
+        }
+        def Material "trim_dark"
+        {
+            token outputs:surface.connect = </mobile_sensor_robot_v1/Looks/trim_dark/Shader.outputs:surface>
+            def Shader "Shader"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.035, 0.045, 0.055)
+                float inputs:metallic = 0.18
+                float inputs:roughness = 0.48
+                token outputs:surface
+            }
+        }
+        def Material "lens"
+        {
+            token outputs:surface.connect = </mobile_sensor_robot_v1/Looks/lens/Shader.outputs:surface>
+            def Shader "Shader"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.008, 0.018, 0.028)
+                color3f inputs:emissiveColor = (0.015, 0.055, 0.085)
+                float inputs:metallic = 0.1
+                float inputs:roughness = 0.12
+                token outputs:surface
+            }
+        }
+        def Material "accent_orange"
+        {
+            token outputs:surface.connect = </mobile_sensor_robot_v1/Looks/accent_orange/Shader.outputs:surface>
+            def Shader "Shader"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.95, 0.31, 0.055)
+                float inputs:metallic = 0.12
+                float inputs:roughness = 0.30
+                token outputs:surface
+            }
+        }
+        def Material "accent_blue"
+        {
+            token outputs:surface.connect = </mobile_sensor_robot_v1/Looks/accent_blue/Shader.outputs:surface>
+            def Shader "Shader"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.04, 0.34, 0.92)
+                float inputs:metallic = 0.12
+                float inputs:roughness = 0.30
+                token outputs:surface
+            }
+        }
+        def Material "accent_green"
+        {
+            token outputs:surface.connect = </mobile_sensor_robot_v1/Looks/accent_green/Shader.outputs:surface>
+            def Shader "Shader"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.05, 0.62, 0.25)
+                float inputs:metallic = 0.12
+                float inputs:roughness = 0.30
+                token outputs:surface
+            }
+        }
+    }
+
+    # Project-owned render geometry. These prims intentionally have no
+    # PhysicsCollisionAPI; the validated Nova Carter collision footprint and
+    # the existing mast/head functional colliders remain authoritative.
     over "chassis_link"
     {
         def Xform "mvwd_sensor_rig"
         {
-            def Cylinder "mast_lower"
+            def Cube "integration_base_plate" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
             {
+                double size = 1
+                rel material:binding = </mobile_sensor_robot_v1/Looks/body_shell>
+                double3 xformOp:scale = (0.30, 0.24, 0.055)
+                double3 xformOp:translate = (0, 0, 0.315)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            }
+            def Cylinder "tower_outer_shell" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                token axis = "Z"
+                double radius = 0.078
+                double height = 0.55
+                rel material:binding = </mobile_sensor_robot_v1/Looks/body_shell>
+                double3 xformOp:translate = (0, 0, 0.555)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+            def Cylinder "tower_lower_collar" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                token axis = "Z"
+                double radius = 0.098
+                double height = 0.055
+                rel material:binding = </mobile_sensor_robot_v1/Looks/trim_dark>
+                double3 xformOp:translate = (0, 0, 0.335)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+            def Cylinder "tower_upper_collar" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                token axis = "Z"
+                double radius = 0.090
+                double height = 0.050
+                rel material:binding = </mobile_sensor_robot_v1/Looks/trim_dark>
+                double3 xformOp:translate = (0, 0, 0.805)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+            def Cylinder "tower_accent_band" (
+                prepend apiSchemas = ["MaterialBindingAPI"]
+            )
+            {
+                token axis = "Z"
+                double radius = 0.081
+                double height = 0.105
+                rel material:binding = </mobile_sensor_robot_v1/Looks/accent_orange>
+                double3 xformOp:translate = (0, 0, 0.455)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+            def Cylinder "mast_lower_hidden"
+            {
+                token visibility = "invisible"
+                token axis = "Z"
                 double radius = 0.025
                 double height = 0.45
-                token axis = "Z"
-                float3[] extent = [(-0.025, -0.025, -0.225), (0.025, 0.025, 0.225)]
-                double3 xformOp:scale = (1, 1, 1)
                 double3 xformOp:translate = (0, 0, 0.575)
-                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+                uniform token[] xformOpOrder = ["xformOp:translate"]
             }
         }
     }
+
     def Xform "mast_carriage" (
         prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
     )
@@ -34,28 +167,127 @@ def Xform "mobile_sensor_robot_v1" (
         float physics:mass = 2
         double3 xformOp:translate = (0, 0, 0.8)
         uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        # Hidden functional colliders preserve the already validated physics.
         def Cylinder "mast_upper" (
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
+            token visibility = "invisible"
             bool physics:collisionEnabled = true
             double radius = 0.02
             double height = 0.4
             token axis = "Z"
-            float3[] extent = [(-0.02, -0.02, -0.2), (0.02, 0.02, 0.2)]
-            double3 xformOp:scale = (1, 1, 1)
-            uniform token[] xformOpOrder = ["xformOp:scale"]
         }
         def Cube "camera_head" (
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {
+            token visibility = "invisible"
             bool physics:collisionEnabled = true
             double size = 1
-            float3[] extent = [(-0.06, -0.04, -0.035), (0.06, 0.04, 0.035)]
             double3 xformOp:scale = (0.12, 0.08, 0.07)
             uniform token[] xformOpOrder = ["xformOp:scale"]
         }
+
+        # The long sleeve always overlaps the fixed tower shell: at 1.4 m its
+        # lower edge is 0.775 m, while the fixed shell reaches 0.830 m.
+        def Cylinder "sliding_sleeve" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            token axis = "Z"
+            double radius = 0.059
+            double height = 0.68
+            rel material:binding = </mobile_sensor_robot_v1/Looks/trim_dark>
+            double3 xformOp:translate = (0, 0, -0.31)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def Cylinder "sliding_sleeve_accent" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            token axis = "Z"
+            double radius = 0.062
+            double height = 0.16
+            rel material:binding = </mobile_sensor_robot_v1/Looks/accent_orange>
+            double3 xformOp:translate = (0, 0, -0.105)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def Cylinder "head_mount_collar" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            token axis = "Z"
+            double radius = 0.074
+            double height = 0.055
+            rel material:binding = </mobile_sensor_robot_v1/Looks/body_shell>
+            double3 xformOp:translate = (0, 0, -0.010)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def Cube "sensor_head_housing" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            double size = 1
+            rel material:binding = </mobile_sensor_robot_v1/Looks/body_shell>
+            double3 xformOp:scale = (0.20, 0.15, 0.105)
+            double3 xformOp:translate = (0.045, 0, 0.028)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+        def Cube "sensor_head_top_cap" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            double size = 1
+            rel material:binding = </mobile_sensor_robot_v1/Looks/accent_orange>
+            double3 xformOp:scale = (0.190, 0.140, 0.012)
+            double3 xformOp:translate = (0.045, 0, 0.086)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+        def Cube "sensor_head_accent" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            double size = 1
+            rel material:binding = </mobile_sensor_robot_v1/Looks/accent_orange>
+            double3 xformOp:scale = (0.070, 0.156, 0.058)
+            double3 xformOp:translate = (-0.020, 0, 0.030)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+        def Cylinder "front_lens_bezel" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            token axis = "X"
+            double radius = 0.033
+            double height = 0.018
+            rel material:binding = </mobile_sensor_robot_v1/Looks/trim_dark>
+            double3 xformOp:translate = (0.154, 0, 0.028)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def Cylinder "front_lens" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            token axis = "X"
+            double radius = 0.024
+            double height = 0.021
+            rel material:binding = </mobile_sensor_robot_v1/Looks/lens>
+            double3 xformOp:translate = (0.165, 0, 0.028)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def Cube "front_direction_marker" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            double size = 1
+            rel material:binding = </mobile_sensor_robot_v1/Looks/accent_orange>
+            double3 xformOp:scale = (0.012, 0.075, 0.015)
+            double3 xformOp:translate = (0.151, 0, -0.010)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+
         def Camera "dataset_camera"
         {
             float focalLength = 14.991
@@ -67,6 +299,7 @@ def Xform "mobile_sensor_robot_v1" (
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient"]
         }
     }
+
     def PhysicsPrismaticJoint "mvwd_mast_joint" (
         prepend apiSchemas = ["PhysicsDriveAPI:linear"]
     )
@@ -84,4 +317,3 @@ def Xform "mobile_sensor_robot_v1" (
         uniform token drive:linear:physics:type = "force"
     }
 }
-

@@ -79,6 +79,14 @@ class RobotState:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "base_to_world", _matrix4(self.base_to_world, "base_to_world"))
+        if not np.isfinite(self.camera_height_m) or self.camera_height_m <= 0.0:
+            raise ValueError("camera_height_m must be finite and positive")
+        if self.mast_joint_value_m is not None and (
+            not np.isfinite(self.mast_joint_value_m)
+            or self.mast_joint_value_m < 0.0
+        ):
+            raise ValueError("mast_joint_value_m must be finite and non-negative")
+
 
 
 @dataclass(frozen=True)

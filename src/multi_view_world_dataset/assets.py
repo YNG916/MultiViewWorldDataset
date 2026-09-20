@@ -5,6 +5,46 @@ from pathlib import Path
 
 from multi_view_world_dataset.errors import SimulatorUnavailableError
 
+# Canonical appearance identity is part of Dataset-v1.1 metadata. The colors
+# are deliberately broad, saturated surfaces rather than small decals so that
+# robot identity remains legible in world BEV and ego views.
+ROBOT_APPEARANCE_VARIANTS: dict[str, dict[str, object]] = {
+    "robot_00": {
+        "variant": "orange",
+        "display_name": "warm orange",
+        "material_prim": "accent_orange",
+        "rgb": (0.95, 0.31, 0.055),
+        "rgb8": (242, 79, 14),
+    },
+    "robot_01": {
+        "variant": "blue",
+        "display_name": "cool blue",
+        "material_prim": "accent_blue",
+        "rgb": (0.04, 0.34, 0.92),
+        "rgb8": (10, 87, 235),
+    },
+    "robot_02": {
+        "variant": "green",
+        "display_name": "signal green",
+        "material_prim": "accent_green",
+        "rgb": (0.05, 0.62, 0.25),
+        "rgb8": (13, 158, 64),
+    },
+}
+
+
+def robot_appearance_metadata() -> dict[str, dict[str, object]]:
+    """Return a JSON-safe copy of the canonical robot appearance mapping."""
+    return {
+        robot_id: {
+            "variant": str(values["variant"]),
+            "display_name": str(values["display_name"]),
+            "material_prim": str(values["material_prim"]),
+            "rgb": [float(value) for value in values["rgb"]],
+        }
+        for robot_id, values in ROBOT_APPEARANCE_VARIANTS.items()
+    }
+
 
 @dataclass(frozen=True)
 class MaterializedRobotAsset:

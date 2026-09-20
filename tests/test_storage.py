@@ -3,6 +3,7 @@ import json
 import numpy as np
 import pytest
 
+from multi_view_world_dataset.rendering.modalities import canonicalize_public_modality
 from multi_view_world_dataset.sampling.trajectories import trajectory_from_spatial_path
 from multi_view_world_dataset.storage.writer import DatasetWriter
 from multi_view_world_dataset.utils.serialization import dump_json
@@ -50,7 +51,21 @@ def test_unfinalized_success_context_is_cleaned(tmp_path):
 def test_nonfinite_values_serialize_as_json_null(tmp_path):
     path = tmp_path / "strict.json"
     dump_json(path, {"limits": np.asarray([-np.inf, np.inf])})
+
     assert json.loads(path.read_text()) == {"limits": [None, None]}
+def test_public_rgb_and_normal_strip_renderer_alpha_channels():
+    rgb = np.zeros((2, 3, 4, 4), dtype=np.uint8)
+    rgb[..., 3] = 255
+    normal = np.zeros((2, 3, 4, 4), dtype=np.float32)
+    normal[..., 3] = 1.0
+    assert canonicalize_public_modality("rgb", rgb).shape == (2, 3, 4, 3)
+    assert canonicalize_public_modality("normal", normal).shape == (2, 3, 4, 3)
+    assert canonicalize_public_modality("floor_00/rgb", rgb).shape == (2, 3, 4, 3)
+    depth = np.zeros((2, 3, 4), dtype=np.float32)
+    assert canonicalize_public_modality("depth_linear", depth) is depth
+    with pytest.raises(ValueError, match="at least 3 channels"):
+        canonicalize_public_modality("normal", np.zeros((3, 4)))
+
 
 def test_dense_storage_falls_back_without_zarr(tmp_path):
     writer = DatasetWriter(tmp_path / "dataset")

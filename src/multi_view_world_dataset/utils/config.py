@@ -167,6 +167,13 @@ def validate_config(config: dict[str, Any]) -> None:
         errors.append("Trajectory smoothing_strengths must lie in [0,1]")
     preflight = trajectory.get("overlap_preflight", {})
     regimes = config.get("placement", {}).get("observation_regime_weights", {})
+    realized_regime_soft_weight = preflight.get("realized_regime_soft_weight")
+    if (
+        not isinstance(realized_regime_soft_weight, (int, float))
+        or not isfinite(float(realized_regime_soft_weight))
+        or float(realized_regime_soft_weight) < 0.0
+    ):
+        errors.append("Trajectory realized_regime_soft_weight must be finite and non-negative")
     required_regimes = {"dense_shared", "partial_chain", "exploratory"}
     coverage_saturations = trajectory.get("regime_coverage_saturation_m2", {})
     if set(coverage_saturations) != required_regimes or any(

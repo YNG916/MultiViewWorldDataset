@@ -22,12 +22,18 @@ status is maintained in [runtime_findings.md](runtime_findings.md).
    acceleration, lateral slip, collision safety, and separation. Path-family
    mix is recorded rather than hard-gated.
 8. Run low-resolution temporal GT-depth overlap preflight using union connectivity, participation, isolation, and
-   near-duplicate hard checks; use per-frame connectivity only as a soft regime target, persist requested/realized
-   regimes, store exact poses, and render `V0`.
+   near-duplicate hard checks. Collect every hard-valid candidate, then softly
+   rank by route quality plus the running global/split deficit of its realized
+   regime; this never becomes an acceptance gate. Persist requested/realized
+   regimes, selection diagnostics, exact poses, and render `V0`.
 9. Render mandatory `B_world_before[t]` and verify robot masks against projected robot poses.
 10. Select a quota-controlled fixed intervention type and a V0-visible target; restore `W0` between attempts, render
     `B_env_after`, `V1`, and `B_world_after`, require post-render evidence, and run exact paired-trajectory QA.
-11. Resolve the installed Nova Carter asset and build a project-derived robot layer with a physical mast; rerun smoke.
+11. Resolve the installed Nova Carter asset and build the official
+   project-derived layer: unchanged functional mast/camera/colliders plus the
+   visual-only shrouded tower, sliding sleeve, sensor housing, and three
+   canonical color variants. Validate prims, materials, height/joint relation,
+   camera frame, and unchanged footprint before smoke.
 12. Add articulation and meaningful state events.
 13. Persist through temporary directories, atomically finalize only accepted samples, resume safely, and log rejects.
 14. Run CPU tests, SE(2) microtests, then `navigation-sweep` on `Rs_int`,

@@ -19,9 +19,11 @@ OmniGibson XY shortest-path API may provide proposals or heuristics, but final
 rectangular-robot validity comes from SE(2) masks and PhysX.
 
 The older development placement and XY tangent-only trajectory methods remain
-compatibility utilities for legacy probes; the dataset generator does not call
-them. Production calls `prepare_navigation_context` followed by
-`sample_route_first_trajectory_sets`.
+deprecated compatibility utilities for legacy probes and emit
+`DeprecationWarning`; the dataset generator does not call them. The sole
+production path calls `prepare_navigation_context` followed by
+`sample_route_first_trajectory_sets`, then performs GT-depth validation and
+soft realized-regime ranking.
 
 The orchestration layer follows Base Scene → Dynamic Configuration → Episode and never merges configuration storage
 into episodes. Simulator objects are transient and must not appear in JSON, Parquet, NPZ, or Zarr metadata.

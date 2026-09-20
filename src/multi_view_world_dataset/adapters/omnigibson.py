@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+import warnings
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
@@ -8,11 +9,15 @@ from typing import Any, Callable
 import numpy as np
 
 from multi_view_world_dataset.adapters.base import BEVRender, BaseSimulatorAdapter
-from multi_view_world_dataset.assets import materialize_mobile_sensor_robot
+from multi_view_world_dataset.assets import (
+    ROBOT_APPEARANCE_VARIANTS,
+    materialize_mobile_sensor_robot,
+)
 from multi_view_world_dataset.cameras.transforms import rotation_angle, validate_transform
 from multi_view_world_dataset.errors import GeometryError, SampleRejected, SimulatorUnavailableError
 from multi_view_world_dataset.rendering.bev import BEVCalibration
 from multi_view_world_dataset.rendering.labels import remap_public_labels
+from multi_view_world_dataset.rendering.modalities import canonicalize_public_modality
 from multi_view_world_dataset.sampling.placement import (
     select_consensus_local_headings,
     select_local_traversable_heading,
@@ -362,6 +367,68 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         self._runtime_findings["available_scene_count"] = len(scenes)
         return scenes
 
+    def _apply_final_robot_appearance_variants(self) -> None:
+        """Bind one canonical accent material to each robot's visual-only shell."""
+        if not self._using_final_robot:
+            return
+        accent_relative_paths = (
+            "chassis_link/mvwd_sensor_rig/tower_accent_band",
+            "mast_carriage/sliding_sleeve_accent",
+            "mast_carriage/sensor_head_accent",
+            "mast_carriage/sensor_head_top_cap",
+            "mast_carriage/front_direction_marker",
+        )
+        stage = self._og.sim.stage
+        applied: dict[str, dict[str, Any]] = {}
+        with self._og.sim.editing_usd():
+            for robot in sorted(self._env.robots, key=lambda item: item.name):
+                if robot.name not in ROBOT_APPEARANCE_VARIANTS:
+                    raise SimulatorUnavailableError(
+                        f"No canonical appearance variant is defined for {robot.name}"
+                    )
+                specification = ROBOT_APPEARANCE_VARIANTS[robot.name]
+                robot_root = str(robot.prim_path)
+                material_path = (
+                    f"{robot_root}/Looks/{specification['material_prim']}"
+                )
+                material_prim = stage.GetPrimAtPath(material_path)
+                if not material_prim.IsValid():
+                    raise SimulatorUnavailableError(
+                        f"Robot appearance material is missing: {material_path}"
+                    )
+                material = self._lazy.pxr.UsdShade.Material(material_prim)
+                bound_paths = []
+                for relative_path in accent_relative_paths:
+                    prim_path = f"{robot_root}/{relative_path}"
+                    prim = stage.GetPrimAtPath(prim_path)
+                    if not prim.IsValid():
+                        raise SimulatorUnavailableError(
+                            f"Robot appearance prim is missing: {prim_path}"
+                        )
+                    binding = self._lazy.pxr.UsdShade.MaterialBindingAPI.Apply(prim)
+                    binding.Bind(
+                        material,
+                        bindingStrength=(
+                            self._lazy.pxr.UsdShade.Tokens.strongerThanDescendants
+                        ),
+                    )
+                    gprim = self._lazy.pxr.UsdGeom.Gprim(prim)
+                    gprim.CreateDisplayColorAttr().Set([
+                        self._lazy.pxr.Gf.Vec3f(
+                            *[float(value) for value in specification["rgb"]]
+                        )
+                    ])
+                    bound_paths.append(prim_path)
+                applied[robot.name] = {
+                    "variant": str(specification["variant"]),
+                    "display_name": str(specification["display_name"]),
+                    "material_path": material_path,
+                    "bound_visual_prims": bound_paths,
+                    "collision_geometry_changed": False,
+                }
+        self._runtime_findings["final_robot_appearance_variants"] = applied
+
+
     def load_scene(self, scene_id: str, *, robot_count: int = 0, development_robot: str = "turtlebot") -> None:
         self._require_started()
         if self._env is not None:
@@ -535,6 +602,8 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             if original_xform_get_attribute is not None:
                 xform_prim_module.XFormPrim.get_attribute = original_xform_get_attribute
         self._scene_id = scene_id
+        if self._using_final_robot:
+            self._apply_final_robot_appearance_variants()
         self._og.sim.step()
         if not self._using_final_robot:
             # Keep the visible semantic instance set stable for the lifetime of
@@ -2093,6 +2162,11 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         self, seed: int, *, discouraged_region_ids: tuple[str, ...] = ()
     ) -> dict[str, float]:
         """Sample separated starts from an OG room / conceptual observation region."""
+        warnings.warn(
+            "place_development_robots is legacy compatibility only; use the "
+            "route-first production pipeline",
+            DeprecationWarning, stacklevel=2,
+        )
         scene = self._require_scene()
         robots = list(self._env.robots)
         if len(robots) != 3:
@@ -2690,6 +2764,11 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         observations_override: dict[str, dict[str, Any]] | None = None,
     ) -> tuple[tuple[Trajectory, ...], dict[str, Any]]:
         observations = observations_override or self.robot_observations()
+        warnings.warn(
+            "sample_robot_trajectories is legacy compatibility only; use "
+            "sample_route_first_trajectory_sets",
+            DeprecationWarning, stacklevel=2,
+        )
         starts = {robot_id: record["base_to_world"] for robot_id, record in observations.items()}
         # A serialized PhysX restore can leave the passive Nova mast a few
         # millimetres away from its calibrated joint position until the next
@@ -2857,6 +2936,11 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
     ) -> tuple[tuple[tuple[Trajectory, ...], dict[str, Any]], ...]:
         """Generate a nested pool of joint sets for one fixed placement."""
         count = int(self.config["trajectory"]["trajectory_sets_per_placement"])
+        warnings.warn(
+            "sample_robot_trajectory_sets is legacy compatibility only; use "
+            "sample_route_first_trajectory_sets",
+            DeprecationWarning, stacklevel=2,
+        )
         candidates: list[tuple[tuple[Trajectory, ...], dict[str, Any]]] = []
         observations = self.robot_observations()
         failures: list[dict[str, Any]] = []
@@ -4292,11 +4376,11 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             arrays: dict[str, np.ndarray] = {}
             for public_name in sensor_modalities:
                 backend_name = backend_names.get(public_name, public_name)
-                arrays[public_name] = self._resample_bev_observation(
-                    camera,
-                    backend_name,
-                    observation[backend_name],
-                    calibration,
+                arrays[public_name] = canonicalize_public_modality(
+                    public_name,
+                    self._resample_bev_observation(
+                        camera, backend_name, observation[backend_name], calibration
+                    ),
                 )
             if "height" in modalities:
                 depth = arrays.get("depth_linear")
@@ -4804,7 +4888,9 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                         ),
                     )
                     modalities = record["modalities"]
-                    rgb = np.asarray(modalities["rgb"])[..., :3]
+                    rgb = canonicalize_public_modality(
+                        "rgb", np.asarray(modalities["rgb"])
+                    )
                     robot_frames[robot_id]["rgb"].append(rgb)
                     for backend_name, public_name in (
                         ("depth_linear", "depth_linear"),
@@ -4812,7 +4898,9 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                         ("seg_instance", "instance"),
                         ("normal", "normal"),
                     ):
-                        values = np.asarray(modalities[backend_name])
+                        values = canonicalize_public_modality(
+                            public_name, np.asarray(modalities[backend_name])
+                        )
                         robot_frames[robot_id][public_name].append(values[::2, ::2])
                     depth = np.asarray(modalities["depth_linear"]).squeeze()
                     valid = (

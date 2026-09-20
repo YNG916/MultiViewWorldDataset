@@ -38,6 +38,15 @@ def test_navigation_route_bank_minimum_is_deprecated_diagnostic_only():
     )
     validate_config(config)
 
+def test_realized_regime_soft_weight_must_be_non_negative():
+    config = load_yaml_config(REPOSITORY / "configs" / "smoke.yaml")
+    config["trajectory"]["overlap_preflight"][
+        "realized_regime_soft_weight"
+    ] = -0.1
+    with pytest.raises(ConfigurationError, match="realized_regime_soft_weight"):
+        validate_config(config)
+
+
 
 def test_runtime_path_precedence_and_failure(tmp_path):
     behavior = tmp_path / "behavior"

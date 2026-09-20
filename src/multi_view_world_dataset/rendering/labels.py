@@ -10,6 +10,43 @@ import numpy as np
 def stable_semantic_id(category: str) -> int:
     return 3 + (zlib.crc32(category.encode("utf-8")) & 0x3FFFFFFF)
 
+class SemanticIDCollisionError(ValueError):
+    """Raised when distinct category names resolve to one public semantic ID."""
+
+    def __init__(self, semantic_id: int, first: str, second: str) -> None:
+        self.details = {
+            "semantic_id": int(semantic_id),
+            "category_names": sorted({str(first), str(second)}),
+            "hash_algorithm": "crc32_masked_30bit_plus_3",
+        }
+        super().__init__(
+            "semantic ID collision: "
+            f"id={semantic_id} categories={self.details['category_names']}"
+        )
+
+
+def validate_semantic_id_uniqueness(
+    categories: Sequence[str],
+    *,
+    existing_by_id: Mapping[int, str] | None = None,
+) -> dict[str, int]:
+    """Return category IDs and fail loudly on any stable-hash collision."""
+    names_by_id = {
+        int(semantic_id): str(name)
+        for semantic_id, name in (existing_by_id or {}).items()
+    }
+    ids_by_name: dict[str, int] = {}
+    for raw_name in sorted(set(categories)):
+        name = str(raw_name)
+        semantic_id = stable_semantic_id(name)
+        prior = names_by_id.get(semantic_id)
+        if prior is not None and prior != name:
+            raise SemanticIDCollisionError(semantic_id, prior, name)
+        names_by_id[semantic_id] = name
+        ids_by_name[name] = semantic_id
+    return ids_by_name
+
+
 
 def public_instance_catalog(objects: Sequence[Any]) -> dict[str, int]:
     return {
@@ -28,6 +65,9 @@ def remap_public_labels(
     labels = np.asarray(instance_image).squeeze()
     instance_by_object = public_instance_catalog(objects)
     objects_by_path = sorted(objects, key=lambda item: len(item.native_path), reverse=True)
+    semantic_by_category = validate_semantic_id_uniqueness(
+        [str(obj.category) for obj in objects]
+    )
     robot_ids = {robot_id: index + 1 for index, robot_id in enumerate(sorted(robot_native_paths))}
     raw_to_instance: dict[int, int] = {0: 0}
     raw_to_semantic: dict[int, int] = {0: 0}
@@ -54,7 +94,7 @@ def remap_public_labels(
             for obj in objects_by_path:
                 if path == obj.native_path or path.startswith(obj.native_path + "/"):
                     public_instance = instance_by_object[obj.instance_id]
-                    public_semantic = stable_semantic_id(obj.category)
+                    public_semantic = semantic_by_category[str(obj.category)]
                     resolved_object_id = obj.instance_id
                     break
         raw_to_instance[raw_id] = public_instance

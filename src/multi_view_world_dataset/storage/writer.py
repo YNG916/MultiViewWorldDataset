@@ -12,8 +12,12 @@ import numpy as np
 import yaml
 
 from multi_view_world_dataset.errors import ConfigurationError
+from multi_view_world_dataset.rendering.modalities import canonicalize_public_modalities
 from multi_view_world_dataset.schema.records import DynamicConfiguration, ObjectState, Trajectory, WorldEpisode
-from multi_view_world_dataset.rendering.labels import stable_semantic_id
+from multi_view_world_dataset.rendering.labels import (
+    SemanticIDCollisionError,
+    validate_semantic_id_uniqueness,
+)
 from multi_view_world_dataset.utils.provenance import configuration_fingerprint, default_taxonomy
 from multi_view_world_dataset.utils.serialization import dump_json, to_jsonable
 
@@ -58,15 +62,16 @@ class EpisodeTransaction:
         self.write_json("trajectories_meta.json", metadata)
 
     def write_dense_group(self, relative_path: str, arrays: dict[str, np.ndarray]) -> str:
+        public_arrays = canonicalize_public_modalities(arrays)
         try:
             import zarr
         except ImportError:
             fallback = self.staging / f"{relative_path}.npz"
             fallback.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(fallback, **{name: np.asarray(array) for name, array in arrays.items()})
+            np.savez_compressed(fallback, **public_arrays)
             return f"{relative_path}.npz"
         group = zarr.open_group(str(self.staging / relative_path), mode="w")
-        for name, array in arrays.items():
+        for name, array in public_arrays.items():
             group.create_array(name, data=np.asarray(array), overwrite=False)
         return relative_path
 
@@ -157,10 +162,32 @@ class DatasetWriter:
         path = self.root / "taxonomy.json"
         taxonomy = json.loads(path.read_text(encoding="utf-8"))
         semantic = taxonomy.setdefault("semantic_labels", {})
+        existing_by_id = {
+            int(semantic_id): str(record["name"])
+            for semantic_id, record in semantic.items()
+            if "name" in record
+        }
+        try:
+            semantic_by_category = validate_semantic_id_uniqueness(
+                [str(obj.category) for obj in catalog],
+                existing_by_id=existing_by_id,
+            )
+        except SemanticIDCollisionError as error:
+            diagnostic = {
+                "scene_id": scene_id,
+                "existing_semantic_names": {
+                    str(key): value for key, value in sorted(existing_by_id.items())
+                },
+                **error.details,
+            }
+            dump_json(self.root / "semantic_id_collision.json", diagnostic)
+            raise ConfigurationError(
+                f"Refusing taxonomy update because {error}"
+            ) from error
         entries = []
         for public_id, obj in enumerate(sorted(catalog, key=lambda item: item.instance_id), start=4):
             # A stable category hash avoids renumbering when later scenes are appended.
-            semantic_id = stable_semantic_id(obj.category)
+            semantic_id = semantic_by_category[str(obj.category)]
             semantic.setdefault(str(semantic_id), {"name": obj.category, "reserved": False})
             entries.append({
                 "public_instance_id": public_id,

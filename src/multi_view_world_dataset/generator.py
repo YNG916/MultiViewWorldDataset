@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 
+from multi_view_world_dataset.assets import robot_appearance_metadata
 from multi_view_world_dataset.adapters.omnigibson import OmniGibsonAdapter
 from multi_view_world_dataset.cameras.calibration import PinholeCalibration
 from multi_view_world_dataset.cameras.overlap import (
@@ -27,6 +28,7 @@ from multi_view_world_dataset.rendering.inspection_v11 import (
     save_environment_room_inspection,
     save_intervention_target_crops,
     save_overlap_graph_inspection,
+    save_robot_appearance_summary,
 )
 from multi_view_world_dataset.sampling.configurations import near_duplicate_configuration
 from multi_view_world_dataset.sampling.diversity import stable_seed, temporal_overlap_acceptance
@@ -353,6 +355,59 @@ def _soft_requested_overlap_regime(
             + split_total * float(weights[name]) - split_counts[name]
         ),
     )
+
+def _realized_regime_deficit_preference(
+    realized_regime: str,
+    weights: dict[str, float],
+    global_counts: Counter[str],
+    split_counts: Counter[str],
+) -> float:
+    """Measure the running global + split deficit for one realized regime."""
+    target_total = float(sum(weights.values()))
+    if target_total <= 0.0 or realized_regime not in weights:
+        raise ValueError("realized regime weights must be positive and complete")
+    target_fraction = float(weights[realized_regime]) / target_total
+
+    def deficit(counts: Counter[str]) -> float:
+        total = int(sum(counts.values()))
+        observed = counts[realized_regime] / total if total else 0.0
+        return target_fraction - observed
+
+    return float(deficit(global_counts) + deficit(split_counts))
+
+
+def _gt_valid_candidate_soft_score(
+    metrics: dict[str, Any],
+    original_rank: int,
+    candidate_count: int,
+    realized_regime: str,
+    weights: dict[str, float],
+    global_counts: Counter[str],
+    split_counts: Counter[str],
+    *,
+    lambda_regime: float,
+) -> dict[str, float]:
+    """Combine route quality and realized-regime deficit without a hard gate."""
+    if lambda_regime < 0.0 or not np.isfinite(lambda_regime):
+        raise ValueError("lambda_regime must be finite and non-negative")
+    rank_denominator = max(1, candidate_count - 1)
+    rank_quality = 1.0 - min(max(original_rank, 0), rank_denominator) / rank_denominator
+    proxy_score = float(metrics.get("cheap_scene_visibility", {}).get("score", 0.0))
+    bounded_proxy_quality = float(np.tanh(proxy_score / 4.0))
+    quality_score = float(rank_quality + 0.10 * bounded_proxy_quality)
+    deficit_preference = _realized_regime_deficit_preference(
+        realized_regime, weights, global_counts, split_counts
+    )
+    final_score = quality_score + lambda_regime * deficit_preference
+    return {
+        "quality_score": quality_score,
+        "rank_quality": float(rank_quality),
+        "bounded_proxy_quality": bounded_proxy_quality,
+        "realized_regime_deficit_preference": float(deficit_preference),
+        "lambda_regime": float(lambda_regime),
+        "final_score": float(final_score),
+    }
+
 def _robot_states(
     config: dict[str, Any],
     heights: dict[str, float],
@@ -370,6 +425,10 @@ def _robot_states(
             model=model,
             base_to_world=by_id[robot_id].base_to_world[0],
             camera_height_m=float(heights[robot_id]),
+            mast_joint_value_m=(
+                float(heights[robot_id]) - float(min(config["camera"]["heights_m"]))
+                if config["robot"]["use_final_robot"] else None
+            ),
         )
         for robot_id in sorted(by_id)
     )
@@ -803,6 +862,12 @@ def generate_dataset(
                 "poses": "local-to-world homogeneous matrices",
                 "depth_linear": "metric camera-forward depth in meters",
             },
+            "image_channel_semantics": {
+                "rgb": "uint8 RGB, channel-last, exactly 3 channels; renderer alpha removed",
+                "normal": "float32 camera-space XYZ, channel-last, exactly 3 channels",
+            },
+            "robot_appearance_variants": robot_appearance_metadata(),
+            "mast_joint_relation": "mast_joint_value_m = camera_height_m - 0.8",
             "bev_conventions": {
                 "occupancy": "observed geometry above floor; not traversability",
                 "point_traversability": "floor-supported point navigability before robot footprint",
@@ -1188,11 +1253,20 @@ def generate_dataset(
                             )
                             trajectory_candidates = list(base_trajectory_candidates)
                             candidate_failures: list[dict[str, Any]] = []
-                            candidate_rank = 0
-                            while candidate_rank < len(trajectory_candidates):
-                                candidate_trajectories, candidate_metrics = (
-                                    trajectory_candidates[candidate_rank]
-                                )
+                            gt_valid_candidates: list[dict[str, Any]] = []
+                            regime_weights = config["placement"]["observation_regime_weights"]
+                            split_realized_counts = realized_regime_counts_by_split.setdefault(
+                                split_name, Counter()
+                            )
+                            lambda_regime = float(
+                                config["trajectory"]["overlap_preflight"][
+                                    "realized_regime_soft_weight"
+                                ]
+                            )
+                            for original_rank, (
+                                candidate_trajectories,
+                                candidate_metrics,
+                            ) in enumerate(trajectory_candidates):
                                 try:
                                     adapter.place_robots_at_trajectory_frame(
                                         candidate_trajectories, 0
@@ -1226,23 +1300,84 @@ def generate_dataset(
                                             "observation_regime"
                                         ] = realized_regime
                                     candidate_metrics["temporal_overlap"] = candidate_overlap
+                                    selection_score = _gt_valid_candidate_soft_score(
+                                        candidate_metrics,
+                                        original_rank,
+                                        len(trajectory_candidates),
+                                        realized_regime,
+                                        regime_weights,
+                                        realized_regime_counts,
+                                        split_realized_counts,
+                                        lambda_regime=lambda_regime,
+                                    )
+                                    candidate_metrics["realized_regime_soft_selection"] = (
+                                        selection_score
+                                    )
                                     candidate_metrics["overlap_regime_distribution"] = {
-                                        "target_weights": config["placement"]["observation_regime_weights"],
-                                        "global_requested_before_accept": dict(requested_regime_counts),
-                                        "global_realized_before_accept": dict(realized_regime_counts),
+                                        "target_weights": regime_weights,
+                                        "global_requested_before_accept": dict(
+                                            requested_regime_counts
+                                        ),
+                                        "global_realized_before_accept": dict(
+                                            realized_regime_counts
+                                        ),
                                         "split": split_name,
                                         "split_requested_before_accept": dict(
                                             requested_regime_counts_by_split[split_name]
                                         ),
                                         "split_realized_before_accept": dict(
-                                            realized_regime_counts_by_split.setdefault(
-                                                split_name, Counter()
-                                            )
+                                            split_realized_counts
                                         ),
-                                        "selection_policy": "soft_global_plus_split_deficit_preference",
+                                        "selection_policy": (
+                                            "quality_plus_soft_realized_global_and_split_deficit"
+                                        ),
                                     }
-                                    candidate_metrics["temporal_preflight_candidate_rank"] = (
-                                        candidate_rank
+                                    candidate_metrics[
+                                        "temporal_preflight_candidate_rank"
+                                    ] = original_rank
+                                    gt_valid_candidates.append({
+                                        "original_rank": original_rank,
+                                        "trajectories": candidate_trajectories,
+                                        "metrics": candidate_metrics,
+                                        "graph": candidate_graph,
+                                        "catalog": candidate_catalog,
+                                        "overlap": candidate_overlap,
+                                        "selection_score": selection_score,
+                                    })
+                                except SampleRejected as candidate_error:
+                                    candidate_failures.append({
+                                        "candidate_rank": original_rank,
+                                        "selection_stage": "gt_depth_preflight",
+                                        "reason": candidate_error.reason,
+                                        "details": candidate_error.details,
+                                    })
+                            if not gt_valid_candidates:
+                                raise SampleRejected(
+                                    "trajectory_set_gt_candidates_exhausted",
+                                    {"candidate_failures": candidate_failures},
+                                )
+                            gt_valid_candidates.sort(
+                                key=lambda item: (
+                                    -float(item["selection_score"]["final_score"]),
+                                    int(item["original_rank"]),
+                                )
+                            )
+                            for selection_rank, candidate_record in enumerate(
+                                gt_valid_candidates
+                            ):
+                                candidate_rank = int(candidate_record["original_rank"])
+                                candidate_trajectories = candidate_record["trajectories"]
+                                candidate_metrics = candidate_record["metrics"]
+                                candidate_metrics[
+                                    "gt_valid_soft_selection_rank"
+                                ] = selection_rank
+                                candidate_graph = candidate_record["graph"]
+                                candidate_catalog = candidate_record["catalog"]
+                                candidate_overlap = candidate_record["overlap"]
+                                try:
+                                    adapter.load_snapshot(configuration_snapshot)
+                                    adapter.place_robots_at_trajectory_frame(
+                                        candidate_trajectories, 0
                                     )
                                     candidate_calibration = adapter.calibrated_floor_bounds(
                                         int(candidate_metrics["floor_index"]),
@@ -1279,6 +1414,8 @@ def generate_dataset(
                                     before = None
                                     candidate_failures.append({
                                         "candidate_rank": candidate_rank,
+                                        "soft_selection_rank": selection_rank,
+                                        "selection_stage": "full_before_rollout",
                                         "candidate_kind": candidate_metrics.get(
                                             "nested_trajectory_sets", {}
                                         ).get("candidate_kind", "base"),
@@ -1287,6 +1424,9 @@ def generate_dataset(
                                         "trajectory_summary": {
                                             "observation_regime": candidate_metrics.get(
                                                 "observation_regime"
+                                            ),
+                                            "soft_selection": candidate_metrics.get(
+                                                "realized_regime_soft_selection"
                                             ),
                                             "joint_diversity": candidate_metrics.get(
                                                 "joint_diversity"
@@ -1297,7 +1437,6 @@ def generate_dataset(
                                             ),
                                         },
                                     })
-                                    candidate_rank += 1
                             if before is None:
                                 raise SampleRejected(
                                     "trajectory_set_candidates_exhausted",
@@ -1651,6 +1790,13 @@ def generate_dataset(
                                 before["robot_views"][robot_id]["rgb"][0],
                             )
                             image_names.append(name)
+                        appearance_name = "robot_appearance_summary.png"
+                        save_robot_appearance_summary(
+                            inspection_root / appearance_name,
+                            before["world_bev"]["rgb"][0],
+                            before["world_bev"]["instance"][0],
+                        )
+                        image_names.append(appearance_name)
                         write_html_summary(
                             inspection_root,
                             f"{selected_scene}/{configuration_id}/{episode_id}",
@@ -1659,6 +1805,7 @@ def generate_dataset(
                                 "event": intervention["event"],
                                 "trajectory": trajectory_metrics,
                                 "sibling_episode_diversity": sibling_diversity,
+                                "robot_appearance_variants": robot_appearance_metadata(),
                             },
                             image_names,
                         )

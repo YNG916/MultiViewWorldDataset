@@ -192,6 +192,9 @@ trajectory:
     keyframe_count: 7
     geometry_width: 224
     geometry_height: 128
+    # Softly re-rank hard-valid GT-depth candidates toward running realized
+    # regime deficits. This is never an acceptance gate.
+    realized_regime_soft_weight: 0.75
     # Soft topology targets used for regime QA / realized-regime labeling.
     # G_union connectivity remains the hard episode-level requirement.
     regime_connected_fraction_target:

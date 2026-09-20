@@ -11,7 +11,8 @@ reserved for diffusion-model time.
 No robot ego image is ever a model input. Level 1 maps robot-free `B_env` plus calibrated target camera poses to
 synchronized target views. Level 2 additionally supplies one structured intervention but still uses the original
 robot-free `B_env`; post-intervention BEV is GT/oracle data. Level 3 supplies continuous target trajectories. `V0` is
-not required model input.
+not required model input. Levels 1, 2, and 3 are all current Dataset-v1.1
+outputs; Level 3 is not a deferred extension.
 
 ## Hierarchy and scale
 
@@ -30,7 +31,13 @@ occur at frame, episode, or configuration level.
 The pinhole robot camera has no distortion: RGB 896×512, geometry 448×256, HFOV 70°, pitch −5°, roll 0°, near 0.1 m,
 far 15 m. RGB and geometry intrinsics are stored separately at their native resolutions. Every modality records the
 actual producing sensor pose; mounted and shared-capture poses plus their alignment errors are both retained. Per-robot height is sampled once from 0.8, 1.0, 1.2, 1.4 m and physically changes the
-mast.
+mast. `RobotState` and `CameraState` both store `mast_joint_value_m`, with
+`mast_joint_value_m = camera_height_m - 0.8` for the official robot.
+
+Saved RGB is channel-last true RGB with exactly three channels; renderer alpha
+is removed. Saved normals are channel-last three-component camera-space XYZ.
+Readers may accept historical four-channel arrays, but new outputs never save
+the fourth transport component.
 
 `B_env` is a robot-free whole-floor **true orthographic** render. Each floor is separate, at 0.02 m/px with RGB,
 linear depth, height above floor, normals, semantic, instance, occupancy, and
@@ -56,7 +63,11 @@ View overlap comes from GT-depth backprojection. Sparse keyframe graphs are acce
 connectivity, at least one meaningful shared moment, participation by every robot, bounded isolation runs, rejection
 of near-duplicate views, and no requirement that any individual keyframe graph be connected. Connected-frame and
 shared-keyframe fractions are soft targets that distinguish requested from realized observation regimes. Neither all
-pairs nor all frames must overlap. Full overlap matrices and graph topology are persisted.
+pairs nor all frames must overlap. Multiple hard-valid GT-depth candidates are
+softly ranked by route quality plus the current global/split deficit of their
+realized regime. This preference is configurable and never rejects the only
+feasible regime. Requested/realized distributions, selection scores, full
+overlap matrices, and graph topology are persisted.
 
 At 10 FPS, 60 frames span 6 seconds with collision-free independent paths of
 1–3 m translated geodesic/continuous arc length. The orientation-aware planner
