@@ -27,3 +27,21 @@ soft realized-regime ranking.
 
 The orchestration layer follows Base Scene → Dynamic Configuration → Episode and never merges configuration storage
 into episodes. Simulator objects are transient and must not appear in JSON, Parquet, NPZ, or Zarr metadata.
+
+
+## Production process and shard architecture
+
+Production never changes scenes inside a long-lived Isaac Sim process. The parent launcher deterministically assigns
+eligible scenes to GPUs and starts one fresh `scene-worker` process per scene. A worker owns exactly one
+`shards/<scene_id>` directory; only the parent mutates `production_status.json`. Consequently taxonomy, reject logs,
+resume markers, and counters are never concurrently appended by independent workers.
+
+`configs/scene_eligibility.yaml` is reconciled against the full installed scene catalog before generation. Splits are
+computed after eligibility filtering and checked for scene-family leakage. Each shard binds the resolved config,
+generator source, Git commit, robot asset, schema, and fingerprint. Atomic configuration/episode staging directories
+are recovered only after that fingerprint matches.
+
+`finalize-dataset` verifies every selected shard, deterministically merges taxonomy and small metadata/indexes, and
+leaves dense observations in place. `pilot-report` aggregates both global and per-scene acceptance, adaptive GT
+shortlist, overlap, motion, intervention, DynamicConfiguration, runtime, and storage metrics; it produces an explicit
+READY/NOT READY decision and never schedules the full run.

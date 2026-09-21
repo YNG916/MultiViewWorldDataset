@@ -18,7 +18,10 @@ from multi_view_world_dataset.rendering.labels import (
     SemanticIDCollisionError,
     validate_semantic_id_uniqueness,
 )
-from multi_view_world_dataset.utils.provenance import configuration_fingerprint, default_taxonomy
+from multi_view_world_dataset.utils.provenance import (
+    default_taxonomy,
+    resolved_dataset_fingerprint,
+)
 from multi_view_world_dataset.utils.serialization import dump_json, to_jsonable
 
 
@@ -111,10 +114,9 @@ class DatasetWriter:
     ) -> None:
         metadata = dict(dataset_meta)
         if resolved_config is not None:
-            metadata["configuration_fingerprint"] = configuration_fingerprint({
-                "resolved_config": resolved_config,
-                "generator_source_fingerprint": metadata.get("generator_source_fingerprint"),
-            })
+            metadata["configuration_fingerprint"] = resolved_dataset_fingerprint(
+                resolved_config, metadata.get("generator_source_fingerprint")
+            )
             metadata["resolved_config_ref"] = "resolved_config.yaml"
         meta_path = self.root / "dataset_meta.json"
         if meta_path.is_file():
@@ -129,6 +131,7 @@ class DatasetWriter:
             dump_json(meta_path, {**metadata, **existing})
         else:
             dump_json(meta_path, metadata)
+        self.recover_partial_outputs()
         taxonomy_path = self.root / "taxonomy.json"
         if not taxonomy_path.is_file():
             dump_json(taxonomy_path, taxonomy or default_taxonomy())
@@ -139,6 +142,20 @@ class DatasetWriter:
                 yaml.safe_dump(to_jsonable(resolved_config), sort_keys=True),
                 encoding="utf-8",
             )
+
+    def recover_partial_outputs(self) -> tuple[str, ...]:
+        """Remove only atomic staging directories left by an interrupted shard."""
+        recovered: list[str] = []
+        for subtree in ("configurations", "episodes"):
+            root = self.root / subtree
+            if not root.is_dir():
+                continue
+            for path in sorted(root.rglob(".*")):
+                if not path.is_dir() or not path.name.startswith((".config_", ".episode_")):
+                    continue
+                recovered.append(str(path.relative_to(self.root)))
+                shutil.rmtree(path)
+        return tuple(recovered)
 
     def update_dataset_metadata(self, updates: dict[str, Any]) -> None:
         """Atomically merge runtime facts without changing dataset semantics."""

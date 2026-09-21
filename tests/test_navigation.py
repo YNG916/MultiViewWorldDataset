@@ -1,11 +1,15 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
 from multi_view_world_dataset.adapters.navigation import (
+    _bind_route,
     _cheap_visibility_metrics,
     _cheap_visibility_score_from_pairwise,
+    measured_overlap_route_mutations,
 )
+import multi_view_world_dataset.adapters.navigation as navigation_adapter_module
 from multi_view_world_dataset.diagnostics import _kit_log_has_gpu_device_loss
 from multi_view_world_dataset.sampling.diversity import temporal_overlap_acceptance
 from multi_view_world_dataset.sampling.navigation import (
@@ -57,6 +61,113 @@ def _route(route_id: str, points: list[list[float]], family: str = "one_waypoint
         route_seed=7,
         minimum_footprint_clearance_m=0.03,
     )
+
+
+def test_measured_overlap_route_mutation_preserves_edge_and_replaces_isolated_route(
+    monkeypatch,
+):
+    routes = (
+        _route("route_00", [[0.0, 0.0], [1.0, 0.0]]),
+        _route("route_01", [[0.0, 1.0], [1.0, 1.0]]),
+        _route("route_02", [[0.0, 4.0], [1.0, 4.0]]),
+        _route("route_03", [[0.0, 2.0], [1.0, 2.0]]),
+    )
+    visible = (
+        tuple(frozenset({1, 2, 3}) for _ in range(7)),
+        tuple(frozenset({1, 2}) for _ in range(7)),
+        tuple(frozenset({8, 9}) for _ in range(7)),
+        tuple(frozenset({2, 3}) for _ in range(7)),
+    )
+    compatibility = SimpleNamespace(compatible=np.ones((4, 4), dtype=bool))
+    context = SimpleNamespace(
+        route_bank=routes,
+        cheap_visible_cells=visible,
+        compatibility=compatibility,
+        invalid_start_pose_blacklist=set(),
+    )
+    config = {
+        "camera": {"hfov_deg": 70.0},
+        "navigation": {
+            "cheap_visibility_edge_threshold": 0.20,
+            "cheap_visibility_maximum_isolated_fraction": 0.71,
+            "start_blacklist_position_quantization_m": 0.05,
+            "start_blacklist_yaw_bins": 32,
+        },
+        "placement": {"formation_degeneracy": {
+            "minimum_mean_heading_difference_deg": 8.0,
+            "maximum_mean_path_similarity": 0.96,
+            "minimum_spatial_coverage_m2": 1.0,
+        }},
+    }
+    adapter = SimpleNamespace(
+        config=config,
+        _navigation_contexts={0: context},
+        _development_camera_mounts={
+            robot_id: np.eye(4)
+            for robot_id in ("robot_00", "robot_01", "robot_02")
+        },
+    )
+    monkeypatch.setattr(
+        navigation_adapter_module,
+        "_sparse_physics_preflight",
+        lambda adapter, context, trajectories: None,
+    )
+    trajectories = tuple(
+        _bind_route(route, robot_id, np.eye(4))
+        for robot_id, route in zip(
+            ("robot_00", "robot_01", "robot_02"), routes[:3], strict=True
+        )
+    )
+    source_metrics = {
+        "floor_index": 0,
+        "route_ids": ["route_00", "route_01", "route_02"],
+        "joint_route_search": {},
+        "nested_trajectory_sets": {},
+    }
+    failures = [{
+        "candidate_rank": 0,
+        "candidate_kind": "base",
+        "reason": "trajectory_temporal_overlap_failed",
+        "details": {
+            "union_edges": [["robot_00", "robot_01"]],
+            "maximum_consecutive_isolated_keyframes": {
+                "robot_00": 0, "robot_01": 0, "robot_02": 7,
+            },
+            "allowed_consecutive_isolated_keyframes": 5,
+            "longest_isolation_intervals": {
+                "robot_02": {
+                    "frame_start": 10, "frame_end": 49,
+                    "sample_start_index": 1, "sample_end_index": 5,
+                },
+            },
+            "checks": {
+                "union_graph_connected": False,
+                "meaningful_shared_moment": True,
+                "every_robot_participates": False,
+                "no_severe_isolation": False,
+                "no_near_duplicate_views": True,
+            },
+        },
+    }]
+    mutated = measured_overlap_route_mutations(
+        adapter, ((trajectories, source_metrics),), failures,
+        maximum_candidates=2,
+    )
+    assert len(mutated) == 1
+    replacement_trajectories, metrics = mutated[0]
+    assert metrics["route_ids"] == ["route_00", "route_01", "route_03"]
+    assert metrics["nested_trajectory_sets"]["candidate_kind"] == (
+        "measured_overlap_route_mutation"
+    )
+    evidence = metrics["joint_diversity"]["measured_overlap_route_mutation"]
+    assert evidence["preserved_measured_edge"] == ["robot_00", "robot_01"]
+    assert evidence["isolated_robot_id"] == "robot_02"
+    assert evidence["repaired_robot_id"] == "robot_02"
+    assert evidence["isolated_interval"]["frame_start"] == 10
+    assert evidence["overlap_target_pair"] == ["robot_00", "robot_01"]
+    assert evidence["cheap_interval_anchor_count"] >= 0
+    assert metrics["cheap_scene_visibility"]["passed"]
+    assert replacement_trajectories[2].metadata["route_id"] == "route_03"
 
 
 def test_route_first_config_has_no_straight_exit_or_shared_heading_gate():
@@ -348,7 +459,7 @@ def test_unclassified_overlap_uses_union_connectivity_then_realized_label():
     )
     assert result["passed"]
     assert result["checks"]["union_graph_connected"]
-    assert result["realized_regime"] == "partial_chain"
+    assert result["realized_regime"] == "exploratory"
     assert result["regime_target_match"]
 
 

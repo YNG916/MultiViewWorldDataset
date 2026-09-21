@@ -21,6 +21,15 @@ def configuration_fingerprint(config: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def resolved_dataset_fingerprint(
+    resolved_config: dict[str, Any], generator_fingerprint: str | None
+) -> str:
+    return configuration_fingerprint({
+        "resolved_config": resolved_config,
+        "generator_source_fingerprint": generator_fingerprint,
+    })
+
+
 def default_taxonomy() -> dict[str, Any]:
     return {
         "version": SEMANTICS_VERSION,

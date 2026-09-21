@@ -12,6 +12,12 @@ from multi_view_world_dataset.diagnostics import (
 from multi_view_world_dataset.dataset_diagnostics import summarize_generated_dataset
 from multi_view_world_dataset.generator import generate_dataset
 from multi_view_world_dataset.pipeline import inspect_simulator_runtime, run_simulator_probe
+from multi_view_world_dataset.pilot_report import generate_pilot_report
+from multi_view_world_dataset.production import (
+    finalize_dataset,
+    launch_scene_shards,
+    run_scene_worker,
+)
 from multi_view_world_dataset.utils.config import load_yaml_config
 from multi_view_world_dataset.utils.runtime import resolve_runtime_paths
 from multi_view_world_dataset.utils.serialization import to_jsonable
@@ -94,6 +100,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicitly allow pilot/default generation (never enabled implicitly)",
     )
     _machine_arguments(generate, output=True)
+
+    worker = subparsers.add_parser(
+        "scene-worker", help="Generate exactly one isolated per-scene shard"
+    )
+    worker.add_argument("--config", required=True)
+    worker.add_argument("--scene", required=True)
+    worker.add_argument("--allow-large", action="store_true")
+    _machine_arguments(worker, output=True)
+
+    launch = subparsers.add_parser(
+        "production-launch",
+        help="Launch one fresh scene-worker process per scene on a resumable GPU queue",
+    )
+    launch.add_argument("--config", required=True)
+    launch.add_argument("--gpus", required=True, help="Comma-separated physical GPU IDs")
+    launch.add_argument("--max-workers", type=int)
+    launch.add_argument("--retry-failed", action="store_true")
+    launch.add_argument("--allow-large", action="store_true")
+    _machine_arguments(launch, output=True)
+
+    finalize = subparsers.add_parser(
+        "finalize-dataset", help="Deterministically merge completed shard metadata"
+    )
+    finalize.add_argument("--dataset-root", required=True)
+    pilot_report = subparsers.add_parser(
+        "pilot-report", help="Generate production-readiness diagnostics from finalized shards"
+    )
+    pilot_report.add_argument("--dataset-root", required=True)
     return parser
 
 
@@ -102,6 +136,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "validate-config":
         config = load_yaml_config(args.config)
         print(json.dumps({"status": "ok", "profile": config["profile"]}, indent=2))
+        return 0
+    if args.command == "pilot-report":
+        output, report = generate_pilot_report(args.dataset_root)
+        print(json.dumps(
+            {"status": "pass", "output": str(output), **report},
+            indent=2, sort_keys=True,
+        ))
+        return 0
+    if args.command == "finalize-dataset":
+        output, report = finalize_dataset(args.dataset_root)
+        print(json.dumps(
+            {"status": "pass", "output": str(output), **report},
+            indent=2, sort_keys=True,
+        ))
         return 0
     if args.command == "dataset-diagnostics":
         output, report = summarize_generated_dataset(
@@ -138,6 +186,30 @@ def main(argv: list[str] | None = None) -> int:
             "classification_counts": report["classification_counts"],
         }, indent=2, sort_keys=True))
         return 0
+    if args.command == "scene-worker":
+        output, result = run_scene_worker(
+            runtime, config, args.scene, allow_large=bool(args.allow_large)
+        )
+        print(json.dumps(
+            {"status": "pass", "output": str(output), **result},
+            indent=2, sort_keys=True,
+        ))
+        return 0
+    if args.command == "production-launch":
+        gpus = tuple(value.strip() for value in args.gpus.split(",") if value.strip())
+        output, result = launch_scene_shards(
+            runtime,
+            config,
+            args.config,
+            gpus=gpus,
+            max_workers=args.max_workers or len(gpus),
+            allow_large=bool(args.allow_large),
+            retry_failed=bool(args.retry_failed),
+        )
+        print(json.dumps(
+            {"output": str(output), **result}, indent=2, sort_keys=True
+        ))
+        return 0 if result["status"] == "pass" else 2
     if args.command == "generate":
         output, result = generate_dataset(
             runtime,

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
 from multi_view_world_dataset.errors import SimulatorUnavailableError
+
+ROBOT_ASSET_ID = "mobile_sensor_robot_v1"
+ROBOT_ASSET_VERSION = "v1-closed-base"
 
 # Canonical appearance identity is part of Dataset-v1.1 metadata. The colors
 # are deliberately broad, saturated surfaces rather than small decals so that
@@ -44,6 +48,21 @@ def robot_appearance_metadata() -> dict[str, dict[str, object]]:
         }
         for robot_id, values in ROBOT_APPEARANCE_VARIANTS.items()
     }
+
+
+def robot_asset_fingerprint(repository_root: Path) -> str:
+    """Hash the source templates that define final robot geometry and metadata."""
+    digest = hashlib.sha256()
+    asset_root = repository_root / "assets" / "robots" / ROBOT_ASSET_ID
+    paths = sorted(asset_root.glob("*.in"))
+    if not paths:
+        raise FileNotFoundError(f"Final robot templates are missing under {asset_root}")
+    for path in paths:
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True)

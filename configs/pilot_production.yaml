@@ -1,0 +1,13 @@
+extends: production_v1.yaml
+profile: pilot
+
+dataset:
+  accepted_configurations_per_scene: 20
+  accepted_episodes_per_configuration: 3
+
+production:
+  selected_scenes: [Beechwood_0_int, Rs_int]
+  scale: pilot_2x20x3
+  pilot_scene_selection:
+    Beechwood_0_int: healthy indoor residential scene validated by final isolated navigation sweep
+    Rs_int: constrained but feasible indoor residential scene validated by final isolated navigation sweep

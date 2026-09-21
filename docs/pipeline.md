@@ -21,8 +21,11 @@ status is maintained in [runtime_findings.md](runtime_findings.md).
    tangent alignment, stationary-turn angular speed, linear speed,
    acceleration, lateral slip, collision safety, and separation. Path-family
    mix is recorded rather than hard-gated.
-8. Run low-resolution temporal GT-depth overlap preflight using union connectivity, participation, isolation, and
-   near-duplicate hard checks. Collect every hard-valid candidate, then softly
+8. Run a seven-keyframe low-resolution temporal GT-depth overlap preflight. Keep union connectivity, participation,
+   a meaningful shared moment, near-duplicate rejection, and the regime-specific dense/partial/exploratory rules hard.
+   Confirm isolation-only or exact-boundary cases on 13 keyframes using normalized temporal duration; do not spend the
+   dense confirmation on a disconnected union or a robot that never participates. Validate exact candidates adaptively in cumulative batches 12 → 24 → 48 without
+   revalidating ranks; stop expansion after the first batch containing any hard-valid candidate. Then softly
    rank by route quality plus the running global/split deficit of its realized
    regime; this never becomes an acceptance gate. Persist requested/realized
    regimes, selection diagnostics, exact poses, and render `V0`.
@@ -43,8 +46,10 @@ status is maintained in [runtime_findings.md](runtime_findings.md).
    one spawned process per scene; the sweep writes a manifest plus a per-scene
    checkpoint so interrupted runs resume without cross-scene renderer/PhysX
    state contamination.
-15. Only if navigation is healthy, run a clean final-robot 1×1×1 smoke and save
-   expanded trajectory/overlap inspection; then run 1×5×3 integration and stop.
+15. Run the clean final-robot 1×5×3 integration through one isolated scene shard using production semantics.
+16. Only if integration passes, run the healthy + constrained two-scene 120-episode pilot through separate workers,
+    finalize metadata, generate complete pilot diagnostics and an explicit READY/NOT READY report, then stop.
+17. Full production remains prepared but is never started automatically.
 
 The full profile is planning metadata only. A rejected intervention never changes or resamples `T_all`. Configuration
 acceptance is based on accepted samples, not attempt count.

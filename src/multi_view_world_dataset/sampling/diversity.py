@@ -201,13 +201,24 @@ def temporal_overlap_acceptance(
     regime_connected_fraction_target: Mapping[str, float],
     regime_shared_keyframe_fraction_target: Mapping[str, float],
     regime_maximum_consecutive_isolated_keyframes: Mapping[str, int],
+    regime_minimum_participating_keyframes: Mapping[str, int] | None = None,
+    regime_maximum_isolation_fraction: Mapping[str, float] | None = None,
+    isolation_decision_mode: str = "sampled_keyframes",
+    episode_frame_count: int | None = None,
 ) -> dict[str, Any]:
     """Evaluate hard episode connectivity and report soft overlap-regime targets.
 
     G_union connectivity, robot participation, non-degenerate views, and
     regime-aware long-term isolation are hard constraints. Per-frame graph
     connectivity is a target / QA metric rather than a universal hard gate.
+
+    ``sampled_keyframes`` is used by the ordinary sparse preflight.  A
+    borderline candidate may be re-rendered more densely and evaluated with
+    ``normalized_duration`` so increasing the keyframe count does not silently
+    make the isolation rule stricter.
     """
+    if isolation_decision_mode not in {"sampled_keyframes", "normalized_duration"}:
+        raise ValueError(f"unknown isolation decision mode: {isolation_decision_mode}")
     ids = tuple(robot_ids)
     union_edges: set[tuple[str, str]] = set()
     participation = {robot_id: 0 for robot_id in ids}
@@ -216,7 +227,10 @@ def temporal_overlap_acceptance(
     connected_count = 0
     meaningful_shared_count = 0
     near_duplicate_count = 0
-    for frame in keyframes:
+    isolated_by_robot = {robot_id: [] for robot_id in ids}
+    frame_indices: list[int] = []
+    for frame_position, frame in enumerate(keyframes):
+        frame_indices.append(int(frame.get("frame_index", frame_position)))
         edges = {tuple(sorted(map(str, edge))) for edge in frame.get("edges", ())}
         union_edges.update(edges)
         connected_count += int(bool(frame.get("connected", False)))
@@ -228,6 +242,7 @@ def temporal_overlap_acceptance(
             incident[right] = True
         for robot_id in ids:
             participation[robot_id] += int(incident[robot_id])
+            isolated_by_robot[robot_id].append(not incident[robot_id])
             isolation_runs[robot_id] = 0 if incident[robot_id] else isolation_runs[robot_id] + 1
             maximum_runs[robot_id] = max(maximum_runs[robot_id], isolation_runs[robot_id])
     reached = {ids[0]} if ids else set()
@@ -242,38 +257,141 @@ def temporal_overlap_acceptance(
     count = max(1, len(keyframes))
     connected_fraction = connected_count / count
     shared_keyframe_fraction = meaningful_shared_count / count
-    union_is_tree = len(union_edges) == max(0, len(ids) - 1)
-    if connected_fraction >= float(regime_connected_fraction_target["dense_shared"]):
-        realized_regime = "dense_shared"
-    elif (
-        union_is_tree
+    union_connected = len(reached) == len(ids)
+    union_is_tree = union_connected and len(union_edges) == max(0, len(ids) - 1)
+    minimum_participation = {
+        "dense_shared": 1,
+        "partial_chain": 2,
+        "exploratory": 1,
+        **dict(regime_minimum_participating_keyframes or {}),
+    }
+    maximum_isolation_sample_fraction = {
+        robot_id: float(value / count) for robot_id, value in maximum_runs.items()
+    }
+    duration_denominator = float(max(
+        1,
+        (episode_frame_count - 1)
+        if episode_frame_count is not None
+        else (max(frame_indices, default=0) - min(frame_indices, default=0)),
+    ))
+    maximum_isolation_fraction: dict[str, float] = {}
+    longest_isolation_intervals: dict[str, dict[str, Any]] = {}
+    for robot_id in ids:
+        flags = isolated_by_robot[robot_id]
+        best_start = best_end = -1
+        best_duration = -1.0
+        start = None
+        for position, isolated in enumerate((*flags, False)):
+            if isolated and start is None:
+                start = position
+            if not isolated and start is not None:
+                end = position - 1
+                left = (
+                    0.0 if start == 0
+                    else 0.5 * (frame_indices[start - 1] + frame_indices[start])
+                )
+                right = (
+                    duration_denominator if end == len(flags) - 1
+                    else 0.5 * (frame_indices[end] + frame_indices[end + 1])
+                )
+                duration = max(0.0, right - left)
+                if duration > best_duration:
+                    best_start, best_end, best_duration = start, end, duration
+                start = None
+        fraction = max(0.0, best_duration) / duration_denominator
+        maximum_isolation_fraction[robot_id] = float(min(1.0, fraction))
+        longest_isolation_intervals[robot_id] = {
+            "sample_start_index": int(best_start),
+            "sample_end_index": int(best_end),
+            "frame_start": (
+                int(frame_indices[best_start]) if best_start >= 0 else None
+            ),
+            "frame_end": int(frame_indices[best_end]) if best_end >= 0 else None,
+            "sample_count": int(maximum_runs[robot_id]),
+            "normalized_duration": float(min(1.0, fraction)),
+        }
+    isolation_fraction_limits = {
+        key: float(value) / max(1, len(keyframes))
+        for key, value in regime_maximum_consecutive_isolated_keyframes.items()
+    }
+    isolation_fraction_limits.update(dict(regime_maximum_isolation_fraction or {}))
+    def isolation_within(regime_name: str) -> bool:
+        if regime_name == "dense_shared":
+            return True
+        if isolation_decision_mode == "normalized_duration":
+            limit = float(isolation_fraction_limits[regime_name])
+            return all(
+                value <= limit + 1.0e-12
+                for value in maximum_isolation_fraction.values()
+            )
+        limit = int(regime_maximum_consecutive_isolated_keyframes[regime_name])
+        return all(value <= limit for value in maximum_runs.values())
+
+    partial_topology_and_participation = bool(
+        union_connected
         and shared_keyframe_fraction
         >= float(regime_shared_keyframe_fraction_target["partial_chain"])
-    ):
+        and all(
+            value >= int(minimum_participation["partial_chain"])
+            for value in participation.values()
+        )
+    )
+    partial_isolation_ok = isolation_within("partial_chain")
+    if connected_fraction >= float(regime_connected_fraction_target["dense_shared"]):
+        realized_regime = "dense_shared"
+    elif partial_topology_and_participation and partial_isolation_ok:
         realized_regime = "partial_chain"
     else:
+        # Regimes are nested quality tiers. A candidate that has enough shared
+        # frames for partial_chain but its longer independent interval only
+        # satisfies exploratory must remain usable as exploratory; improved
+        # overlap must never make a trajectory harder to accept.
         realized_regime = "exploratory"
     allowed_isolation = int(
         regime_maximum_consecutive_isolated_keyframes[realized_regime]
     )
+    allowed_isolation_fraction = float(isolation_fraction_limits[realized_regime])
+    isolation_ok = isolation_within(realized_regime)
     if regime == "unclassified":
         connected_target = 0.0
         shared_target = 0.0
     else:
         connected_target = float(regime_connected_fraction_target[regime])
         shared_target = float(regime_shared_keyframe_fraction_target[regime])
-    checks = {
-        "union_graph_connected": len(reached) == len(ids),
+    universal_checks = {
+        "union_graph_connected": union_connected,
         "meaningful_shared_moment": meaningful_shared_count > 0,
         "every_robot_participates": all(value > 0 for value in participation.values()),
-        "no_severe_isolation": all(value <= allowed_isolation for value in maximum_runs.values()),
         "no_near_duplicate_views": near_duplicate_count == 0,
     }
+    checks = {
+        **universal_checks,
+        "no_severe_isolation": isolation_ok,
+    }
+    passed_universal = all(universal_checks.values())
+    failure_reasons = []
+    failure_code = {
+        "union_graph_connected": "union_disconnected",
+        "meaningful_shared_moment": "no_meaningful_shared_moment",
+        "every_robot_participates": "robot_never_participates",
+        "no_near_duplicate_views": "near_duplicate",
+    }
+    failure_reasons.extend(
+        failure_code[name] for name, passed in universal_checks.items() if not passed
+    )
+    if not isolation_ok:
+        failure_reasons.append(f"severe_isolation_{realized_regime.removesuffix('_shared').removesuffix('_chain')}")
+    isolation_confirmation_recommended = bool(
+        realized_regime != "dense_shared"
+        and passed_universal
+        and max(maximum_runs.values(), default=0) >= allowed_isolation
+    )
     return {
         "passed": all(checks.values()),
         "checks": checks,
         "union_edges": [list(edge) for edge in sorted(union_edges)],
         "connected_keyframe_count": connected_count,
+        "union_graph_is_tree": union_is_tree,
         "keyframe_count": len(keyframes),
         "connected_fraction": connected_fraction,
         "connected_fraction_target": connected_target,
@@ -283,9 +401,28 @@ def temporal_overlap_acceptance(
         "shared_keyframe_fraction_target": shared_target,
         "shared_keyframe_fraction_target_met": shared_keyframe_fraction >= shared_target,
         "participating_keyframe_count": participation,
+        "minimum_participating_keyframes": int(minimum_participation[realized_regime]),
+        "partial_chain_topology_and_participation_met": (
+            partial_topology_and_participation
+        ),
+        "partial_chain_isolation_met": partial_isolation_ok,
+        "fell_back_to_exploratory_for_isolation": bool(
+            realized_regime == "exploratory"
+            and partial_topology_and_participation
+            and not partial_isolation_ok
+        ),
         "maximum_consecutive_isolated_keyframes": maximum_runs,
         "allowed_consecutive_isolated_keyframes": allowed_isolation,
+        "maximum_isolation_sample_fraction": maximum_isolation_sample_fraction,
+        "maximum_isolation_fraction": maximum_isolation_fraction,
+        "allowed_isolation_fraction": allowed_isolation_fraction,
+        "longest_isolation_intervals": longest_isolation_intervals,
+        "isolation_decision_mode": isolation_decision_mode,
         "near_duplicate_keyframe_pair_count": near_duplicate_count,
+        "passed_universal_hard_checks": passed_universal,
+        "isolation_only_failure": bool(passed_universal and not isolation_ok),
+        "isolation_confirmation_recommended": isolation_confirmation_recommended,
+        "failure_reasons": failure_reasons,
         "requested_regime": regime,
         "realized_regime": realized_regime,
         "regime_target_match": regime in {"unclassified", realized_regime},

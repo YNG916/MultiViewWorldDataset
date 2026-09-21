@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import json
 import traceback
+import time
 from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from multi_view_world_dataset.assets import robot_appearance_metadata
+from multi_view_world_dataset.assets import (
+    ROBOT_ASSET_ID,
+    ROBOT_ASSET_VERSION,
+    robot_appearance_metadata,
+    robot_asset_fingerprint,
+)
 from multi_view_world_dataset.adapters.omnigibson import OmniGibsonAdapter
 from multi_view_world_dataset.cameras.calibration import PinholeCalibration
 from multi_view_world_dataset.cameras.overlap import (
@@ -33,7 +40,13 @@ from multi_view_world_dataset.rendering.inspection_v11 import (
 from multi_view_world_dataset.sampling.configurations import near_duplicate_configuration
 from multi_view_world_dataset.sampling.diversity import stable_seed, temporal_overlap_acceptance
 from multi_view_world_dataset.sampling.interventions import eligible_intervention_targets
-from multi_view_world_dataset.sampling.splits import assign_scene_family_splits
+from multi_view_world_dataset.sampling.splits import assign_scene_family_splits, infer_scene_family
+from multi_view_world_dataset.scene_eligibility import (
+    load_scene_eligibility,
+    reconcile_scene_eligibility,
+    resolve_scene_eligibility_path,
+    validate_scene_family_split_disjointness,
+)
 from multi_view_world_dataset.schema.records import (
     CameraState,
     DynamicConfiguration,
@@ -170,13 +183,21 @@ def _temporal_overlap_preflight(
     *,
     catalog: tuple[ObjectState, ...] | None = None,
     requested_regime: str | None = None,
+    keyframe_count_override: int | None = None,
+    isolation_decision_mode: str = "sampled_keyframes",
+    allow_dense_confirmation: bool = True,
 ) -> dict[str, Any]:
     """Validate sparse GT overlap and target visibility before dense capture."""
     preflight = config["trajectory"]["overlap_preflight"]
     frame_count = trajectories[0].frames
-    keyframe_indices = np.unique(
-        np.rint(np.linspace(0, frame_count - 1, int(preflight["keyframe_count"]))).astype(int)
+    requested_keyframe_count = int(
+        keyframe_count_override
+        if keyframe_count_override is not None
+        else preflight["keyframe_count"]
     )
+    keyframe_indices = np.unique(np.rint(np.linspace(
+        0, frame_count - 1, requested_keyframe_count
+    )).astype(int))
     width = int(preflight["geometry_width"])
     height = int(preflight["geometry_height"])
     camera_config = config["camera"]
@@ -283,18 +304,77 @@ def _temporal_overlap_preflight(
         regime_maximum_consecutive_isolated_keyframes=preflight[
             "regime_maximum_consecutive_isolated_keyframes"
         ],
+        regime_minimum_participating_keyframes=preflight.get(
+            "regime_minimum_participating_keyframes",
+            {"dense_shared": 1, "partial_chain": 2, "exploratory": 1},
+        ),
+        regime_maximum_isolation_fraction=preflight.get(
+            "regime_maximum_isolation_fraction"
+        ),
+        isolation_decision_mode=isolation_decision_mode,
+        episode_frame_count=frame_count,
     )
     metrics.update({
         "keyframe_indices": keyframe_indices.tolist(),
         "geometry_resolution": [width, height],
         "robot_ids": list(robot_ids),
         "keyframes": keyframes,
+        "acceptance_source": (
+            f"sparse_{len(keyframe_indices)}"
+            if isolation_decision_mode == "sampled_keyframes"
+            else f"dense_{len(keyframe_indices)}_confirmation"
+        ),
+        "gt_validation_accounting": {
+            "sparse_7_validations": int(isolation_decision_mode == "sampled_keyframes"),
+            "dense_13_confirmations": int(
+                isolation_decision_mode == "normalized_duration"
+            ),
+        },
     })
     if requested_regime is not None:
         metrics["requested_regime"] = str(requested_regime)
         metrics["regime_target_match"] = bool(
             metrics["realized_regime"] == requested_regime
         )
+    if (
+        allow_dense_confirmation
+        and bool(
+            metrics.get("isolation_only_failure", False)
+            or metrics.get("isolation_confirmation_recommended", False)
+        )
+    ):
+        dense_count = int(preflight.get("dense_confirmation_keyframe_count", 13))
+        try:
+            dense_metrics = _temporal_overlap_preflight(
+                adapter,
+                config,
+                trajectories,
+                catalog=None,
+                requested_regime=requested_regime,
+                keyframe_count_override=dense_count,
+                isolation_decision_mode="normalized_duration",
+                allow_dense_confirmation=False,
+            )
+        except SampleRejected as dense_error:
+            metrics["dense_confirmation"] = dense_error.details
+            metrics["failure_reasons"] = list(metrics["failure_reasons"])
+            metrics["failure_reasons"].append("dense_confirmation_failed")
+            metrics["gt_validation_accounting"]["dense_13_confirmations"] = 1
+            metrics["passed"] = False
+            metrics["checks"]["no_severe_isolation"] = False
+            metrics["isolation_only_failure"] = bool(
+                metrics.get("passed_universal_hard_checks", False)
+            )
+        else:
+            dense_metrics["sparse_validation"] = metrics
+            dense_metrics["acceptance_source"] = (
+                f"dense_{len(dense_metrics['keyframe_indices'])}_confirmation"
+            )
+            dense_metrics["gt_validation_accounting"] = {
+                "sparse_7_validations": 1,
+                "dense_13_confirmations": 1,
+            }
+            metrics = dense_metrics
     if not metrics["passed"]:
         raise SampleRejected("trajectory_temporal_overlap_failed", metrics)
     if catalog is not None:
@@ -407,6 +487,231 @@ def _gt_valid_candidate_soft_score(
         "lambda_regime": float(lambda_regime),
         "final_score": float(final_score),
     }
+
+def _adaptive_exact_validation(
+    candidates: Sequence[Any],
+    cumulative_batch_limits: Sequence[int],
+    validate: Callable[[Any, int, int], Any],
+) -> tuple[list[Any], dict[str, Any]]:
+    """Validate each candidate at most once and expand only after an empty batch.
+
+    Batch limits are cumulative ranks, e.g. ``(12, 24, 48)``.  Validation
+    stops after the first batch containing at least one hard-valid candidate;
+    selection among that batch's valid candidates remains a separate soft
+    ranking step.
+    """
+    limits = tuple(int(value) for value in cumulative_batch_limits)
+    if (
+        not limits
+        or any(value <= 0 for value in limits)
+        or any(right <= left for left, right in zip(limits, limits[1:]))
+    ):
+        raise ValueError("exact-validation batch limits must be strictly increasing")
+    valid: list[Any] = []
+    records: list[dict[str, Any]] = []
+    attempted_ranks: set[int] = set()
+    previous_limit = 0
+    accepted_batch: int | None = None
+    for batch_limit in limits:
+        upper = min(batch_limit, len(candidates))
+        batch_valid: list[Any] = []
+        for candidate_rank in range(previous_limit, upper):
+            if candidate_rank in attempted_ranks:
+                raise AssertionError("exact candidate was scheduled more than once")
+            attempted_ranks.add(candidate_rank)
+            candidate = candidates[candidate_rank]
+            record = {
+                "candidate_rank": candidate_rank,
+                "validation_batch_limit": batch_limit,
+                "gt_validation_attempted": True,
+            }
+            try:
+                value = validate(candidate, candidate_rank, batch_limit)
+            except SampleRejected as error:
+                record.update({
+                    "gt_valid": False,
+                    "reject_reason": error.reason,
+                    "reject_details": error.details,
+                })
+            else:
+                record.update({"gt_valid": True, "reject_reason": None})
+                batch_valid.append(value)
+            records.append(record)
+        valid.extend(batch_valid)
+        if batch_valid:
+            accepted_batch = batch_limit
+            break
+        previous_limit = upper
+        if upper >= len(candidates):
+            break
+    return valid, {
+        "configured_cumulative_batches": list(limits),
+        "accepted_batch_limit": accepted_batch,
+        "total_exact_candidates_tested": len(attempted_ranks),
+        "gt_valid_candidate_count": len(valid),
+        "candidate_records": records,
+        "candidate_pool_exhausted": not valid,
+    }
+
+
+
+def _gt_rescue_candidates(
+    adapter: Any,
+    candidate_sets: Sequence[Any],
+    candidate_failures: list[dict[str, Any]],
+    seed: int,
+) -> tuple[tuple[Any, ...], list[dict[str, Any]]]:
+    """Build bounded GT-guided candidates only after the base pool is exhausted."""
+    base = tuple(candidate_sets)
+    generated: list[Any] = []
+    failures: list[dict[str, Any]] = []
+    builders = (
+        (
+            "complementary_hybrid",
+            lambda: adapter.complementary_trajectory_hybrids(
+                base, candidate_failures
+            ),
+        ),
+        (
+            "measured_overlap_bridge",
+            lambda: adapter.measured_overlap_bridge_trajectories(
+                base, candidate_failures, seed
+            ),
+        ),
+    )
+    for candidate_kind, build in builders:
+        try:
+            generated.extend(build())
+        except SampleRejected as error:
+            failures.append({
+                "candidate_kind": candidate_kind,
+                "reason": error.reason,
+                "details": error.details,
+            })
+    return tuple(generated), failures
+
+
+def _gt_validation_record_fields(overlap: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Flatten adaptive temporal-validation provenance into one candidate row."""
+    details = dict(overlap or {})
+    accounting = details.get("gt_validation_accounting", {})
+    checks = details.get("checks", {})
+    return {
+        "sparse_7_validations": int(accounting.get("sparse_7_validations", 1)),
+        "dense_13_confirmations": int(accounting.get("dense_13_confirmations", 0)),
+        "temporal_acceptance_source": details.get("acceptance_source"),
+        "passed_universal_hard_checks": details.get(
+            "passed_universal_hard_checks"
+        ),
+        "failed_checks": sorted(name for name, passed in checks.items() if not passed),
+        "structured_failure_reasons": list(details.get("failure_reasons", ())),
+    }
+
+
+def _candidate_accounting(
+    *,
+    base_candidates_generated: int,
+    candidate_records: Sequence[Mapping[str, Any]],
+    rescue_candidate_counts: Mapping[str, int],
+    duplicate_candidates_removed: int = 0,
+    accepted_candidate_source: str | None = None,
+) -> dict[str, Any]:
+    """Return internally checkable generated / exact-GT candidate totals."""
+    base_exact = sum(
+        record.get("validation_stage") == "adaptive_base"
+        for record in candidate_records
+    )
+    rescue_exact = len(candidate_records) - base_exact
+    sparse = sum(int(record.get("sparse_7_validations", 0)) for record in candidate_records)
+    dense = sum(int(record.get("dense_13_confirmations", 0)) for record in candidate_records)
+    return {
+        "base_candidates_generated": int(base_candidates_generated),
+        "base_candidates_exact_gt_validated": int(base_exact),
+        "rescue_candidates_generated": int(sum(rescue_candidate_counts.values())),
+        "rescue_candidates_exact_gt_validated": int(rescue_exact),
+        "rescue_subtype_counts": dict(rescue_candidate_counts),
+        "duplicate_candidates_removed": int(duplicate_candidates_removed),
+        "sparse_7_validations": int(sparse),
+        "dense_13_confirmations": int(dense),
+        "exact_gt_candidate_record_count": len(candidate_records),
+        "accepted_candidate_source": accepted_candidate_source,
+        "totals_consistent": bool(
+            base_exact + rescue_exact == len(candidate_records)
+            and sparse == len(candidate_records)
+        ),
+    }
+
+
+def _validate_gt_rescue_candidate(
+    adapter: Any,
+    config: dict[str, Any],
+    candidate_trajectories: tuple[Any, ...],
+    candidate_metrics: dict[str, Any],
+    *,
+    original_rank: int,
+    candidate_count: int,
+    requested_overlap_regime: str,
+    regime_weights: dict[str, float],
+    realized_regime_counts: Counter[str],
+    split_realized_counts: Counter[str],
+    lambda_regime: float,
+    split_name: str,
+    requested_regime_counts: Counter[str],
+    split_requested_counts: Counter[str],
+) -> dict[str, Any]:
+    """Run the canonical exact-GT checks for a feedback rescue candidate."""
+    adapter.place_robots_at_trajectory_frame(candidate_trajectories, 0)
+    candidate_graph, _ = _initial_overlap(adapter, config)
+    candidate_catalog = adapter.object_catalog_with_relations()
+    candidate_overlap = _temporal_overlap_preflight(
+        adapter,
+        config,
+        candidate_trajectories,
+        catalog=candidate_catalog,
+        requested_regime=requested_overlap_regime,
+    )
+    requested_regime = str(candidate_overlap["requested_regime"])
+    realized_regime = str(candidate_overlap["realized_regime"])
+    candidate_metrics["requested_observation_regime"] = requested_regime
+    candidate_metrics["observation_regime"] = realized_regime
+    for trajectory in candidate_trajectories:
+        trajectory.metadata["requested_observation_regime"] = requested_regime
+        trajectory.metadata["observation_regime"] = realized_regime
+    candidate_metrics["temporal_overlap"] = candidate_overlap
+    selection_score = _gt_valid_candidate_soft_score(
+        candidate_metrics,
+        original_rank,
+        candidate_count,
+        realized_regime,
+        regime_weights,
+        realized_regime_counts,
+        split_realized_counts,
+        lambda_regime=lambda_regime,
+    )
+    candidate_metrics["realized_regime_soft_selection"] = selection_score
+    candidate_metrics["overlap_regime_distribution"] = {
+        "target_weights": regime_weights,
+        "global_requested_before_accept": dict(requested_regime_counts),
+        "global_realized_before_accept": dict(realized_regime_counts),
+        "split": split_name,
+        "split_requested_before_accept": dict(split_requested_counts),
+        "split_realized_before_accept": dict(split_realized_counts),
+        "selection_policy": (
+            "quality_plus_soft_realized_global_and_split_deficit"
+        ),
+    }
+    candidate_metrics["temporal_preflight_candidate_rank"] = original_rank
+    return {
+        "original_rank": original_rank,
+        "trajectories": candidate_trajectories,
+        "metrics": candidate_metrics,
+        "graph": candidate_graph,
+        "catalog": candidate_catalog,
+        "overlap": candidate_overlap,
+        "selection_score": selection_score,
+        "realized_regime": realized_regime,
+    }
+
 
 def _robot_states(
     config: dict[str, Any],
@@ -842,10 +1147,15 @@ def generate_dataset(
         raise ConfigurationError(
             "Refusing large pilot/default generation without explicit --allow-large"
         )
+    if profile not in {"smoke", "integration"} and scene_id is None:
+        raise ConfigurationError(
+            "Multi-scene generation requires production-launch so every scene uses a fresh process"
+        )
     root = runtime.require_output()
     repository_root = Path(__file__).resolve().parents[2]
     commit = generator_git_commit(repository_root)
     source_fingerprint = generator_source_fingerprint(repository_root)
+    final_robot_fingerprint = robot_asset_fingerprint(repository_root)
     writer = DatasetWriter(root)
     writer.initialize(
         {
@@ -855,6 +1165,11 @@ def generate_dataset(
             "seed": int(config["seed"]),
             "generator_git_commit": commit,
             "generator_source_fingerprint": source_fingerprint,
+            "robot_asset": {
+                "asset_id": ROBOT_ASSET_ID,
+                "version": ROBOT_ASSET_VERSION,
+                "fingerprint": final_robot_fingerprint,
+            },
             "source_of_truth": "world_state+simulator_snapshot+trajectory+event_log",
             "coordinate_conventions": {
                 "world": "right-handed Z-up",
@@ -933,19 +1248,42 @@ def generate_dataset(
                 )
             }
         )
-        scenes = adapter.discover_scenes()
+        discovered_scenes = adapter.discover_scenes()
+        eligibility_manifest_path = resolve_scene_eligibility_path(
+            repository_root, config
+        )
+        eligibility_manifest = load_scene_eligibility(eligibility_manifest_path)
+        eligibility = reconcile_scene_eligibility(
+            discovered_scenes, eligibility_manifest
+        )
+        eligible_scenes = list(eligibility["eligible_scenes"])
+        splits = assign_scene_family_splits(
+            eligible_scenes,
+            config["dataset"]["splits"],
+            int(config["dataset"]["scene_family_split_seed"]),
+        )
+        validate_scene_family_split_disjointness(splits)
+        writer.update_dataset_metadata({
+            "scene_eligibility": eligibility,
+            "scene_eligibility_manifest": str(eligibility_manifest_path),
+            "scene_split_mapping": splits,
+            "scene_family_mapping": {
+                scene: infer_scene_family(scene) for scene in eligible_scenes
+            },
+        })
+        scenes = eligible_scenes
         if scene_id is not None:
-            if scene_id not in scenes:
+            if scene_id not in discovered_scenes:
                 raise ConfigurationError(f"Requested scene is not installed: {scene_id}")
+            if scene_id not in eligible_scenes:
+                reason = eligibility_manifest.by_scene[scene_id].reason
+                raise ConfigurationError(
+                    f"Requested scene is ineligible: {scene_id}: {reason}"
+                )
             scenes = [scene_id]
         scene_limit = config["dataset"].get("scene_limit")
         if scene_limit is not None:
             scenes = scenes[: int(scene_limit)]
-        splits = assign_scene_family_splits(
-            adapter.discover_scenes(),
-            config["dataset"]["splits"],
-            int(config["dataset"]["scene_family_split_seed"]),
-        )
         requested_configurations = int(config["dataset"]["accepted_configurations_per_scene"])
         requested_episodes = int(config["dataset"]["accepted_episodes_per_configuration"])
         for scene_position, selected_scene in enumerate(scenes):
@@ -1044,6 +1382,7 @@ def generate_dataset(
                                 for catalog in accepted_catalogs
                             ):
                                 raise SampleRejected("near_duplicate_configuration")
+                            navigation_context_started = time.perf_counter()
                             adapter.prepare_navigation_context(
                                 str(candidate["exact_state_hash"]),
                                 stable_seed(seed, "configuration-navigation-context"),
@@ -1051,6 +1390,9 @@ def generate_dataset(
                             )
                             navigation_metadata = adapter.navigation_context_metadata()
                             environment_arrays, _ = _render_environment_floors(adapter, config)
+                            navigation_context_build_s = (
+                                time.perf_counter() - navigation_context_started
+                            )
                             world_state = WorldState(
                                 scene_id=selected_scene,
                                 configuration_id=configuration_id,
@@ -1120,6 +1462,7 @@ def generate_dataset(
                                         if key in candidate
                                     },
                                     "navigation_context_ref": "navigation_context.json",
+                                    "navigation_context_and_route_bank_build_s": navigation_context_build_s,
                                 },
                             )
                             writer.write_configuration(
@@ -1214,6 +1557,8 @@ def generate_dataset(
                         int(config["seed"]), selected_scene,
                         configuration_id, episode_id,
                     )
+                    episode_started = time.perf_counter()
+                    episode_timing: dict[str, float] = {}
                     before = None
                     graph = None
                     heights = None
@@ -1245,6 +1590,7 @@ def generate_dataset(
                         )
                         adapter.load_snapshot(configuration_snapshot)
                         try:
+                            route_search_started = time.perf_counter()
                             heights, base_trajectory_candidates = (
                                 adapter.sample_route_first_trajectory_sets(
                                     stable_seed(episode_seed, "route-first", placement_attempt),
@@ -1252,6 +1598,10 @@ def generate_dataset(
                                 )
                             )
                             trajectory_candidates = list(base_trajectory_candidates)
+                            episode_timing["route_bank_joint_search_s"] = (
+                                episode_timing.get("route_bank_joint_search_s", 0.0)
+                                + time.perf_counter() - route_search_started
+                            )
                             candidate_failures: list[dict[str, Any]] = []
                             gt_valid_candidates: list[dict[str, Any]] = []
                             regime_weights = config["placement"]["observation_regime_weights"]
@@ -1263,10 +1613,35 @@ def generate_dataset(
                                     "realized_regime_soft_weight"
                                 ]
                             )
+                            exact_validation_started = time.perf_counter()
+                            exact_batch_limits = tuple(map(
+                                int, config["navigation"]["exact_validation_batches"]
+                            ))
+                            active_exact_batch_limit = exact_batch_limits[0]
+                            exact_candidate_records: list[dict[str, Any]] = []
+                            total_exact_candidates_tested = 0
                             for original_rank, (
                                 candidate_trajectories,
                                 candidate_metrics,
                             ) in enumerate(trajectory_candidates):
+                                if original_rank >= active_exact_batch_limit:
+                                    if gt_valid_candidates:
+                                        break
+                                    active_exact_batch_limit = next(
+                                        limit for limit in exact_batch_limits
+                                        if limit > original_rank
+                                    )
+                                total_exact_candidates_tested += 1
+                                candidate_proxy_score = float(
+                                    candidate_metrics.get(
+                                        "cheap_scene_visibility", {}
+                                    ).get("score", 0.0)
+                                )
+                                candidate_kind = str(
+                                    candidate_metrics.get(
+                                        "nested_trajectory_sets", {}
+                                    ).get("candidate_kind", "base")
+                                )
                                 try:
                                     adapter.place_robots_at_trajectory_frame(
                                         candidate_trajectories, 0
@@ -1337,6 +1712,8 @@ def generate_dataset(
                                     ] = original_rank
                                     gt_valid_candidates.append({
                                         "original_rank": original_rank,
+                                        "candidate_kind": candidate_kind,
+                                        "validation_stage": "adaptive_base",
                                         "trajectories": candidate_trajectories,
                                         "metrics": candidate_metrics,
                                         "graph": candidate_graph,
@@ -1344,17 +1721,512 @@ def generate_dataset(
                                         "overlap": candidate_overlap,
                                         "selection_score": selection_score,
                                     })
+                                    exact_candidate_records.append({
+                                        "candidate_rank": original_rank,
+                                        "candidate_kind": candidate_kind,
+                                        "validation_stage": "adaptive_base",
+                                        "cheap_proxy_score": candidate_proxy_score,
+                                        "gt_validation_attempted": True,
+                                        "gt_valid": True,
+                                        "reject_reason": None,
+                                        "validation_batch_limit": active_exact_batch_limit,
+                                        "realized_regime": realized_regime,
+                                    })
                                 except SampleRejected as candidate_error:
+                                    failure_requested = str(
+                                        candidate_error.details.get(
+                                            "requested_regime", requested_overlap_regime
+                                        )
+                                    )
+                                    failure_realized = str(
+                                        candidate_error.details.get(
+                                            "realized_regime", "unclassified"
+                                        )
+                                    )
+                                    candidate_metrics[
+                                        "requested_observation_regime"
+                                    ] = failure_requested
+                                    candidate_metrics[
+                                        "observation_regime"
+                                    ] = failure_realized
+                                    if (
+                                        candidate_error.reason
+                                        == "trajectory_temporal_overlap_failed"
+                                    ):
+                                        candidate_metrics["temporal_overlap"] = (
+                                            candidate_error.details
+                                        )
+                                    for candidate_trajectory in candidate_trajectories:
+                                        candidate_trajectory.metadata[
+                                            "requested_observation_regime"
+                                        ] = failure_requested
+                                        candidate_trajectory.metadata[
+                                            "observation_regime"
+                                        ] = failure_realized
                                     candidate_failures.append({
                                         "candidate_rank": original_rank,
+                                        "candidate_kind": candidate_kind,
+                                        "cheap_proxy_score": candidate_proxy_score,
                                         "selection_stage": "gt_depth_preflight",
+                                        "validation_stage": "adaptive_base",
                                         "reason": candidate_error.reason,
                                         "details": candidate_error.details,
                                     })
+                                    exact_candidate_records.append({
+                                        "candidate_rank": original_rank,
+                                        "candidate_kind": candidate_kind,
+                                        "validation_stage": "adaptive_base",
+                                        "cheap_proxy_score": candidate_proxy_score,
+                                        "gt_validation_attempted": True,
+                                        "gt_valid": False,
+                                        "reject_reason": candidate_error.reason,
+                                        "validation_batch_limit": active_exact_batch_limit,
+                                    })
+                            rescue_candidate_counts: Counter[str] = Counter()
+                            rescue_generation_failures: list[dict[str, Any]] = []
+                            rescue_candidates: tuple[Any, ...] = ()
+                            if not gt_valid_candidates:
+                                adapter.load_snapshot(configuration_snapshot)
+                                (
+                                    rescue_candidates,
+                                    rescue_generation_failures,
+                                ) = _gt_rescue_candidates(
+                                    adapter,
+                                    trajectory_candidates,
+                                    candidate_failures,
+                                    stable_seed(
+                                        episode_seed,
+                                        "measured-overlap-bridge",
+                                        placement_attempt,
+                                    ),
+                                )
+                                for rescue_offset, (
+                                    candidate_trajectories,
+                                    candidate_metrics,
+                                ) in enumerate(rescue_candidates):
+                                    original_rank = (
+                                        len(trajectory_candidates)
+                                        + rescue_offset
+                                    )
+                                    candidate_kind = str(
+                                        candidate_metrics.get(
+                                            "nested_trajectory_sets", {}
+                                        ).get("candidate_kind", "gt_rescue")
+                                    )
+                                    rescue_candidate_counts[candidate_kind] += 1
+                                    total_exact_candidates_tested += 1
+                                    candidate_proxy_score = float(
+                                        candidate_metrics.get(
+                                            "cheap_scene_visibility", {}
+                                        ).get("score", 0.0)
+                                    )
+                                    try:
+                                        adapter.place_robots_at_trajectory_frame(
+                                            candidate_trajectories, 0
+                                        )
+                                        candidate_graph, _ = _initial_overlap(
+                                            adapter, config
+                                        )
+                                        candidate_catalog = (
+                                            adapter.object_catalog_with_relations()
+                                        )
+                                        candidate_overlap = (
+                                            _temporal_overlap_preflight(
+                                                adapter,
+                                                config,
+                                                candidate_trajectories,
+                                                catalog=candidate_catalog,
+                                                requested_regime=(
+                                                    requested_overlap_regime
+                                                ),
+                                            )
+                                        )
+                                        requested_regime = str(
+                                            candidate_overlap[
+                                                "requested_regime"
+                                            ]
+                                        )
+                                        realized_regime = str(
+                                            candidate_overlap["realized_regime"]
+                                        )
+                                        candidate_metrics[
+                                            "requested_observation_regime"
+                                        ] = requested_regime
+                                        candidate_metrics[
+                                            "observation_regime"
+                                        ] = realized_regime
+                                        for candidate_trajectory in (
+                                            candidate_trajectories
+                                        ):
+                                            candidate_trajectory.metadata[
+                                                "requested_observation_regime"
+                                            ] = requested_regime
+                                            candidate_trajectory.metadata[
+                                                "observation_regime"
+                                            ] = realized_regime
+                                        candidate_metrics[
+                                            "temporal_overlap"
+                                        ] = candidate_overlap
+                                        selection_score = (
+                                            _gt_valid_candidate_soft_score(
+                                                candidate_metrics,
+                                                original_rank,
+                                                (
+                                                    len(trajectory_candidates)
+                                                    + len(rescue_candidates)
+                                                ),
+                                                realized_regime,
+                                                regime_weights,
+                                                realized_regime_counts,
+                                                split_realized_counts,
+                                                lambda_regime=lambda_regime,
+                                            )
+                                        )
+                                        candidate_metrics[
+                                            "realized_regime_soft_selection"
+                                        ] = selection_score
+                                        candidate_metrics[
+                                            "overlap_regime_distribution"
+                                        ] = {
+                                            "target_weights": regime_weights,
+                                            "global_requested_before_accept": dict(
+                                                requested_regime_counts
+                                            ),
+                                            "global_realized_before_accept": dict(
+                                                realized_regime_counts
+                                            ),
+                                            "split": split_name,
+                                            "split_requested_before_accept": dict(
+                                                requested_regime_counts_by_split[
+                                                    split_name
+                                                ]
+                                            ),
+                                            "split_realized_before_accept": dict(
+                                                split_realized_counts
+                                            ),
+                                            "selection_policy": (
+                                                "quality_plus_soft_realized_"
+                                                "global_and_split_deficit"
+                                            ),
+                                        }
+                                        candidate_metrics[
+                                            "temporal_preflight_candidate_rank"
+                                        ] = original_rank
+                                        gt_valid_candidates.append({
+                                            "original_rank": original_rank,
+                                            "candidate_kind": candidate_kind,
+                                            "validation_stage": "gt_rescue",
+                                            "trajectories": (
+                                                candidate_trajectories
+                                            ),
+                                            "metrics": candidate_metrics,
+                                            "graph": candidate_graph,
+                                            "catalog": candidate_catalog,
+                                            "overlap": candidate_overlap,
+                                            "selection_score": selection_score,
+                                        })
+                                        exact_candidate_records.append({
+                                            "candidate_rank": original_rank,
+                                            "candidate_kind": candidate_kind,
+                                            "validation_stage": "gt_rescue",
+                                            "cheap_proxy_score": (
+                                                candidate_proxy_score
+                                            ),
+                                            "gt_validation_attempted": True,
+                                            "gt_valid": True,
+                                            "reject_reason": None,
+                                            "validation_batch_limit": (
+                                                active_exact_batch_limit
+                                            ),
+                                            "realized_regime": realized_regime,
+                                        })
+                                    except SampleRejected as candidate_error:
+                                        candidate_failures.append({
+                                            "candidate_rank": original_rank,
+                                            "candidate_kind": candidate_kind,
+                                            "cheap_proxy_score": (
+                                                candidate_proxy_score
+                                            ),
+                                            "selection_stage": (
+                                                "gt_depth_preflight"
+                                            ),
+                                            "validation_stage": "gt_rescue",
+                                            "reason": candidate_error.reason,
+                                            "details": candidate_error.details,
+                                        })
+                                        exact_candidate_records.append({
+                                            "candidate_rank": original_rank,
+                                            "candidate_kind": candidate_kind,
+                                            "validation_stage": "gt_rescue",
+                                            "cheap_proxy_score": (
+                                                candidate_proxy_score
+                                            ),
+                                            "gt_validation_attempted": True,
+                                            "gt_valid": False,
+                                            "reject_reason": (
+                                                candidate_error.reason
+                                            ),
+                                            "validation_batch_limit": (
+                                                active_exact_batch_limit
+                                            ),
+                                        })
+                                all_rescue_candidates = list(rescue_candidates)
+                                maximum_feedback_rounds = int(
+                                    config["trajectory"][
+                                        "maximum_gt_feedback_mutation_rounds"
+                                    ]
+                                )
+                                for feedback_round in range(
+                                    1, maximum_feedback_rounds
+                                ):
+                                    if gt_valid_candidates:
+                                        break
+                                    adapter.load_snapshot(configuration_snapshot)
+                                    combined_candidates = tuple(
+                                        trajectory_candidates
+                                    ) + tuple(all_rescue_candidates)
+                                    try:
+                                        feedback_candidates = (
+                                            adapter.measured_overlap_bridge_trajectories(
+                                                combined_candidates,
+                                                candidate_failures,
+                                                stable_seed(
+                                                    episode_seed,
+                                                    "measured-overlap-feedback",
+                                                    placement_attempt,
+                                                    feedback_round,
+                                                ),
+                                            )
+                                        )
+                                    except SampleRejected as feedback_error:
+                                        rescue_generation_failures.append({
+                                            "candidate_kind": (
+                                                "measured_overlap_route_mutation"
+                                            ),
+                                            "feedback_round": feedback_round + 1,
+                                            "reason": feedback_error.reason,
+                                            "details": feedback_error.details,
+                                        })
+                                        break
+                                    if not feedback_candidates:
+                                        break
+                                    feedback_start_rank = len(combined_candidates)
+                                    feedback_candidate_count = (
+                                        feedback_start_rank
+                                        + len(feedback_candidates)
+                                    )
+                                    for feedback_offset, (
+                                        candidate_trajectories,
+                                        candidate_metrics,
+                                    ) in enumerate(feedback_candidates):
+                                        original_rank = (
+                                            feedback_start_rank + feedback_offset
+                                        )
+                                        candidate_kind = str(
+                                            candidate_metrics.get(
+                                                "nested_trajectory_sets", {}
+                                            ).get(
+                                                "candidate_kind",
+                                                "measured_overlap_route_mutation",
+                                            )
+                                        )
+                                        rescue_candidate_counts[candidate_kind] += 1
+                                        total_exact_candidates_tested += 1
+                                        candidate_proxy_score = float(
+                                            candidate_metrics.get(
+                                                "cheap_scene_visibility", {}
+                                            ).get("score", 0.0)
+                                        )
+                                        validation_stage = (
+                                            f"gt_feedback_mutation_round_"
+                                            f"{feedback_round + 1}"
+                                        )
+                                        try:
+                                            validated = (
+                                                _validate_gt_rescue_candidate(
+                                                    adapter,
+                                                    config,
+                                                    candidate_trajectories,
+                                                    candidate_metrics,
+                                                    original_rank=original_rank,
+                                                    candidate_count=(
+                                                        feedback_candidate_count
+                                                    ),
+                                                    requested_overlap_regime=(
+                                                        requested_overlap_regime
+                                                    ),
+                                                    regime_weights=regime_weights,
+                                                    realized_regime_counts=(
+                                                        realized_regime_counts
+                                                    ),
+                                                    split_realized_counts=(
+                                                        split_realized_counts
+                                                    ),
+                                                    lambda_regime=lambda_regime,
+                                                    split_name=split_name,
+                                                    requested_regime_counts=(
+                                                        requested_regime_counts
+                                                    ),
+                                                    split_requested_counts=(
+                                                        requested_regime_counts_by_split[
+                                                            split_name
+                                                        ]
+                                                    ),
+                                                )
+                                            )
+                                        except SampleRejected as candidate_error:
+                                            candidate_failures.append({
+                                                "candidate_rank": original_rank,
+                                                "candidate_kind": candidate_kind,
+                                                "cheap_proxy_score": (
+                                                    candidate_proxy_score
+                                                ),
+                                                "selection_stage": (
+                                                    "gt_depth_preflight"
+                                                ),
+                                                "validation_stage": (
+                                                    validation_stage
+                                                ),
+                                                "feedback_round": (
+                                                    feedback_round + 1
+                                                ),
+                                                "reason": candidate_error.reason,
+                                                "details": candidate_error.details,
+                                            })
+                                            exact_candidate_records.append({
+                                                "candidate_rank": original_rank,
+                                                "candidate_kind": candidate_kind,
+                                                "validation_stage": (
+                                                    validation_stage
+                                                ),
+                                                "feedback_round": (
+                                                    feedback_round + 1
+                                                ),
+                                                "cheap_proxy_score": (
+                                                    candidate_proxy_score
+                                                ),
+                                                "gt_validation_attempted": True,
+                                                "gt_valid": False,
+                                                "reject_reason": (
+                                                    candidate_error.reason
+                                                ),
+                                                "validation_batch_limit": (
+                                                    active_exact_batch_limit
+                                                ),
+                                            })
+                                        else:
+                                            validated.update({
+                                                "candidate_kind": candidate_kind,
+                                                "validation_stage": (
+                                                    validation_stage
+                                                ),
+                                            })
+                                            gt_valid_candidates.append(validated)
+                                            exact_candidate_records.append({
+                                                "candidate_rank": original_rank,
+                                                "candidate_kind": candidate_kind,
+                                                "validation_stage": (
+                                                    validation_stage
+                                                ),
+                                                "feedback_round": (
+                                                    feedback_round + 1
+                                                ),
+                                                "cheap_proxy_score": (
+                                                    candidate_proxy_score
+                                                ),
+                                                "gt_validation_attempted": True,
+                                                "gt_valid": True,
+                                                "reject_reason": None,
+                                                "validation_batch_limit": (
+                                                    active_exact_batch_limit
+                                                ),
+                                                "realized_regime": validated[
+                                                    "realized_regime"
+                                                ],
+                                            })
+                                    all_rescue_candidates.extend(
+                                        feedback_candidates
+                                    )
+                                rescue_candidates = tuple(all_rescue_candidates)
+                            failure_lookup = {
+                                (
+                                    int(item["candidate_rank"]),
+                                    str(item.get("validation_stage", "")),
+                                ): item.get("details", {})
+                                for item in candidate_failures
+                            }
+                            valid_lookup = {
+                                (
+                                    int(item["original_rank"]),
+                                    str(item.get("validation_stage", "")),
+                                ): item.get("overlap", {})
+                                for item in gt_valid_candidates
+                            }
+                            for record in exact_candidate_records:
+                                lookup_key = (
+                                    int(record["candidate_rank"]),
+                                    str(record.get("validation_stage", "")),
+                                )
+                                overlap_details = (
+                                    valid_lookup.get(lookup_key)
+                                    if record.get("gt_valid", False)
+                                    else failure_lookup.get(lookup_key)
+                                )
+                                record.update(
+                                    _gt_validation_record_fields(overlap_details)
+                                )
+                            if total_exact_candidates_tested != len(
+                                exact_candidate_records
+                            ):
+                                raise AssertionError(
+                                    "exact GT candidate counter does not match records"
+                                )
+                            duplicate_candidates_removed = max(
+                                (
+                                    int(metrics.get(
+                                        "rescue_candidate_accounting", {}
+                                    ).get("duplicate_route_triplets_removed", 0))
+                                    for _, metrics in rescue_candidates
+                                ),
+                                default=0,
+                            )
+                            candidate_accounting = _candidate_accounting(
+                                base_candidates_generated=len(trajectory_candidates),
+                                candidate_records=exact_candidate_records,
+                                rescue_candidate_counts=rescue_candidate_counts,
+                                duplicate_candidates_removed=(
+                                    duplicate_candidates_removed
+                                ),
+                            )
+                            episode_timing["exact_gt_validation_s"] = (
+                                episode_timing.get("exact_gt_validation_s", 0.0)
+                                + time.perf_counter() - exact_validation_started
+                            )
                             if not gt_valid_candidates:
                                 raise SampleRejected(
                                     "trajectory_set_gt_candidates_exhausted",
-                                    {"candidate_failures": candidate_failures},
+                                    {
+                                        "candidate_failures": candidate_failures,
+                                        "exact_gt_validation": {
+                                            "configured_cumulative_batches": list(exact_batch_limits),
+                                            "accepted_batch_limit": None,
+                                            "total_exact_candidates_tested": total_exact_candidates_tested,
+                                            "gt_valid_candidate_count": 0,
+                                            "candidate_records": (
+                                                exact_candidate_records
+                                            ),
+                                            "rescue_candidate_counts": dict(
+                                                rescue_candidate_counts
+                                            ),
+                                            "rescue_generation_failures": (
+                                                rescue_generation_failures
+                                            ),
+                                            "candidate_pool_exhausted": True,
+                                            "candidate_accounting": (
+                                                candidate_accounting
+                                            ),
+                                        },
+                                    },
                                 )
                             gt_valid_candidates.sort(
                                 key=lambda item: (
@@ -1368,6 +2240,38 @@ def generate_dataset(
                                 candidate_rank = int(candidate_record["original_rank"])
                                 candidate_trajectories = candidate_record["trajectories"]
                                 candidate_metrics = candidate_record["metrics"]
+                                candidate_metrics["exact_gt_validation"] = {
+                                    "configured_cumulative_batches": list(exact_batch_limits),
+                                    "accepted_batch_limit": active_exact_batch_limit,
+                                    "total_exact_candidates_tested": total_exact_candidates_tested,
+                                    "gt_valid_candidate_count": len(gt_valid_candidates),
+                                    "candidate_records": exact_candidate_records,
+                                    "accepted_candidate_kind": candidate_record[
+                                        "candidate_kind"
+                                    ],
+                                    "accepted_validation_stage": candidate_record[
+                                        "validation_stage"
+                                    ],
+                                    "rescue_candidate_counts": dict(
+                                        rescue_candidate_counts
+                                    ),
+                                    "rescue_generation_failures": (
+                                        rescue_generation_failures
+                                    ),
+                                    "candidate_realized_regimes_considered": [
+                                        record["realized_regime"]
+                                        for record in exact_candidate_records
+                                        if record["gt_valid"]
+                                    ],
+                                    "candidate_pool_exhausted": False,
+                                    "candidate_accounting": {
+                                        **candidate_accounting,
+                                        "accepted_candidate_source": (
+                                            f"{candidate_record['candidate_kind']}:"
+                                            f"{candidate_record['validation_stage']}"
+                                        ),
+                                    },
+                                }
                                 candidate_metrics[
                                     "gt_valid_soft_selection_rank"
                                 ] = selection_rank
@@ -1385,10 +2289,15 @@ def generate_dataset(
                                         float(config["bev"]["bounds_margin_m"]),
                                     )
                                     candidate_snapshot = adapter.dump_snapshot()
+                                    before_rollout_started = time.perf_counter()
                                     candidate_before = adapter.playback_trajectories(
                                         candidate_trajectories,
                                         int(candidate_metrics["floor_index"]),
                                         candidate_calibration,
+                                    )
+                                    episode_timing["before_rollout_s"] = (
+                                        episode_timing.get("before_rollout_s", 0.0)
+                                        + time.perf_counter() - before_rollout_started
                                     )
                                     candidate_visibility = _intervention_visibility_table(
                                         candidate_catalog,
@@ -1402,6 +2311,7 @@ def generate_dataset(
                                         )
                                     trajectories = candidate_trajectories
                                     trajectory_metrics = candidate_metrics
+                                    trajectory_metrics["outer_motion_attempt_index"] = placement_attempt
                                     graph = candidate_graph
                                     temporal_overlap_metrics = candidate_overlap
                                     w0_catalog = candidate_catalog
@@ -1495,6 +2405,7 @@ def generate_dataset(
                         )
                         adapter.load_snapshot(w0_snapshot)
                         try:
+                            intervention_started = time.perf_counter()
                             intervention = adapter.apply_atomic_intervention(
                                 stable_seed(episode_seed, "intervention", event_attempt),
                                 forced_type=fixed_intervention_type,
@@ -1502,10 +2413,19 @@ def generate_dataset(
                                 visible_target_ids=tuple(visibility_table["eligible_target_ids"]),
                             )
                             environment_after, _ = _render_environment_floors(adapter, config)
+                            episode_timing["intervention_and_environment_bev_s"] = (
+                                episode_timing.get("intervention_and_environment_bev_s", 0.0)
+                                + time.perf_counter() - intervention_started
+                            )
+                            after_rollout_started = time.perf_counter()
                             after = adapter.playback_trajectories(
                                 trajectories,
                                 int(trajectory_metrics["floor_index"]),
                                 world_calibration,
+                            )
+                            episode_timing["after_rollout_s"] = (
+                                episode_timing.get("after_rollout_s", 0.0)
+                                + time.perf_counter() - after_rollout_started
                             )
                             post_render_effect = _post_render_intervention_effect(
                                 intervention["event"].target_instance_id,
@@ -1638,6 +2558,7 @@ def generate_dataset(
                         fixed_intervention_type.value,
                         intervention["event"].target_instance_id,
                     )
+                    serialization_started = time.perf_counter()
                     with writer.begin_episode(
                         selected_scene, configuration_id, episode_id
                     ) as transaction:
@@ -1703,20 +2624,6 @@ def generate_dataset(
                             qa=qa_results,
                         )
                         writer.write_episode_metadata(transaction, episode)
-                        transaction.write_json(
-                            "generation_metrics.json",
-                            {
-                                "overlap": graph,
-                                "trajectory": trajectory_metrics,
-                                "before": before["metrics"],
-                                "after": after["metrics"],
-                                "intervention_attempt": intervention["attempt"],
-                                "fixed_intervention_type": fixed_intervention_type.value,
-                                "intervention_visibility": visibility_table,
-                                "post_render_intervention_effect": post_render_effect,
-                                "sibling_episode_diversity": sibling_diversity,
-                            },
-                        )
                         inspection_root = transaction.staging / "inspection"
                         image_names = []
                         floor_id = (
@@ -1809,6 +2716,38 @@ def generate_dataset(
                             },
                             image_names,
                         )
+                        episode_timing["serialization_and_inspection_s"] = (
+                            time.perf_counter() - serialization_started
+                        )
+                        episode_timing["total_episode_s"] = (
+                            time.perf_counter() - episode_started
+                        )
+                        generation_metrics = {
+                            "overlap": graph,
+                            "trajectory": trajectory_metrics,
+                            "before": before["metrics"],
+                            "after": after["metrics"],
+                            "intervention_attempt": intervention["attempt"],
+                            "fixed_intervention_type": fixed_intervention_type.value,
+                            "intervention_visibility": visibility_table,
+                            "post_render_intervention_effect": post_render_effect,
+                            "sibling_episode_diversity": sibling_diversity,
+                            "runtime_s": episode_timing,
+                        }
+                        transaction.write_json(
+                            "generation_metrics.json", generation_metrics
+                        )
+                        episode_bytes = sum(
+                            path.stat().st_size
+                            for path in transaction.staging.rglob("*")
+                            if path.is_file()
+                        )
+                        generation_metrics["storage"] = {
+                            "episode_bytes_before_final_metadata_rewrite": episode_bytes
+                        }
+                        transaction.write_json(
+                            "generation_metrics.json", generation_metrics
+                        )
                         transaction.finalize()
                     used_targets.add(intervention["event"].target_instance_id)
                     accepted_intervention_types[fixed_intervention_type.value] += 1
@@ -1846,6 +2785,13 @@ def generate_dataset(
             "accepted_episodes": accepted_episodes,
             "requested_overlap_regime_counts": dict(requested_regime_counts),
             "realized_overlap_regime_counts": dict(realized_regime_counts),
+            "target_overlap_regime_distribution": dict(
+                config["placement"]["observation_regime_weights"]
+            ),
+            "realized_overlap_regime_fractions": {
+                name: realized_regime_counts[name] / max(1, sum(realized_regime_counts.values()))
+                for name in sorted(config["placement"]["observation_regime_weights"])
+            },
             "requested_overlap_regime_counts_by_split": {
                 name: dict(values)
                 for name, values in requested_regime_counts_by_split.items()
@@ -1854,7 +2800,7 @@ def generate_dataset(
                 name: dict(values)
                 for name, values in realized_regime_counts_by_split.items()
             },
-            "scope": "development profiles only; full generation not started",
+            "scope": "single-scene shard generation; full production is never started implicitly",
         }
         dump_json(root / "generation_result.json", result)
         (root / "generation_failure.json").unlink(missing_ok=True)

@@ -1,0 +1,120 @@
+extends: default.yaml
+profile: production
+
+# Canonical Dataset-v1.1 production profile. Scale variants extend this file;
+# they must not override research semantics.
+dataset:
+  schema_version: "1.1.0"
+  scene_eligibility_manifest: configs/scene_eligibility.yaml
+  scene_limit: null
+  accepted_configurations_per_scene: 150
+  accepted_episodes_per_configuration: 3
+  robots: 3
+  frames: 60
+  fps: 10
+  scene_family_split_seed: 1907
+  splits: {train: 0.8, val: 0.1, test: 0.1}
+
+robot:
+  final_model: mobile_sensor_robot_v1
+  use_final_robot: true
+
+camera:
+  rgb_width: 896
+  rgb_height: 512
+  geometry_width: 448
+  geometry_height: 256
+  hfov_deg: 70.0
+  pitch_deg: -5.0
+  roll_deg: 0.0
+  near_m: 0.1
+  far_m: 15.0
+  heights_m: [0.8, 1.0, 1.2, 1.4]
+
+bev:
+  environment_meters_per_pixel: 0.02
+  world_meters_per_pixel: 0.04
+  modalities: [rgb, depth_linear, height, normal, semantic, instance, instance_id, occupancy, traversability]
+  world_modalities: [rgb, depth_linear, height, semantic, instance, instance_id, occupancy]
+
+configuration_sampling:
+  movable_fraction: 0.15
+  minimum_changed_objects: 2
+  maximum_changed_objects: 6
+  stratify_by: [size, category, room, relation]
+
+navigation:
+  exact_validation_batches: [12, 24, 48]
+
+overlap:
+  edge_threshold: 0.20
+  useful_min: 0.20
+  useful_max: 0.70
+  near_duplicate_threshold: 0.90
+  depth_sample_stride: 8
+  reprojection_tolerance_m: 0.08
+
+placement:
+  minimum_pairwise_distance_m: 0.6
+  observation_regime_weights:
+    dense_shared: 0.30
+    partial_chain: 0.50
+    exploratory: 0.20
+
+trajectory:
+  path_length_min_m: 1.0
+  path_length_max_m: 3.0
+  maximum_linear_speed_mps: 0.8
+  maximum_angular_speed_radps: 1.2
+  maximum_acceleration_mps2: 1.5
+  path_family_weights:
+    direct: 0.30
+    one_waypoint: 0.50
+    two_waypoint: 0.20
+  overlap_preflight:
+    dense_confirmation_keyframe_count: 13
+    realized_regime_soft_weight: 0.75
+    regime_connected_fraction_target:
+      dense_shared: 0.60
+      partial_chain: 0.30
+      exploratory: 0.15
+    regime_shared_keyframe_fraction_target:
+      dense_shared: 0.60
+      partial_chain: 0.30
+      exploratory: 0.15
+    regime_maximum_consecutive_isolated_keyframes:
+      dense_shared: 2
+      partial_chain: 5
+      exploratory: 6
+    regime_minimum_participating_keyframes:
+      dense_shared: 1
+      partial_chain: 2
+      exploratory: 1
+    regime_maximum_isolation_fraction:
+      dense_shared: 1.0
+      partial_chain: 0.7142857142857143
+      exploratory: 0.8571428571428571
+
+intervention:
+  type_weights:
+    rigid_relocation: 0.60
+    articulation: 0.30
+    state_change: 0.10
+  application_mode: pre_rollout
+
+storage:
+  dense_backend: zarr_or_compressed_npz
+  atomic_finalize: true
+  shard_unit: scene
+
+production:
+  selected_scenes: null
+  full_configurations_per_scene: 150
+  episodes_per_configuration: 3
+  process_model: fresh_process_per_scene
+
+production_readiness:
+  maximum_gt_candidate_exhaustion_fraction: 0.10
+  maximum_dominant_distribution_fraction: 0.90
+  minimum_changed_object_count_bins: 3
+  storage_headroom_fraction: 0.25

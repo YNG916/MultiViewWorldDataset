@@ -123,14 +123,19 @@ def summarize_generated_dataset(
         diagnostics.get("parallel_path_direction_similarity_min", 0.90)
     )
 
-    episode_paths = sorted(
-        path.parent
-        for path in (root / "episodes").glob("*/*/episode_*/meta.json")
+    episode_meta_paths = list((root / "episodes").glob("*/*/episode_*/meta.json"))
+    configuration_meta_paths = list(
+        (root / "configurations").glob("*/*/config_meta.json")
     )
-    configuration_paths = sorted(
-        path.parent
-        for path in (root / "configurations").glob("*/*/config_meta.json")
-    )
+    if (root / "shards").is_dir():
+        episode_meta_paths.extend(
+            (root / "shards").glob("*/episodes/*/*/episode_*/meta.json")
+        )
+        configuration_meta_paths.extend(
+            (root / "shards").glob("*/configurations/*/*/config_meta.json")
+        )
+    episode_paths = sorted(path.parent for path in episode_meta_paths)
+    configuration_paths = sorted(path.parent for path in configuration_meta_paths)
 
     start_regions: Counter[str] = Counter()
     episode_regions: Counter[str] = Counter()
@@ -147,6 +152,10 @@ def summarize_generated_dataset(
     rejection_stages: Counter[str] = Counter()
     rejection_reasons: Counter[str] = Counter()
     rejection_stage_reasons: Counter[str] = Counter()
+    exact_validation_batches: Counter[str] = Counter()
+    outer_motion_attempts: Counter[str] = Counter()
+    exact_candidate_failure_reasons: Counter[str] = Counter()
+    sparse_physics_failure_reasons: Counter[str] = Counter()
 
     start_distances: list[float] = []
     spatial_coverages: list[float] = []
@@ -166,10 +175,15 @@ def summarize_generated_dataset(
     changed_pixels: list[float] = []
     rgb_deltas: list[float] = []
     configuration_changed_counts: list[float] = []
+    configuration_changed_count_distribution: Counter[str] = Counter()
+    runtime_values: dict[str, list[float]] = {}
+    configuration_storage_bytes: list[float] = []
     camera_translation_errors: list[float] = []
     camera_rotation_errors: list[float] = []
     multimodal_alignment: list[float] = []
     storage_bytes: list[float] = []
+    exact_candidates_tested: list[float] = []
+    route_bank_sizes: list[float] = []
 
     union_connected = 0
     parallel_episodes = 0
@@ -191,9 +205,36 @@ def summarize_generated_dataset(
 
     for episode in episode_paths:
         metrics = _load_json(episode / "generation_metrics.json", {})
+        for stage, value in metrics.get("runtime_s", {}).items():
+            runtime_values.setdefault(str(stage), []).append(float(value))
         events = _load_json(episode / "events.json", [])
         trajectory = metrics.get("trajectory", {})
         joint = trajectory.get("joint_diversity", {})
+        outer_attempt = int(trajectory.get("outer_motion_attempt_index", 0))
+        outer_motion_attempts[
+            str(outer_attempt) if outer_attempt < 3 else "3+"
+        ] += 1
+        exact = trajectory.get("exact_gt_validation", {})
+        accepted_batch = exact.get("accepted_batch_limit")
+        exact_validation_batches[
+            str(accepted_batch) if accepted_batch is not None else "exhausted"
+        ] += 1
+        exact_candidates_tested.append(float(
+            exact.get("total_exact_candidates_tested", 0)
+        ))
+        exact_candidate_failure_reasons.update(
+            str(record.get("reject_reason", "unknown"))
+            for record in exact.get("candidate_records", [])
+            if not record.get("gt_valid", False)
+        )
+        sparse_physics_failure_reasons.update(
+            trajectory.get("joint_route_search", {}).get(
+                "sparse_physics_candidate_failure_counts", {}
+            )
+        )
+        route_bank_sizes.append(float(
+            trajectory.get("navigation_context", {}).get("route_bank_size", 0)
+        ))
 
         regions = [str(value) for value in trajectory.get("start_region_ids", [])]
         start_regions.update(regions)
@@ -356,6 +397,12 @@ def summarize_generated_dataset(
         metadata = configuration.get("metadata", {})
         changed_ids = metadata.get("changed_instance_ids", [])
         configuration_changed_counts.append(float(len(changed_ids)))
+        configuration_changed_count_distribution[str(len(changed_ids))] += 1
+        configuration_storage_bytes.append(float(sum(
+            path.stat().st_size
+            for path in configuration_path.rglob("*")
+            if path.is_file()
+        )))
         world_objects = {
             str(obj.get("instance_id")): obj
             for obj in configuration.get("world_state", {}).get("objects", [])
@@ -365,8 +412,12 @@ def summarize_generated_dataset(
             changed_categories[str(obj.get("category") or "unknown")] += 1
             changed_rooms[str(obj.get("room_id") or "unknown")] += 1
 
-    rejects_path = root / "rejects.jsonl"
-    if rejects_path.is_file():
+    reject_paths = [root / "rejects.jsonl"]
+    if (root / "shards").is_dir():
+        reject_paths.extend(sorted((root / "shards").glob("*/rejects.jsonl")))
+    for rejects_path in reject_paths:
+        if not rejects_path.is_file():
+            continue
         for line in rejects_path.read_text(encoding="utf-8").splitlines():
             try:
                 reject = json.loads(line)
@@ -400,6 +451,27 @@ def summarize_generated_dataset(
             "spatial_coverage_bbox_area_m2": _summary(spatial_coverages),
             "compact_start_episode_fraction": (
                 compact_start_episodes / max(1, episode_count)
+            ),
+        },
+        "acceptance_efficiency": {
+            "outer_motion_attempt_counts": dict(outer_motion_attempts),
+            "episode_before_attempts_exhausted_count": int(
+                rejection_reasons.get("episode_before_attempts_exhausted", 0)
+            ),
+        },
+        "gt_candidate_efficiency": {
+            "accepted_batch_counts": dict(exact_validation_batches),
+            "accepted_batch_fractions": _fraction(exact_validation_batches),
+            "exact_candidates_tested": _summary(exact_candidates_tested),
+            "route_bank_size": _summary(route_bank_sizes),
+            "candidate_pool_exhausted_reject_count": int(
+                rejection_reasons.get("trajectory_set_gt_candidates_exhausted", 0)
+            ),
+            "exact_candidate_failure_reason_counts": dict(
+                exact_candidate_failure_reasons
+            ),
+            "sparse_physics_failure_reason_counts": dict(
+                sparse_physics_failure_reasons
             ),
         },
         "trajectory": {
@@ -450,6 +522,9 @@ def summarize_generated_dataset(
         },
         "configuration": {
             "changed_object_count": _summary(configuration_changed_counts),
+            "changed_object_count_distribution": dict(
+                configuration_changed_count_distribution
+            ),
             "changed_category_counts": dict(changed_categories),
             "changed_room_counts": dict(changed_rooms),
         },
@@ -477,9 +552,15 @@ def summarize_generated_dataset(
                 multimodal_alignment
             ),
         },
+        "runtime_s": {
+            stage: _summary(values)
+            for stage, values in sorted(runtime_values.items())
+        },
         "storage": {
             "bytes_per_episode": _summary(storage_bytes),
+            "bytes_per_configuration": _summary(configuration_storage_bytes),
             "total_episode_bytes": int(sum(storage_bytes)),
+            "total_configuration_bytes": int(sum(configuration_storage_bytes)),
         },
         "collapse_thresholds": {
             **thresholds,

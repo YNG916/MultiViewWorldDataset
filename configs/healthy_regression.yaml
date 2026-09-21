@@ -1,0 +1,6 @@
+extends: final_robot_preview.yaml
+profile: smoke
+
+# A deterministic alternate seed for the post-sampling-patch healthy-scene
+# regression. Research semantics are inherited unchanged.
+seed: 20260921

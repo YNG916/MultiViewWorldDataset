@@ -8,6 +8,7 @@ machine:
 
 dataset:
   schema_version: "1.1.0"
+  scene_eligibility_manifest: configs/scene_eligibility.yaml
   scene_limit: null
   accepted_configurations_per_scene: 150
   accepted_episodes_per_configuration: 3
@@ -88,6 +89,9 @@ navigation:
   route_bank_minimum_size: 24
   route_bank_max_raw_attempts: 1500
   route_candidate_attempts_per_raw: 10
+  # Cumulative exact GT-depth validation batches. Stop at the first batch
+  # containing a hard-valid candidate; never revalidate an earlier rank.
+  exact_validation_batches: [12, 24, 48]
   top_triplets_for_exact_validation: 12
   joint_route_search_budget: 4096
   # Reserve most exact-preflight slots for the strongest scene-aware overlap
@@ -151,8 +155,11 @@ trajectory:
   maximum_joint_valid_candidates: 128
   trajectory_sets_per_placement: 8
   maximum_complementary_hybrid_candidates: 2
-  # Recovery is triggered only after GT depth measured exactly one union edge.
+  # Preserve a measured edge and mutate only the currently isolated robot's
+  # native RouteBank route. A second bounded round may use the first round's
+  # exact-GT isolation feedback; no overlap threshold is changed.
   maximum_measured_overlap_bridge_candidates: 6
+  maximum_gt_feedback_mutation_rounds: 2
   measured_overlap_bridge_pool_size: 3
   measured_overlap_bridge_sampling_attempts: 120
   measured_overlap_bridge_target_depth_m: 3.0
@@ -190,6 +197,7 @@ trajectory:
     exploratory: 0.75
   overlap_preflight:
     keyframe_count: 7
+    dense_confirmation_keyframe_count: 13
     geometry_width: 224
     geometry_height: 128
     # Softly re-rank hard-valid GT-depth candidates toward running realized
@@ -207,8 +215,17 @@ trajectory:
       exploratory: 0.15
     regime_maximum_consecutive_isolated_keyframes:
       dense_shared: 2
-      partial_chain: 4
-      exploratory: 5
+      partial_chain: 5
+      exploratory: 6
+    regime_minimum_participating_keyframes:
+      dense_shared: 1
+      partial_chain: 2
+      exploratory: 1
+    # Equivalent time-normalized limits used only by dense confirmation.
+    regime_maximum_isolation_fraction:
+      dense_shared: 1.0
+      partial_chain: 0.7142857142857143
+      exploratory: 0.8571428571428571
     depth_sample_stride: 4
   validation_position_tolerance_m: 1.0e-5
   validation_rotation_tolerance_rad: 1.0e-5

@@ -1,0 +1,13 @@
+extends: production_v1.yaml
+profile: integration
+
+# Two episodes are intentional: episode_000 covers the ordinary adaptive
+# shortlist and episode_001 exercises the sibling / GT-rescue path that failed
+# during the first production-preparation integration run.
+dataset:
+  accepted_configurations_per_scene: 1
+  accepted_episodes_per_configuration: 2
+
+production:
+  selected_scenes: [Beechwood_0_int]
+  scale: integration_rescue_smoke_1x1x2

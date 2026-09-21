@@ -50,6 +50,9 @@ def validate_config(config: dict[str, Any]) -> None:
     generation = config.get("generation", {})
     trajectory = config.get("trajectory", {})
     navigation = config.get("navigation", {})
+    eligibility_manifest = dataset.get("scene_eligibility_manifest")
+    if not isinstance(eligibility_manifest, str) or not eligibility_manifest.strip():
+        errors.append("dataset.scene_eligibility_manifest must be a non-empty path")
     if dataset.get("robots") != 3:
         errors.append("Dataset v1 requires exactly 3 robots")
     if config.get("profile") not in {"smoke", "integration"} and dataset.get("frames") != 60:
@@ -79,6 +82,24 @@ def validate_config(config: dict[str, Any]) -> None:
         errors.append("Intervention type weights must sum to 1")
     if intervention.get("application_mode") != "pre_rollout":
         errors.append("Dataset v1 only supports pre_rollout interventions")
+    configuration_sampling = config.get("configuration_sampling", {})
+    minimum_changed = configuration_sampling.get("minimum_changed_objects")
+    maximum_changed = configuration_sampling.get("maximum_changed_objects")
+    if (
+        not isinstance(minimum_changed, int)
+        or not isinstance(maximum_changed, int)
+        or minimum_changed < 2
+        or maximum_changed > 6
+        or minimum_changed > maximum_changed
+    ):
+        errors.append("Dataset-v1.1 DynamicConfiguration must randomize 2-6 objects")
+    selected_scenes = config.get("production", {}).get("selected_scenes")
+    if selected_scenes is not None and (
+        not isinstance(selected_scenes, list)
+        or not selected_scenes
+        or len(set(map(str, selected_scenes))) != len(selected_scenes)
+    ):
+        errors.append("production.selected_scenes must be null or a non-empty unique list")
     for key in (
         "native_relation_high_level_attempts",
         "native_relation_low_level_attempts",
@@ -126,6 +147,7 @@ def validate_config(config: dict[str, Any]) -> None:
         errors.append("trajectory_sets_per_placement must be an integer in [8,16]")
     hybrid_count = trajectory.get("maximum_complementary_hybrid_candidates")
     bridge_count = trajectory.get("maximum_measured_overlap_bridge_candidates")
+    feedback_rounds = trajectory.get("maximum_gt_feedback_mutation_rounds")
     candidate_counts_valid = (
         isinstance(hybrid_count, int)
         and hybrid_count >= 0
@@ -140,6 +162,10 @@ def validate_config(config: dict[str, Any]) -> None:
         errors.append(
             "base trajectory sets plus complementary and measured-overlap "
             "bridge candidates must total at most 16"
+        )
+    if not isinstance(feedback_rounds, int) or not 1 <= feedback_rounds <= 3:
+        errors.append(
+            "maximum_gt_feedback_mutation_rounds must be an integer in [1,3]"
         )
     for key in (
         "measured_overlap_bridge_pool_size",
@@ -259,6 +285,37 @@ def validate_config(config: dict[str, Any]) -> None:
             "Trajectory regime_maximum_consecutive_isolated_keyframes must "
             "define non-negative integer values for all regimes"
         )
+    dense_confirmation_count = preflight.get("dense_confirmation_keyframe_count")
+    if (
+        not isinstance(dense_confirmation_count, int)
+        or dense_confirmation_count <= int(preflight.get("keyframe_count", 0))
+    ):
+        errors.append(
+            "Trajectory dense_confirmation_keyframe_count must be an integer "
+            "larger than overlap_preflight.keyframe_count"
+        )
+    participation_limits = preflight.get(
+        "regime_minimum_participating_keyframes", {}
+    )
+    if set(participation_limits) != required_regimes or any(
+        not isinstance(value, int) or value < 1
+        for value in participation_limits.values()
+    ):
+        errors.append(
+            "Trajectory regime_minimum_participating_keyframes must define "
+            "positive integer values for all regimes"
+        )
+    isolation_fractions = preflight.get(
+        "regime_maximum_isolation_fraction", {}
+    )
+    if set(isolation_fractions) != required_regimes or any(
+        not isinstance(value, (int, float)) or not 0.0 <= float(value) <= 1.0
+        for value in isolation_fractions.values()
+    ):
+        errors.append(
+            "Trajectory regime_maximum_isolation_fraction must define [0,1] "
+            "values for all regimes"
+        )
     placement = config.get("placement", {})
     for key in ("floor_support_aabb_tolerance_m",):
         value = placement.get(key)
@@ -291,6 +348,19 @@ def validate_config(config: dict[str, Any]) -> None:
         value = navigation.get(key)
         if not isinstance(value, int) or value < 1:
             errors.append(f"Navigation setting {key} must be a positive integer")
+    exact_batches = navigation.get("exact_validation_batches")
+    if (
+        not isinstance(exact_batches, list)
+        or not exact_batches
+        or any(not isinstance(value, int) or value < 1 for value in exact_batches)
+        or any(
+            right <= left
+            for left, right in zip(exact_batches, exact_batches[1:])
+        )
+    ):
+        errors.append(
+            "navigation.exact_validation_batches must be strictly increasing positive integers"
+        )
     if (
         isinstance(navigation.get("footprint_yaw_bins"), int)
         and navigation["footprint_yaw_bins"] < 4

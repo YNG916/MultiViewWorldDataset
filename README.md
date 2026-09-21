@@ -51,7 +51,46 @@ atomically finalizes accepted configurations and episodes. Dataset-v1.1 also wri
 a configuration fingerprint, a non-empty public semantic/instance taxonomy, per-frame observation calibration, and
 full temporal overlap graph metadata. Resume is allowed only when the fingerprint is identical; a changed config is
 refused instead of being mixed into an existing root. Pilot/default profiles are refused unless `--allow-large` is
-supplied; this workflow stops after integration.
+supplied. Pilot and production profiles cannot loop through scenes in one Isaac process; use the scene-sharded
+launcher below.
+
+## Final production preparation
+
+The canonical configs share identical Dataset-v1.1 research semantics and differ only in scale:
+
+- `configs/integration_final.yaml`: Beechwood_0_int, 5 configurations × 3 episodes.
+- `configs/pilot_production.yaml`: healthy Beechwood_0_int plus constrained Rs_int, each 20 × 3.
+- `configs/production_v1.yaml`: all eligible scenes, each 150 × 3. This is prepared but must not be launched without
+  explicit approval after the pilot report.
+
+Run the clean integration on one GPU. The parent launches a fresh worker process for the scene and writes only global
+status; the worker writes only `shards/Beechwood_0_int`:
+
+```bash
+mvwd production-launch --config configs/integration_final.yaml --gpus 7 --max-workers 1 \
+  --output-root /path/to/integration-final --cache-root /path/to/cache
+mvwd finalize-dataset --dataset-root /path/to/integration-final
+mvwd dataset-diagnostics --dataset-root /path/to/integration-final
+```
+
+Only after integration passes, run the real two-scene pilot using available GPUs:
+
+```bash
+mvwd production-launch --config configs/pilot_production.yaml --gpus 0,1 --max-workers 2 \
+  --allow-large --output-root /path/to/pilot-production --cache-root /path/to/cache
+mvwd finalize-dataset --dataset-root /path/to/pilot-production
+mvwd pilot-report --dataset-root /path/to/pilot-production
+```
+
+Each scene has `logs/<scene>.log`, `shards/<scene>/shard_status.json`, its own `rejects.jsonl`, and `timing.json`.
+Rerunning skips matching completed shards. Use `--retry-failed` to retry only failed shards; a fingerprint mismatch is
+refused. `finalize-dataset` merges metadata/indexes and taxonomy deterministically without copying dense episode data.
+The readiness report is written under `global/pilot_report.{json,md}`, with plots and per-scene summaries. It always
+stops after reporting; it never starts full production.
+
+`configs/scene_eligibility.yaml` records all 51 swept scenes: 50 eligible and the explicitly excluded
+`Wainscott_0_garden`, whose final robot footprint has no valid navigable state. Installed-scene reconciliation fails
+loudly if the catalog changes. Primary splits are generated only from eligible scenes and remain scene-family disjoint.
 
 Before rendering a dataset, inspect stochastic sampling distributions without a dense RGB rollout:
 
@@ -106,10 +145,12 @@ small smoke runs report that warning evaluation is deferred.
 The generator samples OG room-instance (or explicitly named conceptual fallback) observation regions, three
 independent traversability-aware geodesic paths, and a configurable `dense_shared` / `partial_chain` / `exploratory`
 regime. It does not optimize for the most compact or most parallel three-robot formation. Each fixed placement owns a
-nested pool of trajectory sets; temporal acceptance uses the union overlap graph, meaningful shared moments, robot
-participation, regime-aware isolation-run limits, and near-duplicate rejection as hard constraints. Per-keyframe graph
-connectivity and shared-keyframe fractions are soft regime targets used to label both the requested and realized
-regime; they are persisted for QA but do not recreate a compact-formation gate. When several candidates pass the
+nested pool of trajectory sets. Temporal acceptance always requires a connected union overlap graph, at least one
+meaningful shared moment, participation by every robot, and no near-duplicate observation system. `dense_shared`
+requires at least 60% connected GT keyframes; `partial_chain` requires at least three of seven shared keyframes, two
+participating keyframes per robot, and at most five consecutive isolated samples; `exploratory` permits one temporal
+anchor per robot and at most six. A candidate exactly on a sparse isolation boundary is confirmed on 13 keyframes
+using normalized isolation duration. These rules do not recreate a compact-formation gate. When several candidates pass the
 GT-depth hard checks, the generator softly re-ranks them by route quality plus
 the running global/split deficit of the realized regime. This is never a hard
 regime gate. Before and after branches still use the exact same accepted

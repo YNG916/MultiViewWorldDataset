@@ -1,0 +1,75 @@
+version: "2026-09-18.final-robot-se2-v4"
+feasibility_source: "final_robot_se2_nav_allscenes_v4_isolated_gpu0_20260918/navigation_sweep.json"
+footprint_metadata:
+  robot_asset: mobile_sensor_robot_v1
+  robot_asset_version: v1
+  basis: convex union of enabled native Nova Carter collision links
+  footprint_yaw_bins: 32
+  footprint_safety_margin_m: 0.03
+  dynamic_obstacle_margin_m: 0.02
+eligible_defaults: &eligible_defaults
+  eligible: true
+  reason: final isolated-process navigation sweep passed
+  robot_asset: mobile_sensor_robot_v1
+  robot_asset_version: v1
+  footprint_profile: nova_carter_collision_envelope_v1
+excluded_defaults: &excluded_defaults
+  eligible: false
+  robot_asset: mobile_sensor_robot_v1
+  robot_asset_version: v1
+  footprint_profile: nova_carter_collision_envelope_v1
+scenes:
+  Beechwood_0_garden: {<<: *eligible_defaults, feasibility_class: healthy}
+  Beechwood_0_int: {<<: *eligible_defaults, feasibility_class: healthy}
+  Beechwood_1_int: {<<: *eligible_defaults, feasibility_class: healthy}
+  Benevolence_0_int: {<<: *eligible_defaults, feasibility_class: constrained}
+  Benevolence_1_int: {<<: *eligible_defaults, feasibility_class: constrained}
+  Benevolence_2_int: {<<: *eligible_defaults, feasibility_class: constrained}
+  Ihlen_0_int: {<<: *eligible_defaults, feasibility_class: healthy}
+  Ihlen_1_int: {<<: *eligible_defaults, feasibility_class: healthy}
+  Merom_0_garden: {<<: *eligible_defaults, feasibility_class: healthy}
+  Merom_0_int: {<<: *eligible_defaults, feasibility_class: healthy}
+  Merom_1_int: {<<: *eligible_defaults, feasibility_class: constrained}
+  Pomaria_0_garden: {<<: *eligible_defaults, feasibility_class: healthy}
+  Pomaria_0_int: {<<: *eligible_defaults, feasibility_class: constrained}
+  Pomaria_1_int: {<<: *eligible_defaults, feasibility_class: constrained}
+  Pomaria_2_int: {<<: *eligible_defaults, feasibility_class: healthy}
+  Rs_garden: {<<: *eligible_defaults, feasibility_class: constrained}
+  Rs_int: {<<: *eligible_defaults, feasibility_class: constrained}
+  Wainscott_0_garden:
+    <<: *excluded_defaults
+    feasibility_class: infeasible
+    reason: no footprint-safe navigable state for mobile_sensor_robot_v1 under final navigation semantics
+  Wainscott_0_int: {<<: *eligible_defaults, feasibility_class: constrained}
+  Wainscott_1_int: {<<: *eligible_defaults, feasibility_class: healthy}
+  gates_bedroom: {<<: *eligible_defaults, feasibility_class: healthy}
+  grocery_store_asian: {<<: *eligible_defaults, feasibility_class: healthy}
+  grocery_store_cafe: {<<: *eligible_defaults, feasibility_class: healthy}
+  grocery_store_convenience: {<<: *eligible_defaults, feasibility_class: healthy}
+  grocery_store_half_stocked: {<<: *eligible_defaults, feasibility_class: healthy}
+  hall_arch_wood: {<<: *eligible_defaults, feasibility_class: healthy}
+  hall_conference_large: {<<: *eligible_defaults, feasibility_class: healthy}
+  hall_glass_ceiling: {<<: *eligible_defaults, feasibility_class: healthy}
+  hall_train_station: {<<: *eligible_defaults, feasibility_class: healthy}
+  hotel_gym_spa: {<<: *eligible_defaults, feasibility_class: healthy}
+  hotel_suite_large: {<<: *eligible_defaults, feasibility_class: healthy}
+  hotel_suite_small: {<<: *eligible_defaults, feasibility_class: constrained}
+  house_double_floor_lower: {<<: *eligible_defaults, feasibility_class: healthy}
+  house_double_floor_upper: {<<: *eligible_defaults, feasibility_class: healthy}
+  house_single_floor: {<<: *eligible_defaults, feasibility_class: healthy}
+  office_bike: {<<: *eligible_defaults, feasibility_class: healthy}
+  office_cubicles_left: {<<: *eligible_defaults, feasibility_class: healthy}
+  office_cubicles_right: {<<: *eligible_defaults, feasibility_class: healthy}
+  office_large: {<<: *eligible_defaults, feasibility_class: healthy}
+  office_vendor_machine: {<<: *eligible_defaults, feasibility_class: healthy}
+  restaurant_asian: {<<: *eligible_defaults, feasibility_class: healthy}
+  restaurant_brunch: {<<: *eligible_defaults, feasibility_class: healthy}
+  restaurant_cafeteria: {<<: *eligible_defaults, feasibility_class: constrained}
+  restaurant_diner: {<<: *eligible_defaults, feasibility_class: constrained}
+  restaurant_hotel: {<<: *eligible_defaults, feasibility_class: healthy}
+  restaurant_urban: {<<: *eligible_defaults, feasibility_class: healthy}
+  school_biology: {<<: *eligible_defaults, feasibility_class: healthy}
+  school_chemistry: {<<: *eligible_defaults, feasibility_class: healthy}
+  school_computer_lab_and_infirmary: {<<: *eligible_defaults, feasibility_class: healthy}
+  school_geography: {<<: *eligible_defaults, feasibility_class: healthy}
+  school_gym: {<<: *eligible_defaults, feasibility_class: healthy}

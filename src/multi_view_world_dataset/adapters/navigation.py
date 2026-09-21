@@ -8,7 +8,11 @@ from typing import Any
 import numpy as np
 
 from multi_view_world_dataset.errors import SampleRejected, SimulatorUnavailableError
-from multi_view_world_dataset.sampling.diversity import joint_trajectory_metrics, stable_seed
+from multi_view_world_dataset.sampling.diversity import (
+    formation_degenerate,
+    joint_trajectory_metrics,
+    stable_seed,
+)
 from multi_view_world_dataset.sampling.navigation import (
     NavigationContext,
     RouteCandidate,
@@ -1292,11 +1296,12 @@ def sample_route_first_trajectory_sets(
             ]
         ),
     )
+    joint_search_diagnostics: dict[str, Any] = {}
     triplets = select_joint_route_candidates(
         context.route_bank,
         context.compatibility,
         rng,
-        top_k=int(adapter.config["navigation"]["top_triplets_for_exact_validation"]),
+        top_k=max(map(int, adapter.config["navigation"]["exact_validation_batches"])),
         cheap_visibility_score=visibility_scorer,
         visibility_priority_fraction=float(
             adapter.config["navigation"][
@@ -1314,6 +1319,7 @@ def sample_route_first_trajectory_sets(
             if adapter.config["navigation"]["require_connected_start_regions"]
             else None
         ),
+        diagnostics=joint_search_diagnostics,
     )
     if not triplets:
         raise SampleRejected(
@@ -1411,6 +1417,7 @@ def sample_route_first_trajectory_sets(
                 "candidate_index": candidate_index,
                 "shortlisted_triplet_count": len(triplets),
                 "assignment_indices": list(assignment),
+                **joint_search_diagnostics,
             },
         }
         family_counts = Counter(
@@ -1439,14 +1446,337 @@ def sample_route_first_trajectory_sets(
                 "floor_index": floor_index,
                 "shortlisted_triplets": len(triplets),
                 "failures": failures,
+
                 "blacklist_size": len(context.invalid_start_pose_blacklist),
             },
         )
+    sparse_failure_counts = Counter(
+        str(record["reason"]) for record in failures
+    )
+    for _, metrics in accepted:
+        metrics["joint_route_search"].update({
+            "sparse_physics_candidate_failure_counts": dict(sparse_failure_counts),
+            "sparse_physics_candidate_failure_count": len(failures),
+            "sparse_physics_candidate_failures": failures,
+        })
     adapter._runtime_findings["route_first_episode_sampling"] = {
         "floor_index": floor_index,
         "shortlisted_triplets": len(triplets),
+        **joint_search_diagnostics,
         "sparse_physx_accepted": len(accepted),
         "failures": failures,
     }
     adapter._runtime_findings["sampled_floor_index"] = floor_index
     return heights, tuple(accepted)
+
+
+def measured_overlap_route_mutations(
+    adapter: Any,
+    candidate_sets: tuple[tuple[tuple[Trajectory, ...], dict[str, Any]], ...],
+    candidate_failures: list[dict[str, Any]],
+    *,
+    maximum_candidates: int,
+) -> tuple[tuple[tuple[Trajectory, ...], dict[str, Any]], ...]:
+    """Repair GT-measured isolation with bounded native RouteBank mutations.
+
+    Keep both independently planned routes on a measured overlap edge and
+    replace only the third robot's route. Every mutation remains subject to
+    RouteBank footprint compatibility, formation checks, sparse PhysX, and the
+    caller's exact GT-depth validation. The cheap cache only ranks mutations.
+    """
+    if maximum_candidates <= 0 or not candidate_sets:
+        return ()
+    failures = {
+        int(item["candidate_rank"]): item
+        for item in candidate_failures
+        if isinstance(item.get("candidate_rank"), int)
+        and item.get("candidate_kind", "base")
+        in {"base", "measured_overlap_route_mutation"}
+        and item.get("reason") == "trajectory_temporal_overlap_failed"
+    }
+    robot_ids = tuple(sorted(item.robot_id for item in candidate_sets[0][0]))
+    if not failures or len(robot_ids) != 3:
+        return ()
+    floor_index = int(candidate_sets[0][1]["floor_index"])
+    context = adapter._navigation_contexts[floor_index]
+    routes = context.route_bank
+    route_index = {route.route_id: index for index, route in enumerate(routes)}
+    seen = {
+        tuple(map(str, metrics.get("route_ids", ())))
+        for _, metrics in candidate_sets
+        if len(metrics.get("route_ids", ())) == len(robot_ids)
+    }
+    edge_threshold = float(
+        adapter.config["navigation"]["cheap_visibility_edge_threshold"]
+    )
+    maximum_isolated_fraction = float(
+        adapter.config["navigation"][
+            "cheap_visibility_maximum_isolated_fraction"
+        ]
+    )
+    proposals: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    duplicate_triplets_removed = 0
+    for source_rank, (_, source_metrics) in enumerate(candidate_sets):
+        failure = failures.get(source_rank)
+        if failure is None:
+            continue
+        details = failure.get("details", {})
+        edges = {
+            tuple(sorted(map(str, edge)))
+            for edge in details.get("union_edges", ())
+            if len(edge) == 2
+        }
+        isolation = {
+            str(key): int(value)
+            for key, value in details.get(
+                "maximum_consecutive_isolated_keyframes", {}
+            ).items()
+        }
+        allowed = int(details.get("allowed_consecutive_isolated_keyframes", 0))
+        isolation_intervals = details.get("longest_isolation_intervals", {})
+        measured_keyframes = tuple(details.get("keyframes", ()))
+        source_ids = tuple(map(str, source_metrics.get("route_ids", ())))
+        if len(source_ids) != len(robot_ids):
+            continue
+        try:
+            source_indices = tuple(route_index[value] for value in source_ids)
+        except KeyError:
+            continue
+        for isolated_id in sorted(
+            robot_ids, key=lambda key: (-isolation.get(key, 0), key)
+        ):
+            isolated_index = robot_ids.index(isolated_id)
+            preserved_edge = tuple(sorted(
+                key for key in robot_ids if key != isolated_id
+            ))
+            if preserved_edge not in edges:
+                continue
+            for replacement_index, replacement in enumerate(routes):
+                assignment = list(source_indices)
+                assignment[isolated_index] = replacement_index
+                assignment = tuple(assignment)
+                assignment_ids = tuple(routes[index].route_id for index in assignment)
+                if len(set(assignment)) != len(assignment):
+                    continue
+                if assignment_ids in seen:
+                    duplicate_triplets_removed += 1
+                    continue
+                if any(
+                    not bool(context.compatibility.compatible[assignment[left], assignment[right]])
+                    for left in range(len(robot_ids))
+                    for right in range(left + 1, len(robot_ids))
+                ):
+                    continue
+                selected_routes = tuple(routes[index] for index in assignment)
+                cheap = _cheap_visibility_metrics(
+                    selected_routes,
+                    routes,
+                    context.cheap_visible_cells,
+                    edge_threshold=edge_threshold,
+                    maximum_isolated_fraction=maximum_isolated_fraction,
+                )
+                trajectories = tuple(
+                    _bind_route(
+                        route, robot_id,
+                        adapter._development_camera_mounts[robot_id],
+                    )
+                    for robot_id, route in zip(
+                        robot_ids, selected_routes, strict=True
+                    )
+                )
+                joint = joint_trajectory_metrics(
+                    trajectories,
+                    camera_hfov_deg=float(adapter.config["camera"]["hfov_deg"]),
+                )
+                if formation_degenerate(
+                    joint,
+                    adapter.config["placement"]["formation_degeneracy"],
+                ):
+                    continue
+                seen.add(assignment_ids)
+                cheap_isolation = max(map(
+                    int,
+                    cheap.get("maximum_consecutive_isolated_keyframes", [10**6]),
+                ))
+                repaired_participation = int(
+                    cheap.get("robot_participation_counts", [0] * len(robot_ids))[
+                        isolated_index
+                    ]
+                )
+                interval = dict(isolation_intervals.get(isolated_id, {}))
+                frame_start = interval.get("frame_start")
+                frame_end = interval.get("frame_end")
+                interval_proxy_indices: list[int] = []
+                if frame_start is not None and frame_end is not None:
+                    denominator = max(1, int(candidate_sets[0][0][0].frames) - 1)
+                    cheap_count = max(1, int(cheap.get("keyframe_count", 1)))
+                    interval_proxy_indices = [
+                        index for index in range(cheap_count)
+                        if int(frame_start) <= round(index * denominator / max(1, cheap_count - 1))
+                        <= int(frame_end)
+                    ]
+                interval_anchor_count = 0
+                for proxy_index in interval_proxy_indices:
+                    proxy_edges = cheap.get("keyframes", [])[proxy_index].get("edges", ())
+                    interval_anchor_count += int(any(
+                        isolated_index in edge for edge in proxy_edges
+                    ))
+                source_shared_centroids = {
+                    pair: centroid
+                    for frame in measured_keyframes
+                    if (
+                        frame_start is None
+                        or int(frame_start) <= int(frame.get("frame_index", -1))
+                        <= int(frame_end)
+                    )
+                    for pair, centroid in frame.get(
+                        "shared_surface_centroids_world", {}
+                    ).items()
+                }
+                priority = (
+                    0 if cheap.get("union_graph_connected", False) else 1,
+                    sum(
+                        not bool(value)
+                        for value in cheap.get("robot_participates", ())
+                    ),
+                    cheap_isolation,
+                    max(0, max(isolation.values(), default=allowed) - allowed),
+                    -repaired_participation,
+                    -interval_anchor_count,
+                    -float(cheap.get("shared_keyframe_fraction", 0.0)),
+                    -float(cheap.get("connected_keyframe_fraction", 0.0)),
+                    -float(cheap.get("score", -1.0e6)),
+                    source_rank,
+                    isolated_id,
+                    replacement.route_id,
+                )
+                evidence = {
+                    "strategy": "measured_overlap_route_mutation",
+                    "source_candidate_rank": source_rank,
+                    "preserved_measured_edge": list(preserved_edge),
+                    "isolated_robot_id": isolated_id,
+                    "replaced_route_id": source_ids[isolated_index],
+                    "replacement_route_id": replacement.route_id,
+                    "source_maximum_consecutive_isolated_keyframes": isolation,
+                    "source_allowed_consecutive_isolated_keyframes": allowed,
+                    "repaired_robot_id": isolated_id,
+                    "isolated_interval": interval,
+                    "overlap_target_pair": list(preserved_edge),
+                    "target_shared_surfaces_world": source_shared_centroids,
+                    "cheap_interval_anchor_count": interval_anchor_count,
+                    "cheap_repaired_robot_participation_count": (
+                        repaired_participation
+                    ),
+                    "cheap_mutation_preflight": cheap,
+                }
+                proposals.append((priority, {
+                    "source_rank": source_rank,
+                    "isolated_id": isolated_id,
+                    "source_metrics": source_metrics,
+                    "selected_routes": selected_routes,
+                    "assignment": assignment,
+                    "trajectories": trajectories,
+                    "joint": joint,
+                    "cheap": cheap,
+                    "evidence": evidence,
+                }))
+
+    proposals.sort(key=lambda item: item[0])
+    ordered: list[dict[str, Any]] = []
+    selected_targets: set[tuple[int, str]] = set()
+    for _, proposal in proposals:
+        target = (int(proposal["source_rank"]), str(proposal["isolated_id"]))
+        if target not in selected_targets:
+            selected_targets.add(target)
+            ordered.append(proposal)
+    selected_proposal_ids = {id(proposal) for proposal in ordered}
+    ordered.extend(
+        proposal
+        for _, proposal in proposals
+        if id(proposal) not in selected_proposal_ids
+    )
+
+    accepted: list[tuple[tuple[Trajectory, ...], dict[str, Any]]] = []
+    physics_failures: list[dict[str, Any]] = []
+    for proposal in ordered:
+        trajectories = proposal["trajectories"]
+        if any(
+            _start_blacklist_key(adapter, trajectory)
+            in context.invalid_start_pose_blacklist
+            for trajectory in trajectories
+        ):
+            continue
+        try:
+            _sparse_physics_preflight(adapter, context, trajectories)
+        except SampleRejected as error:
+            physics_failures.append({
+                "reason": error.reason,
+                "details": error.details,
+                "route_ids": [
+                    route.route_id for route in proposal["selected_routes"]
+                ],
+            })
+            continue
+        source = proposal["source_metrics"]
+        selected_routes = proposal["selected_routes"]
+        evidence = proposal["evidence"]
+        joint = dict(proposal["joint"])
+        joint.update({
+            "formation_degenerate": False,
+            "measured_overlap_route_mutation": evidence,
+        })
+        traversed = {
+            robot_id: list(route.traversed_regions)
+            for robot_id, route in zip(robot_ids, selected_routes, strict=True)
+        }
+        nested = dict(source.get("nested_trajectory_sets", {}))
+        nested.update({
+            "candidate_kind": "measured_overlap_route_mutation",
+            "source_overlap_evidence": evidence,
+        })
+        family_counts = Counter(
+            route.trajectory.path_family for route in selected_routes
+        )
+        metrics = {
+            **source,
+            "route_ids": [route.route_id for route in selected_routes],
+            "start_region_ids": [route.start_region for route in selected_routes],
+            "goal_region_ids": [route.goal_region for route in selected_routes],
+            "traversed_region_ids": traversed,
+            "unique_traversed_region_count": len({
+                region for values in traversed.values() for region in values
+            }),
+            "minimum_pairwise_distance_m": float(
+                joint["minimum_inter_robot_distance_m"]
+            ),
+            "joint_diversity": joint,
+            "cheap_scene_visibility": proposal["cheap"],
+            "robots": {
+                robot_id: route.metadata()
+                for robot_id, route in zip(robot_ids, selected_routes, strict=True)
+            },
+            "route_family_diversity": {
+                "counts": dict(family_counts),
+                "unique_family_count": len(family_counts),
+                "waypoint_route_count": sum(
+                    route.trajectory.path_family != "direct"
+                    for route in selected_routes
+                ),
+                "hard_minimum_enforced": False,
+            },
+            "joint_route_search": {
+                **source.get("joint_route_search", {}),
+                "assignment_indices": list(proposal["assignment"]),
+                "rescue_strategy": "measured_overlap_route_mutation",
+                "rescue_source_candidate_rank": proposal["source_rank"],
+                "rescue_sparse_physics_failures": physics_failures[:20],
+            },
+            "nested_trajectory_sets": nested,
+            "rescue_candidate_accounting": {
+                "duplicate_route_triplets_removed": duplicate_triplets_removed,
+            },
+        }
+        accepted.append((trajectories, metrics))
+        if len(accepted) >= maximum_candidates:
+            break
+    return tuple(accepted)

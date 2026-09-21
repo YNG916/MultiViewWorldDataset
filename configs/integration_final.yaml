@@ -1,0 +1,10 @@
+extends: production_v1.yaml
+profile: integration
+
+dataset:
+  accepted_configurations_per_scene: 5
+  accepted_episodes_per_configuration: 3
+
+production:
+  selected_scenes: [Beechwood_0_int]
+  scale: integration_1x5x3

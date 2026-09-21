@@ -655,6 +655,7 @@ def select_joint_route_candidates(
     visibility_priority_fraction: float = 0.0,
     visibility_score_weight: float = 1.0,
     region_graph: RegionGraph | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> tuple[tuple[int, int, int], ...]:
     """Bounded compatibility-aware three-route search; never enumerates B^3."""
     count = len(routes)
@@ -713,8 +714,17 @@ def select_joint_route_candidates(
     combined_ranked = sorted(
         found, key=lambda item: (-found[item][0], -found[item][1], item)
     )
+    if diagnostics is not None:
+        diagnostics.update({
+            "search_budget": search_budget,
+            "unique_joint_candidate_count": len(found),
+            "requested_shortlist_size": top_k,
+        })
     if cheap_visibility_score is None or visibility_priority_fraction <= 0.0:
-        return tuple(combined_ranked[:top_k])
+        result = tuple(combined_ranked[:top_k])
+        if diagnostics is not None:
+            diagnostics["returned_shortlist_size"] = len(result)
+        return result
     visibility_ranked = sorted(
         found, key=lambda item: (-found[item][1], -found[item][0], item)
     )
@@ -732,7 +742,10 @@ def select_joint_route_candidates(
         shortlisted_set.add(item)
         if len(shortlisted) >= top_k:
             break
-    return tuple(shortlisted)
+    result = tuple(shortlisted)
+    if diagnostics is not None:
+        diagnostics["returned_shortlist_size"] = len(result)
+    return result
 
 
 @dataclass

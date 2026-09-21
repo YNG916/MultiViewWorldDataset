@@ -3094,6 +3094,29 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         candidate_failures: list[dict[str, Any]],
         seed: int,
     ) -> tuple[tuple[tuple[Trajectory, ...], dict[str, Any]], ...]:
+        """Mutate native RouteBank triplets using measured GT edge evidence."""
+        del seed  # RouteBank ordering and measured evidence are deterministic.
+        from multi_view_world_dataset.adapters.navigation import (
+            measured_overlap_route_mutations,
+        )
+
+        return measured_overlap_route_mutations(
+            self,
+            candidate_sets,
+            candidate_failures,
+            maximum_candidates=int(
+                self.config["trajectory"][
+                    "maximum_measured_overlap_bridge_candidates"
+                ]
+            ),
+        )
+
+    def _legacy_geodesic_overlap_bridge_trajectories(
+        self,
+        candidate_sets: tuple[tuple[tuple[Trajectory, ...], dict[str, Any]], ...],
+        candidate_failures: list[dict[str, Any]],
+        seed: int,
+    ) -> tuple[tuple[tuple[Trajectory, ...], dict[str, Any]], ...]:
         """Resample only an isolated robot after GT depth measured one edge."""
         trajectory_config = self.config["trajectory"]
         maximum_candidates = int(
