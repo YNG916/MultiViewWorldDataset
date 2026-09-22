@@ -286,14 +286,15 @@ def temporal_overlap_acceptance(
                 start = position
             if not isolated and start is not None:
                 end = position - 1
-                left = (
-                    0.0 if start == 0
-                    else 0.5 * (frame_indices[start - 1] + frame_indices[start])
-                )
-                right = (
-                    duration_denominator if end == len(flags) - 1
-                    else 0.5 * (frame_indices[end] + frame_indices[end + 1])
-                )
+                # Dense confirmation should measure the physical span that is
+                # actually observed to be isolated. Extending a run to the
+                # midpoints of adjacent unsampled intervals made the nominal
+                # 6/7 exploratory limit stricter at episode boundaries than
+                # the sparse rule it approximates (e.g. 11/13 isolated
+                # samples became 0.873 instead of the measured 49/59 = 0.831
+                # span). Do not infer unobserved isolation.
+                left = float(frame_indices[start])
+                right = float(frame_indices[end])
                 duration = max(0.0, right - left)
                 if duration > best_duration:
                     best_start, best_end, best_duration = start, end, duration

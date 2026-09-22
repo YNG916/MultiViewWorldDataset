@@ -1,0 +1,12 @@
+extends: production_v1.yaml
+profile: integration
+
+# Minimal deterministic regression that reaches the v9 failure coordinate
+# Beechwood_0_int/config_001/episode_000 without rendering the full 1x5x3 set.
+dataset:
+  accepted_configurations_per_scene: 2
+  accepted_episodes_per_configuration: 1
+
+production:
+  selected_scenes: [Beechwood_0_int]
+  scale: integration_route_cohort_regression_1x2x1

@@ -5,8 +5,11 @@ import numpy as np
 
 from multi_view_world_dataset.adapters.navigation import (
     _bind_route,
+    _cohort_spatial_weights,
     _cheap_visibility_metrics,
     _cheap_visibility_score_from_pairwise,
+    _incomplete_view_cohort_regions,
+    _shared_surface_target_visibility,
     measured_overlap_route_mutations,
 )
 import multi_view_world_dataset.adapters.navigation as navigation_adapter_module
@@ -90,6 +93,7 @@ def test_measured_overlap_route_mutation_preserves_edge_and_replaces_isolated_ro
         "navigation": {
             "cheap_visibility_edge_threshold": 0.20,
             "cheap_visibility_maximum_isolated_fraction": 0.71,
+            "cheap_visibility_max_range_m": 8.0,
             "start_blacklist_position_quantization_m": 0.05,
             "start_blacklist_yaw_bins": 32,
         },
@@ -99,11 +103,17 @@ def test_measured_overlap_route_mutation_preserves_edge_and_replaces_isolated_ro
             "minimum_spatial_coverage_m2": 1.0,
         }},
     }
+    camera_mount = np.eye(4)
+    camera_mount[:3, :3] = [
+        [0.0, 0.0, 1.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+    ]
     adapter = SimpleNamespace(
         config=config,
         _navigation_contexts={0: context},
         _development_camera_mounts={
-            robot_id: np.eye(4)
+            robot_id: camera_mount
             for robot_id in ("robot_00", "robot_01", "robot_02")
         },
     )
@@ -113,7 +123,7 @@ def test_measured_overlap_route_mutation_preserves_edge_and_replaces_isolated_ro
         lambda adapter, context, trajectories: None,
     )
     trajectories = tuple(
-        _bind_route(route, robot_id, np.eye(4))
+        _bind_route(route, robot_id, camera_mount)
         for robot_id, route in zip(
             ("robot_00", "robot_01", "robot_02"), routes[:3], strict=True
         )
@@ -147,6 +157,28 @@ def test_measured_overlap_route_mutation_preserves_edge_and_replaces_isolated_ro
                 "no_severe_isolation": False,
                 "no_near_duplicate_views": True,
             },
+            "dense_confirmation": {
+                "passed_universal_hard_checks": True,
+                "checks": {"no_severe_isolation": False},
+                "union_edges": [["robot_00", "robot_01"]],
+                "maximum_consecutive_isolated_keyframes": {
+                    "robot_00": 0, "robot_01": 0, "robot_02": 11,
+                },
+                "allowed_consecutive_isolated_keyframes": 6,
+                "longest_isolation_intervals": {
+                    "robot_02": {
+                        "frame_start": 20, "frame_end": 40,
+                        "sample_start_index": 4, "sample_end_index": 8,
+                    },
+                },
+                "keyframes": [{
+                    "frame_index": 30,
+                    "edges": [["robot_00", "robot_01"]],
+                    "shared_surface_centroids_world": {
+                        "robot_00|robot_01": [3.0, 2.0, 0.0],
+                    },
+                }],
+            },
         },
     }]
     mutated = measured_overlap_route_mutations(
@@ -163,11 +195,47 @@ def test_measured_overlap_route_mutation_preserves_edge_and_replaces_isolated_ro
     assert evidence["preserved_measured_edge"] == ["robot_00", "robot_01"]
     assert evidence["isolated_robot_id"] == "robot_02"
     assert evidence["repaired_robot_id"] == "robot_02"
-    assert evidence["isolated_interval"]["frame_start"] == 10
+    assert evidence["isolated_interval"]["frame_start"] == 20
     assert evidence["overlap_target_pair"] == ["robot_00", "robot_01"]
     assert evidence["cheap_interval_anchor_count"] >= 0
+    assert evidence["target_shared_surface_visibility"][
+        "visible_target_count"
+    ] == 1
     assert metrics["cheap_scene_visibility"]["passed"]
     assert replacement_trajectories[2].metadata["route_id"] == "route_03"
+
+
+def test_shared_surface_target_visibility_prefers_route_facing_gt_centroid():
+    forward_mount = np.eye(4)
+    forward_mount[:3, :3] = [
+        [0.0, 0.0, 1.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0],
+    ]
+    facing = _bind_route(
+        _route("facing", [[0.0, 0.0], [1.0, 0.0]]),
+        "robot_00",
+        forward_mount,
+    )
+    away = _bind_route(
+        _route("away", [[0.0, 0.0], [-1.0, 0.0]]),
+        "robot_00",
+        forward_mount,
+    )
+    targets = [{
+        "frame_index": 30,
+        "pair": "robot_01|robot_02",
+        "centroid_world": [3.0, 0.0, 0.0],
+    }]
+    facing_score = _shared_surface_target_visibility(
+        facing, targets, camera_hfov_deg=70.0, maximum_range_m=8.0
+    )
+    away_score = _shared_surface_target_visibility(
+        away, targets, camera_hfov_deg=70.0, maximum_range_m=8.0
+    )
+    assert facing_score["visible_target_count"] == 1
+    assert away_score["visible_target_count"] == 0
+    assert facing_score["mean_alignment"] > away_score["mean_alignment"]
 
 
 def test_route_first_config_has_no_straight_exit_or_shared_heading_gate():
@@ -597,3 +665,46 @@ def test_precomputed_cheap_visibility_score_matches_detailed_score():
         maximum_isolated_fraction=0.67,
     )
     assert np.isclose(fast, detailed["score"])
+
+
+def test_disconnected_precomputed_visibility_matches_detailed_penalty():
+    routes = (
+        _route("a", [[0.0, 0.0], [1.0, 0.0]]),
+        _route("b", [[0.0, 2.0], [1.0, 2.0]]),
+        _route("c", [[0.0, 4.0], [1.0, 4.0]]),
+    )
+    visible = tuple(
+        tuple(frozenset({10 * robot + frame}) for frame in range(3))
+        for robot in range(3)
+    )
+    overlap = np.zeros((3, 3, 3), dtype=np.float32)
+    for index in range(3):
+        overlap[index, index, :] = 1.0
+    detailed = _cheap_visibility_metrics(
+        routes, routes, visible, edge_threshold=0.2,
+        maximum_isolated_fraction=0.85,
+    )
+    fast = _cheap_visibility_score_from_pairwise(
+        (0, 1, 2), overlap, edge_threshold=0.2,
+        maximum_isolated_fraction=0.85,
+    )
+    assert detailed["score"] == -3.0
+    assert np.isclose(fast, detailed["score"])
+
+
+def test_view_cohort_focus_only_targets_productive_incomplete_regions():
+    from collections import Counter
+
+    counts = Counter({"room_a": 2, "room_b": 3, "room_c": 1})
+    assert _incomplete_view_cohort_regions(
+        ["room_a", "room_b", "room_c", "room_d"], counts, 3
+    ) == ("room_a", "room_c")
+
+
+def test_view_cohort_spatial_weights_are_soft_normalized_and_anchor_biased():
+    weights = _cohort_spatial_weights(
+        np.asarray([[0.0, 0.0], [1.0, 0.0], [8.0, 0.0]]),
+        np.asarray([0.0, 0.0]), scale_m=2.0, probability_floor=0.05,
+    )
+    assert np.isclose(weights.sum(), 1.0)
+    assert weights[0] > weights[1] > weights[2] > 0.0

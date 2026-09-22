@@ -337,6 +337,7 @@ def validate_config(config: dict[str, Any]) -> None:
         "route_bank_minimum_size",
         "route_bank_max_raw_attempts",
         "route_candidate_attempts_per_raw",
+        "route_bank_view_cohort_size",
         "top_triplets_for_exact_validation",
         "joint_route_search_budget",
         "se2_maximum_expansions",
@@ -348,6 +349,31 @@ def validate_config(config: dict[str, Any]) -> None:
         value = navigation.get(key)
         if not isinstance(value, int) or value < 1:
             errors.append(f"Navigation setting {key} must be a positive integer")
+    cohort_completion_probability = navigation.get(
+        "route_bank_view_cohort_completion_probability"
+    )
+    if not isinstance(cohort_completion_probability, (int, float)) or not (
+        0.0 <= float(cohort_completion_probability) <= 1.0
+    ):
+        errors.append(
+            "navigation.route_bank_view_cohort_completion_probability must be in [0, 1]"
+        )
+    cohort_spatial_scale = navigation.get(
+        "route_bank_view_cohort_spatial_scale_m"
+    )
+    if not isinstance(cohort_spatial_scale, (int, float)) or float(
+        cohort_spatial_scale
+    ) <= 0.0:
+        errors.append(
+            "navigation.route_bank_view_cohort_spatial_scale_m must be positive"
+        )
+    for key in (
+        "route_bank_view_cohort_probability_floor",
+        "route_bank_view_cohort_heading_probability_floor",
+    ):
+        value = navigation.get(key)
+        if not isinstance(value, (int, float)) or not 0.0 < float(value) <= 1.0:
+            errors.append(f"Navigation setting {key} must lie in (0, 1]")
     exact_batches = navigation.get("exact_validation_batches")
     if (
         not isinstance(exact_batches, list)

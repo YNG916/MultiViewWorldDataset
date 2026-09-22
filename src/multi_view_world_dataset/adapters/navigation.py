@@ -398,15 +398,28 @@ def _cheap_scene_view_cache(
                 adapter, samples.reshape(-1, 2)
             ).reshape(ray_count, len(ranges), 2)
             for pixels in mapped_rays:
+                last_free: int | None = None
                 for row, column in pixels:
                     if not (0 <= row < height and 0 <= column < width):
                         break
                     if not point_free_mask[row, column]:
-                        # Preserve the first occupied cell: it is the scene
-                        # surface (wall / furniture) seen by this ray.
-                        visible.add(int(row) * width + int(column))
+                        # GT-depth overlap compares visible scene surfaces,
+                        # not the empty volume shared by two view frusta.  Use
+                        # the last free cell on the viewing side of the first
+                        # obstacle as a cheap raster surface proxy.  Including
+                        # every free cell here made opposite / divergent views
+                        # in one room look strongly overlapping and produced
+                        # systematically false high scores.
+                        if last_free is not None:
+                            visible.add(last_free)
                         break
-                    visible.add(int(row) * width + int(column))
+                    last_free = int(row) * width + int(column)
+                else:
+                    # A ray that reaches the configured range still supplies
+                    # one bounded far-surface proxy, rather than its complete
+                    # free-space volume.
+                    if last_free is not None:
+                        visible.add(last_free)
             route_views.append(frozenset(visible))
         cached.append(tuple(route_views))
     pairwise = np.eye(len(routes), dtype=np.float64)
@@ -635,9 +648,10 @@ def _cheap_visibility_score_from_pairwise(
     )
     mean_overlap = float(np.mean(pairwise[upper]))
     useful_overlap = min(mean_overlap / max(edge_threshold, 1e-9), 1.0)
+    union_connected = len(reached) == robot_count
     return float(
         1.5 * connected_count / frame_count
-        + 1.0
+        + float(union_connected)
         + shared_count / frame_count
         + 1.5 * float(np.min(participation_counts)) / frame_count
         + 0.5 * useful_overlap
@@ -667,6 +681,43 @@ def _cheap_visibility_scorer(
         )
 
     return score
+
+
+def _incomplete_view_cohort_regions(
+    eligible_regions: list[str],
+    route_counts_by_start: Counter[str],
+    cohort_size: int,
+) -> tuple[str, ...]:
+    """Return productive regions that still need routes for a 3-view cohort."""
+    if cohort_size < 1:
+        raise ValueError("cohort_size must be positive")
+    return tuple(
+        region
+        for region in eligible_regions
+        if 0 < int(route_counts_by_start[region]) < cohort_size
+    )
+
+
+def _cohort_spatial_weights(
+    points_xy: np.ndarray,
+    anchor_xy: np.ndarray,
+    *,
+    scale_m: float,
+    probability_floor: float,
+) -> np.ndarray:
+    """Softly cluster route starts without turning proximity into a hard gate."""
+    points = np.asarray(points_xy, dtype=np.float64)
+    anchor = np.asarray(anchor_xy, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 2 or not len(points):
+        raise ValueError("points_xy must be non-empty [N,2]")
+    if anchor.shape != (2,):
+        raise ValueError("anchor_xy must have shape [2]")
+    if scale_m <= 0.0 or not 0.0 < probability_floor <= 1.0:
+        raise ValueError("invalid cohort spatial weighting parameters")
+    distance = np.linalg.norm(points - anchor[None, :], axis=1)
+    preference = np.exp(-0.5 * (distance / scale_m) ** 2)
+    weights = probability_floor + (1.0 - probability_floor) * preference
+    return weights / weights.sum()
 
 def _minimum_route_footprint_clearance_m(
     adapter: Any,
@@ -746,6 +797,8 @@ def _build_floor_context(
         for region in region_graph.nodes
     }
     route_counts_by_start: Counter[str] = Counter()
+    cohort_focus_attempts = 0
+    cohort_route_accepts = 0
     reject_counts: Counter[str] = Counter()
     routes: list[RouteCandidate] = []
     signatures: set[tuple[int, int, int, int]] = set()
@@ -762,13 +815,67 @@ def _build_floor_context(
         eligible_regions = [name for name, values in region_pixels.items() if len(values)]
         if not eligible_regions:
             break
-        weights = np.asarray([
-            1.0 / (1.0 + route_counts_by_start[name]) for name in eligible_regions
-        ])
-        start_region = str(rng.choice(eligible_regions, p=weights / weights.sum()))
-        start_pixel = region_pixels[start_region][
-            int(rng.integers(len(region_pixels[start_region])))
-        ]
+        cohort_size = int(navigation["route_bank_view_cohort_size"])
+        incomplete_cohorts = _incomplete_view_cohort_regions(
+            eligible_regions, route_counts_by_start, cohort_size
+        )
+        use_cohort_focus = bool(
+            incomplete_cohorts
+            and rng.random()
+            < float(
+                navigation["route_bank_view_cohort_completion_probability"]
+            )
+        )
+        cohort_reference = None
+        if use_cohort_focus:
+            cohort_focus_attempts += 1
+            # Complete the most developed cohort first. Stable lexical order
+            # makes equal-count behavior deterministic before the RNG draw.
+            cohort_pool = sorted(
+                incomplete_cohorts,
+                key=lambda name: (-route_counts_by_start[name], name),
+            )
+            leading_count = route_counts_by_start[cohort_pool[0]]
+            cohort_pool = [
+                name for name in cohort_pool
+                if route_counts_by_start[name] == leading_count
+            ]
+            start_region = str(rng.choice(cohort_pool))
+            cohort_reference = next(
+                route for route in routes if route.start_region == start_region
+            )
+            pixels_for_region = region_pixels[start_region]
+            world_for_region = adapter._native_value(
+                trav_map.map_to_world(
+                    adapter._th.as_tensor(
+                        pixels_for_region, dtype=adapter._th.int64
+                    )
+                )
+            ).astype(np.float64)
+            start_weights = _cohort_spatial_weights(
+                world_for_region,
+                cohort_reference.start_xy,
+                scale_m=float(
+                    navigation["route_bank_view_cohort_spatial_scale_m"]
+                ),
+                probability_floor=float(
+                    navigation["route_bank_view_cohort_probability_floor"]
+                ),
+            )
+            start_pixel = pixels_for_region[
+                int(rng.choice(len(pixels_for_region), p=start_weights))
+            ]
+        else:
+            weights = np.asarray([
+                1.0 / (1.0 + route_counts_by_start[name])
+                for name in eligible_regions
+            ])
+            start_region = str(
+                rng.choice(eligible_regions, p=weights / weights.sum())
+            )
+            start_pixel = region_pixels[start_region][
+                int(rng.integers(len(region_pixels[start_region])))
+            ]
         component = int(component_labels[tuple(start_pixel)])
         component_pixels = np.argwhere(
             (component_labels == component) & seed_mask
@@ -787,11 +894,23 @@ def _build_floor_context(
         route_seed = stable_seed(seed, "route", raw_attempt)
         route_rng = np.random.default_rng(route_seed)
         trajectory = None
+        preferred_heading = 0.0
+        heading_probability_floor = 1.0
+        if cohort_reference is not None:
+            reference_pose = cohort_reference.trajectory.base_to_world[0]
+            preferred_heading = float(
+                np.arctan2(reference_pose[1, 0], reference_pose[0, 0])
+            )
+            heading_probability_floor = float(
+                navigation[
+                    "route_bank_view_cohort_heading_probability_floor"
+                ]
+            )
         for _ in range(attempts_per_raw):
             family = str(route_rng.choice(families, p=family_probabilities))
             controls = _sample_route_controls(
                 start_xy,
-                0.0,
+                preferred_heading,
                 candidates,
                 family,
                 float(trajectory_config["path_length_min_m"]),
@@ -800,7 +919,7 @@ def _build_floor_context(
                 np.deg2rad(float(trajectory_config["maximum_control_turn_deg"])),
                 route_rng,
                 soft_initial_heading=True,
-                initial_heading_probability_floor=1.0,
+                initial_heading_probability_floor=heading_probability_floor,
             )
             if controls is None:
                 reject_counts["se2_no_control_candidates"] += 1
@@ -851,8 +970,20 @@ def _build_floor_context(
                 float(navigation["footprint_safety_margin_m"]),
             ),
         )
+        route = replace(route, metrics={
+            **route.metrics,
+            "route_bank_sampling_mode": (
+                "view_cohort_completion"
+                if cohort_reference is not None
+                else "scene_exploration"
+            ),
+            "view_cohort_reference_route_id": (
+                None if cohort_reference is None else cohort_reference.route_id
+            ),
+        })
         routes.append(route)
         route_counts_by_start[route.start_region] += 1
+        cohort_route_accepts += int(cohort_reference is not None)
     compatibility = compute_pairwise_route_compatibility(
         routes,
         minimum_pairwise_distance_m=float(
@@ -873,6 +1004,22 @@ def _build_floor_context(
         "route_reject_counts": dict(reject_counts),
         "route_generation_seconds": time.perf_counter() - started,
         "start_region_distribution": dict(route_counts_by_start),
+        "view_cohort": {
+            "target_size": int(navigation["route_bank_view_cohort_size"]),
+            "completion_probability": float(
+                navigation["route_bank_view_cohort_completion_probability"]
+            ),
+            "focus_raw_attempts": cohort_focus_attempts,
+            "focused_routes_accepted": cohort_route_accepts,
+            "completed_regions": sorted(
+                region for region, count in route_counts_by_start.items()
+                if count >= int(navigation["route_bank_view_cohort_size"])
+            ),
+            "incomplete_productive_regions": sorted(
+                region for region, count in route_counts_by_start.items()
+                if 0 < count < int(navigation["route_bank_view_cohort_size"])
+            ),
+        },
         "old_omnigibson_eroded_cell_count": int(np.count_nonzero(
             adapter._native_value(
                 adapter._robot_eroded_traversability(floor_index, adapter._env.robots[0])
@@ -1470,6 +1617,69 @@ def sample_route_first_trajectory_sets(
     return heights, tuple(accepted)
 
 
+def _shared_surface_target_visibility(
+    trajectory: Trajectory,
+    targets: list[dict[str, Any]],
+    *,
+    camera_hfov_deg: float,
+    maximum_range_m: float,
+) -> dict[str, Any]:
+    """Rank a valid route by measured GT surfaces it can plausibly revisit.
+
+    This is deliberately a soft, occlusion-unaware rescue score.  It never
+    replaces the exact GT-depth preflight; it only makes the bounded exact-GT
+    budget test RouteBank alternatives aimed at the observed failure.
+    """
+    if not 0.0 < camera_hfov_deg < 180.0:
+        raise ValueError("camera_hfov_deg must lie in (0, 180)")
+    if maximum_range_m <= 0.0:
+        raise ValueError("maximum_range_m must be positive")
+    threshold = float(np.cos(np.deg2rad(0.5 * camera_hfov_deg)))
+    records: list[dict[str, Any]] = []
+    alignments: list[float] = []
+    visible = 0
+    for target in targets:
+        frame_index = min(
+            max(int(target.get("frame_index", 0)), 0),
+            trajectory.frames - 1,
+        )
+        point = np.asarray(target.get("centroid_world", ()), dtype=np.float64)
+        if point.shape != (3,) or not np.isfinite(point).all():
+            continue
+        camera = trajectory.camera_to_world[frame_index]
+        delta = point - camera[:3, 3]
+        distance = float(np.linalg.norm(delta))
+        forward = np.asarray(camera[:3, 2], dtype=np.float64)
+        forward_norm = float(np.linalg.norm(forward))
+        if distance <= 1.0e-8 or forward_norm <= 1.0e-8:
+            continue
+        alignment = float(np.dot(delta / distance, forward / forward_norm))
+        in_view = bool(
+            0.1 < distance <= maximum_range_m and alignment >= threshold
+        )
+        visible += int(in_view)
+        alignments.append(alignment)
+        records.append({
+            "frame_index": frame_index,
+            "pair": target.get("pair"),
+            "distance_m": distance,
+            "forward_alignment": alignment,
+            "within_range_and_fov": in_view,
+        })
+    return {
+        "target_count": len(records),
+        "visible_target_count": int(visible),
+        "visible_target_fraction": (
+            float(visible / len(records)) if records else 0.0
+        ),
+        "mean_alignment": (
+            float(np.mean(alignments)) if alignments else -1.0
+        ),
+        "fov_alignment_threshold": threshold,
+        "targets": records,
+    }
+
+
 def measured_overlap_route_mutations(
     adapter: Any,
     candidate_sets: tuple[tuple[tuple[Trajectory, ...], dict[str, Any]], ...],
@@ -1520,7 +1730,20 @@ def measured_overlap_route_mutations(
         failure = failures.get(source_rank)
         if failure is None:
             continue
-        details = failure.get("details", {})
+        sparse_details = failure.get("details", {})
+        dense_details = sparse_details.get("dense_confirmation", {})
+        # Dense confirmation contains the better localized physical-time
+        # isolation interval.  It is available precisely for the near-pass
+        # candidates this rescue is intended to repair.
+        details = (
+            dense_details
+            if isinstance(dense_details, dict)
+            and dense_details.get("passed_universal_hard_checks", False)
+            and not dense_details.get("checks", {}).get(
+                "no_severe_isolation", True
+            )
+            else sparse_details
+        )
         edges = {
             tuple(sorted(map(str, edge)))
             for edge in details.get("union_edges", ())
@@ -1621,24 +1844,56 @@ def measured_overlap_route_mutations(
                     interval_anchor_count += int(any(
                         isolated_index in edge for edge in proxy_edges
                     ))
-                source_shared_centroids = {
-                    pair: centroid
+                edge_key = "|".join(preserved_edge)
+                source_shared_targets = [
+                    {
+                        "frame_index": int(frame.get("frame_index", 0)),
+                        "pair": edge_key,
+                        "centroid_world": centroid,
+                    }
                     for frame in measured_keyframes
                     if (
                         frame_start is None
                         or int(frame_start) <= int(frame.get("frame_index", -1))
                         <= int(frame_end)
                     )
-                    for pair, centroid in frame.get(
+                    for centroid in [frame.get(
                         "shared_surface_centroids_world", {}
-                    ).items()
-                }
+                    ).get(edge_key)]
+                    if centroid is not None
+                ]
+                if not source_shared_targets:
+                    source_shared_targets = [
+                        {
+                            "frame_index": int(frame.get("frame_index", 0)),
+                            "pair": edge_key,
+                            "centroid_world": centroid,
+                        }
+                        for frame in measured_keyframes
+                        for centroid in [frame.get(
+                            "shared_surface_centroids_world", {}
+                        ).get(edge_key)]
+                        if centroid is not None
+                    ]
+                target_visibility = _shared_surface_target_visibility(
+                    trajectories[isolated_index],
+                    source_shared_targets,
+                    camera_hfov_deg=float(adapter.config["camera"]["hfov_deg"]),
+                    maximum_range_m=float(
+                        adapter.config["navigation"][
+                            "cheap_visibility_max_range_m"
+                        ]
+                    ),
+                )
                 priority = (
+                    0 if target_visibility["visible_target_count"] else 1,
                     0 if cheap.get("union_graph_connected", False) else 1,
                     sum(
                         not bool(value)
                         for value in cheap.get("robot_participates", ())
                     ),
+                    -int(target_visibility["visible_target_count"]),
+                    -float(target_visibility["mean_alignment"]),
                     cheap_isolation,
                     max(0, max(isolation.values(), default=allowed) - allowed),
                     -repaired_participation,
@@ -1662,7 +1917,8 @@ def measured_overlap_route_mutations(
                     "repaired_robot_id": isolated_id,
                     "isolated_interval": interval,
                     "overlap_target_pair": list(preserved_edge),
-                    "target_shared_surfaces_world": source_shared_centroids,
+                    "target_shared_surfaces": source_shared_targets,
+                    "target_shared_surface_visibility": target_visibility,
                     "cheap_interval_anchor_count": interval_anchor_count,
                     "cheap_repaired_robot_participation_count": (
                         repaired_participation

@@ -38,6 +38,15 @@ def test_navigation_route_bank_minimum_is_deprecated_diagnostic_only():
     )
     validate_config(config)
 
+
+def test_navigation_view_cohort_controls_are_validated():
+    config = load_yaml_config(REPOSITORY / "configs" / "smoke.yaml")
+    config["navigation"][
+        "route_bank_view_cohort_completion_probability"
+    ] = 1.1
+    with pytest.raises(ConfigurationError, match="cohort_completion_probability"):
+        validate_config(config)
+
 def test_realized_regime_soft_weight_must_be_non_negative():
     config = load_yaml_config(REPOSITORY / "configs" / "smoke.yaml")
     config["trajectory"]["overlap_preflight"][

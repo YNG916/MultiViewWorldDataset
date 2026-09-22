@@ -61,6 +61,29 @@ def _resize_nearest(values: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     return array[rows[:, None], columns[None, :]]
 
 
+def _resampled_candidate_indices(
+    rng: np.random.Generator,
+    candidate_count: int,
+    maximum_attempts: int,
+):
+    """Yield balanced candidate choices while resampling intervention parameters.
+
+    maximum_attempts is a proposal budget, not a cap on the number of
+    distinct target objects. Cycling randomized candidate orders lets a
+    single visible object receive multiple independently sampled transforms
+    while still distributing attempts fairly when several targets exist.
+    """
+    if candidate_count <= 0 or maximum_attempts <= 0:
+        return
+    yielded = 0
+    while yielded < maximum_attempts:
+        for target_index in rng.permutation(candidate_count):
+            if yielded >= maximum_attempts:
+                return
+            yield int(target_index)
+            yielded += 1
+
+
 def _points_inside_floor_support(
     points_xy: np.ndarray,
     support_bounds_xy: np.ndarray,
@@ -1323,7 +1346,9 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             if not candidates:
                 failures.append({"reason": "no_eligible_targets", "type": intervention_type.value})
                 continue
-            for target_index in rng.permutation(len(candidates)):
+            for target_index in _resampled_candidate_indices(
+                rng, len(candidates), maximum_attempts
+            ):
                 if attempt >= maximum_attempts:
                     break
                 attempt += 1
@@ -4282,6 +4307,28 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             camera.modalities
         )
 
+    def _flush_final_robot_projection_change(
+        self, camera: Any, *, finding_prefix: str
+    ) -> None:
+        """Discard the stale AOV after moving / reprojecting the shared sensor."""
+        if not self._using_final_robot:
+            return
+        # In OmniGibson 3.9.2 bare render ticks do not make a projection / pose
+        # edit authoritative on an existing Replicator render product.  The
+        # first full observation can still contain the previous perspective
+        # view and, in particular, omit one robot from the instance AOV.
+        self._get_final_robot_capture_observation(camera)
+        render_ticks = 4
+        for _ in range(render_ticks):
+            self._og.sim.render()
+        count_key = f"{finding_prefix}_projection_flush_count"
+        self._runtime_findings[count_key] = int(
+            self._runtime_findings.get(count_key, 0)
+        ) + 1
+        self._runtime_findings[
+            f"{finding_prefix}_projection_flush_render_ticks"
+        ] = render_ticks
+
     def render_floor_bev(
         self, floor_index: int, calibration: BEVCalibration, *, include_robots: bool, modalities: tuple[str, ...]
     ) -> BEVRender:
@@ -4378,21 +4425,9 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 # robot-perspective view even though USD reports orthographic.
                 # Consume that stale observation, then render the authoritative
                 # top-down frame before saving any modality.
-                self._get_final_robot_capture_observation(camera)
-                projection_flush_render_ticks = 4
-                for _ in range(projection_flush_render_ticks):
-                    self._og.sim.render()
-                flushes = int(
-                    self._runtime_findings.get(
-                        "environment_bev_projection_flush_count", 0
-                    )
+                self._flush_final_robot_projection_change(
+                    camera, finding_prefix="environment_bev"
                 )
-                self._runtime_findings["environment_bev_projection_flush_count"] = (
-                    flushes + 1
-                )
-                self._runtime_findings[
-                    "environment_bev_projection_flush_render_ticks"
-                ] = projection_flush_render_ticks
                 observation, info = self._get_final_robot_capture_observation(
                     camera
                 )
@@ -4584,8 +4619,15 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 robot.set_position_orientation(position=position, orientation=orientation)
                 self._restore_final_robot_mast_mount(robot)
                 robot.keep_still()
-            for _ in range(2):
+            for _ in range(4):
                 self._og.sim.render()
+            # The persistent capture sensor most recently served a perspective
+            # ego view (or a different BEV pose).  Consume that stale AOV and
+            # render the authoritative top-down trajectory frame before frame
+            # 0 is admitted to the dataset or world-BEV robot-mask QA.
+            self._flush_final_robot_projection_change(
+                camera, finding_prefix="rollout_world_bev"
+            )
             for frame_index in range(frames):
                 if (
                     frame_index == 0

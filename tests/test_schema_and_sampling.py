@@ -7,6 +7,7 @@ import pytest
 from multi_view_world_dataset.adapters.omnigibson import (
     OmniGibsonAdapter,
     _points_inside_floor_support,
+    _resampled_candidate_indices,
     _restore_world_to_map_batch_order,
 )
 from multi_view_world_dataset.errors import SampleRejected
@@ -67,6 +68,20 @@ def make_object(instance_id="obj_a", x=0.0):
 def _straight_planner(start, goal):
     path = np.asarray([start, goal], dtype=float)
     return path, float(np.linalg.norm(goal - start))
+
+
+def test_intervention_proposal_budget_resamples_single_visible_target():
+    first = list(_resampled_candidate_indices(np.random.default_rng(11), 1, 8))
+    second = list(_resampled_candidate_indices(np.random.default_rng(11), 1, 8))
+    assert first == [0] * 8
+    assert second == first
+
+
+def test_intervention_proposal_budget_cycles_candidates_fairly():
+    sampled = list(_resampled_candidate_indices(np.random.default_rng(19), 3, 8))
+    assert len(sampled) == 8
+    assert set(sampled[:3]) == {0, 1, 2}
+    assert set(sampled[3:6]) == {0, 1, 2}
 
 
 def test_floor_support_filter_rejects_exterior_traversability_pixels():
@@ -742,6 +757,31 @@ def test_final_robot_renderer_labels_cache_static_scene_mapping():
     assert helpers.calls == 1
     assert first[0]["17"] == "/World/chair/mesh"
     assert adapter._runtime_findings["final_robot_renderer_mapping_cache_hits"] == 1
+
+
+def test_final_robot_projection_flush_discards_observation_then_renders():
+    adapter = object.__new__(OmniGibsonAdapter)
+    calls = []
+    adapter._using_final_robot = True
+    adapter._runtime_findings = {}
+    adapter._get_final_robot_capture_observation = lambda camera: calls.append(
+        ("observation", camera)
+    )
+    adapter._og = SimpleNamespace(
+        sim=SimpleNamespace(render=lambda: calls.append(("render", None)))
+    )
+    camera = object()
+    adapter._flush_final_robot_projection_change(
+        camera, finding_prefix="rollout_world_bev"
+    )
+    assert calls[0] == ("observation", camera)
+    assert calls[1:] == [("render", None)] * 4
+    assert adapter._runtime_findings[
+        "rollout_world_bev_projection_flush_count"
+    ] == 1
+    assert adapter._runtime_findings[
+        "rollout_world_bev_projection_flush_render_ticks"
+    ] == 4
 
 
 def test_public_label_catalog_cache_uses_static_identity_only_once():

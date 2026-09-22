@@ -89,6 +89,15 @@ navigation:
   route_bank_minimum_size: 24
   route_bank_max_raw_attempts: 1500
   route_candidate_attempts_per_raw: 10
+  # Once a region produces one valid route, preferentially complete a
+  # three-route local view cohort before returning to broad scene coverage.
+  # This prevents a small, difficult RouteBank from containing only one or
+  # two routes per room, which cannot support a connected 3-camera graph.
+  route_bank_view_cohort_size: 3
+  route_bank_view_cohort_completion_probability: 0.85
+  route_bank_view_cohort_spatial_scale_m: 2.5
+  route_bank_view_cohort_probability_floor: 0.05
+  route_bank_view_cohort_heading_probability_floor: 0.10
   # Cumulative exact GT-depth validation batches. Stop at the first batch
   # containing a hard-valid candidate; never revalidate an earlier rank.
   exact_validation_batches: [12, 24, 48]

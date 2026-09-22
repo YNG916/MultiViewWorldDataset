@@ -201,6 +201,29 @@ def test_dense_confirmation_falls_back_to_exploratory_instead_of_penalizing_over
     assert result["passed"]
 
 
+def test_dense_confirmation_accepts_one_early_anchor_with_measured_span():
+    keyframes = np.rint(np.linspace(0, 59, 13)).astype(int)
+    frames = []
+    for index, frame in enumerate(keyframes):
+        edges = []
+        if index == 1:
+            edges = [["a", "b"], ["b", "c"]]
+        elif index == 4:
+            edges = [["a", "b"]]
+        frames.append({
+            "frame_index": int(frame),
+            "connected": len(edges) == 2,
+            "edges": edges,
+        })
+    result = _v11_overlap(frames, mode="normalized_duration")
+    assert result["passed"]
+    assert result["realized_regime"] == "exploratory"
+    assert result["participating_keyframe_count"] == {"a": 2, "b": 2, "c": 1}
+    assert result["maximum_consecutive_isolated_keyframes"]["c"] == 11
+    assert result["maximum_isolation_fraction"]["c"] == pytest.approx(49 / 59)
+    assert result["maximum_isolation_fraction"]["c"] <= 6 / 7
+
+
 def test_sparse_isolation_boundary_triggers_dense_confirmation(monkeypatch):
     import multi_view_world_dataset.generator as generator_module
 
