@@ -1,4 +1,5 @@
 import json
+import errno
 
 import numpy as np
 import pytest
@@ -28,6 +29,31 @@ def test_episode_transaction_is_atomic_and_resume_safe(tmp_path):
         with pytest.raises(FileExistsError):
             duplicate.finalize()
         duplicate.abort()
+
+
+def test_disk_full_during_episode_commit_keeps_previous_episode(tmp_path, monkeypatch):
+    import multi_view_world_dataset.storage.writer as writer_module
+
+    writer = DatasetWriter(tmp_path / "dataset")
+    with writer.begin_episode("scene", "config", "episode_000") as transaction:
+        transaction.write_json("meta.json", {"accepted": True})
+        transaction.finalize()
+    previous = writer.root / "episodes" / "scene" / "config" / "episode_000"
+    original_replace = writer_module.os.replace
+
+    def disk_full_on_new_episode(source, target):
+        if str(target).endswith("episode_001"):
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return original_replace(source, target)
+
+    monkeypatch.setattr(writer_module.os, "replace", disk_full_on_new_episode)
+    with pytest.raises(OSError, match="No space left"):
+        with writer.begin_episode("scene", "config", "episode_001") as transaction:
+            transaction.write_json("meta.json", {"accepted": True})
+            transaction.finalize()
+    assert (previous / "meta.json").is_file()
+    assert writer.completed_episode_ids("scene", "config") == ("episode_000",)
+    assert not list(previous.parent.glob(".episode_001.*"))
 
 
 def test_failed_transaction_is_removed(tmp_path):

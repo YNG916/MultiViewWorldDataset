@@ -960,6 +960,127 @@ def test_scene_workers_are_serial_on_each_gpu(tmp_path, monkeypatch):
     }
 
 
+def test_full_production_batches_keep_one_manifest_and_completed_shards(tmp_path, monkeypatch):
+    config = load_yaml_config("configs/production_v1.yaml")
+    runtime = RuntimePaths(tmp_path / "behavior", tmp_path / "dataset", tmp_path / "cache")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        scene = command[command.index("--scene") + 1]
+        calls.append(scene)
+        shard = scene_shard_path(runtime.output_root, scene)
+        dump_json(shard / "shard_status.json", {
+            "status": "complete", "accepted_configurations": 150,
+            "accepted_episodes": 450,
+        })
+        dump_json(shard / "generation_status.json", {
+            "status": "pass", "accepted_configurations": 150,
+            "accepted_episodes": 450,
+        })
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(production_module.subprocess, "run", fake_run)
+    with pytest.raises(ConfigurationError, match="explicit --scenes"):
+        launch_scene_shards(
+            runtime, config, "configs/production_v1.yaml",
+            gpus=("0",), max_workers=1, allow_large=True,
+        )
+    _, first = launch_scene_shards(
+        runtime, config, "configs/production_v1.yaml",
+        gpus=("0",), max_workers=1, allow_large=True,
+        scene_ids=("Beechwood_0_int",),
+    )
+    assert first["status"] == "partial"
+    assert first["complete_scenes"] == ["Beechwood_0_int"]
+    _, second = launch_scene_shards(
+        runtime, config, "configs/production_v1.yaml",
+        gpus=("1",), max_workers=1, allow_large=True,
+        scene_ids=("Rs_int",),
+    )
+    assert second["status"] == "partial"
+    assert second["complete_scenes"] == ["Beechwood_0_int", "Rs_int"]
+    assert calls == ["Beechwood_0_int", "Rs_int"]
+    manifest = json.loads(
+        (runtime.output_root / "global" / "production_manifest.json").read_text()
+    )
+    assert len(manifest["selected_scenes"]) == 50
+    assert manifest["configuration_fingerprint"] == second["configuration_fingerprint"]
+    with pytest.raises(ConfigurationError, match="not selected"):
+        launch_scene_shards(
+            runtime, config, "configs/production_v1.yaml",
+            gpus=("0",), max_workers=1, allow_large=True,
+            scene_ids=("Wainscott_0_garden",),
+        )
+
+
+def test_partial_finalize_indexes_completed_scene_only(tmp_path):
+    root = tmp_path / "dataset"
+    config = load_yaml_config("configs/production_v1.yaml")
+    repository_root = Path(__file__).resolve().parents[1]
+    manifest = initialize_production_root(root, config, repository_root)
+    scene = "Beechwood_0_int"
+    shard = scene_shard_path(root, scene)
+    dump_json(shard / "shard_status.json", {"status": "complete"})
+    dump_json(shard / "dataset_meta.json", {
+        "configuration_fingerprint": manifest["configuration_fingerprint"],
+        "schema_version": manifest["schema_version"],
+    })
+    dump_json(shard / "taxonomy.json", _taxonomy(scene, 101, "chair"))
+    dump_json(shard / "configurations" / scene / "config_000" / "config_meta.json", {})
+    dump_json(shard / "episodes" / scene / "config_000" / "episode_000" / "meta.json", {})
+    with pytest.raises(ConfigurationError, match="incomplete shard"):
+        finalize_dataset(root)
+    _, result = finalize_dataset(root, allow_partial=True)
+    assert result["status"] == "partial"
+    assert result["indexed_completed_scenes"] == [scene]
+    assert result["pending_scene_count"] == 49
+    assert result["episode_count"] == 1
+    index = json.loads((root / "global" / "dataset_index.json").read_text())
+    assert len(index["episodes"]) == 1
+
+
+def test_partial_finalize_preserves_committed_episodes_across_interrupted_batches(tmp_path):
+    root = tmp_path / "dataset"
+    config = load_yaml_config("configs/production_v1.yaml")
+    manifest = initialize_production_root(root, config, Path(__file__).resolve().parents[1])
+    scene = "Beechwood_0_int"
+    shard = scene_shard_path(root, scene)
+    dump_json(shard / "shard_status.json", {"status": "failed", "error": "disk full"})
+    dump_json(shard / "dataset_meta.json", {
+        "configuration_fingerprint": manifest["configuration_fingerprint"],
+        "schema_version": manifest["schema_version"],
+    })
+    dump_json(shard / "taxonomy.json", _taxonomy(scene, 101, "chair"))
+    dump_json(shard / "configurations" / scene / "config_000" / "config_meta.json", {})
+
+    def committed_episode(index, passed=True):
+        episode = shard / "episodes" / scene / "config_000" / f"episode_{index:03d}"
+        dump_json(episode / "meta.json", {"episode_id": episode.name})
+        dump_json(episode / "qa.json", [{"check": "paired_trajectory_equality", "passed": passed}])
+        dump_json(episode / "generation_metrics.json", {})
+        (episode / "trajectories.npz").write_bytes(b"trajectory data")
+        return episode
+
+    first = committed_episode(0)
+    _, first_index = finalize_dataset(root, allow_partial=True)
+    assert first_index["status"] == "partial"
+    assert first_index["indexed_partial_scenes"] == [scene]
+    assert first_index["episode_count"] == 1
+    first_bytes = (first / "trajectories.npz").read_bytes()
+
+    committed_episode(1, passed=False)
+    with pytest.raises(ConfigurationError, match="passing QA"):
+        finalize_dataset(root, allow_partial=True)
+    dump_json(shard / "episodes" / scene / "config_000" / "episode_001" / "qa.json", [
+        {"check": "paired_trajectory_equality", "passed": True},
+    ])
+    _, second_index = finalize_dataset(root, allow_partial=True)
+    assert second_index["episode_count"] == 2
+    assert (first / "trajectories.npz").read_bytes() == first_bytes
+    episodes = json.loads((root / "global" / "dataset_index.json").read_text())["episodes"]
+    assert [entry["episode_id"] for entry in episodes] == ["episode_000", "episode_001"]
+
+
 def test_atomic_json_replace_failure_preserves_previous_status(tmp_path, monkeypatch):
     status_path = tmp_path / "generation_status.json"
     dump_json(status_path, {"accepted_episodes": 6})

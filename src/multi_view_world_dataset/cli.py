@@ -116,6 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     launch.add_argument("--config", required=True)
     launch.add_argument("--gpus", required=True, help="Comma-separated physical GPU IDs")
+    launch.add_argument("--scenes", help="Comma-separated scene IDs to run in this batch; required for full production")
     launch.add_argument("--max-workers", type=int)
     launch.add_argument("--retry-failed", action="store_true")
     launch.add_argument("--allow-large", action="store_true")
@@ -125,6 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
         "finalize-dataset", help="Deterministically merge completed shard metadata"
     )
     finalize.add_argument("--dataset-root", required=True)
+    finalize.add_argument("--allow-partial", action="store_true", help="Index only completed scene shards")
     pilot_report = subparsers.add_parser(
         "pilot-report", help="Generate production-readiness diagnostics from finalized shards"
     )
@@ -146,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
         ))
         return 0
     if args.command == "finalize-dataset":
-        output, report = finalize_dataset(args.dataset_root)
+        output, report = finalize_dataset(args.dataset_root, allow_partial=bool(args.allow_partial))
         print(json.dumps(
             {"status": "pass", "output": str(output), **report},
             indent=2, sort_keys=True,
@@ -210,11 +212,13 @@ def main(argv: list[str] | None = None) -> int:
             max_workers=args.max_workers or len(gpus),
             allow_large=bool(args.allow_large),
             retry_failed=bool(args.retry_failed),
+            scene_ids=(tuple(value.strip() for value in args.scenes.split(",") if value.strip())
+                       if args.scenes is not None else None),
         )
         print(json.dumps(
             {"output": str(output), **result}, indent=2, sort_keys=True
         ))
-        return 0 if result["status"] == "pass" else 2
+        return 0 if result["status"] in {"pass", "partial"} else 2
     if args.command == "generate":
         output, result = generate_dataset(
             runtime,

@@ -60,8 +60,8 @@ The canonical configs share identical Dataset-v1.1 research semantics and differ
 
 - `configs/integration_final.yaml`: Beechwood_0_int, 5 configurations × 3 episodes.
 - `configs/pilot_production.yaml`: healthy Beechwood_0_int plus constrained Rs_int, each 20 × 3.
-- `configs/production_v1.yaml`: all eligible scenes, each 150 × 3. This is prepared but must not be launched without
-  explicit approval after the pilot report.
+- `configs/production_v1.yaml`: all eligible scenes, each 150 × 3. Run explicit scene batches
+  into one final root; the global manifest and dataset fingerprint stay fixed.
 
 Run the clean integration on one GPU. The parent launches a fresh worker process for the scene and writes only global
 status; the worker writes only `shards/Beechwood_0_int`:
@@ -88,9 +88,23 @@ refused. `finalize-dataset` merges metadata/indexes and taxonomy deterministical
 The readiness report is written under `global/pilot_report.{json,md}`, with plots and per-scene summaries. It always
 stops after reporting; it never starts full production.
 
-The launcher assigns a serial scene queue to each listed physical GPU. On a node with four usable H100s, pass
-`--gpus 0,1,2,3 --max-workers 4`; at most one scene worker runs per listed GPU. A production root has one
-coordinator lock, and each scene shard has its own worker lock. Run the long command in `tmux` or the cluster's
+The launcher runs one scene worker per listed GPU in parallel; if a batch contains more scenes
+than GPUs, each GPU processes its own queue serially. Full production requires an explicit
+`--scenes` batch so it cannot accidentally start all 50 eligible scenes. For example, after
+checking free disk space, start two complete 150 × 3 scene shards directly in the final root:
+
+```bash
+mvwd production-launch --config configs/production_v1.yaml --scenes Beechwood_0_int,Rs_int \
+  --gpus 0,1 --max-workers 2 --allow-large --output-root /path/to/final-dataset \
+  --cache-root /path/to/cache
+mvwd finalize-dataset --dataset-root /path/to/final-dataset --allow-partial
+```
+
+Later batches use the same config and output root with other `--scenes` IDs. A partial
+index includes completed scene shards and atomically committed, QA-passing episodes from
+interrupted shards. Finalization without `--allow-partial` still requires all selected
+scenes to be complete. A production root has one coordinator lock, and each
+scene shard has its own worker lock. Run the long command in `tmux` or the cluster's
 batch scheduler. To resume the same code and configuration after interruption:
 
 ```bash
@@ -101,8 +115,20 @@ mvwd production-launch --config configs/pilot_production.yaml --gpus 0,1 --max-w
 The parent restarts sampling exhaustion and stalled workers with new deterministic retry epochs. Completed episodes
 are committed by atomic directory rename and skipped on resume. Status JSON is also replaced atomically. A code or
 configuration change changes the dataset fingerprint and requires a new output root; keep old roots as separate
-provenance snapshots. Multi-node production should use one coordinator per dataset root, with GPU IDs local to that
-node; concurrent launchers targeting one root are rejected.
+provenance snapshots. After disk-full or an external interruption, restore free space and rerun the same
+config, source, output root and scene batch with `--retry-failed`:
+
+```bash
+mvwd production-launch --config configs/production_v1.yaml --scenes Beechwood_0_int,Rs_int \
+  --gpus 0,1 --max-workers 2 --allow-large --retry-failed \
+  --output-root /path/to/final-dataset --cache-root /path/to/cache
+```
+
+Only incomplete staging directories are removed on resume; committed episodes remain. Regenerate the partial
+index after each interruption or completed batch. Never copy data from a different fingerprinted root into this
+one. Check free space before each batch: the full 50-scene projection can exceed the current filesystem.
+Multi-node production uses one coordinator per dataset root, with GPU IDs local to that node; concurrent launchers
+targeting one root are rejected.
 If the same configuration repeatedly exhausts episode sampling before producing any complete episode, the parent
 archives it under `shards/<scene>/quarantine/configurations/` and samples a replacement for that configuration slot.
 Configurations with even one complete episode are retained.

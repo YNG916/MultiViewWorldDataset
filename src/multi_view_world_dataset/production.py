@@ -463,6 +463,7 @@ def _launch_scene_shards_unlocked(
     max_workers: int,
     allow_large: bool,
     retry_failed: bool = False,
+    scene_ids: Sequence[str] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     if not gpus:
         raise ConfigurationError("At least one GPU ID is required")
@@ -473,13 +474,29 @@ def _launch_scene_shards_unlocked(
     root = runtime.require_output()
     repository_root = Path(__file__).resolve().parents[2]
     manifest = initialize_production_root(root, config, repository_root)
+    if scene_ids is None:
+        if config["profile"] == "production" and not config.get("production", {}).get("selected_scenes"):
+            raise ConfigurationError(
+                "Full production requires an explicit --scenes batch; "
+                "do not launch all eligible scenes implicitly"
+            )
+        requested_scenes = tuple(manifest["selected_scenes"])
+    else:
+        requested_scenes = tuple(map(str, scene_ids))
+        if not requested_scenes or len(set(requested_scenes)) != len(requested_scenes):
+            raise ConfigurationError("--scenes must contain unique scene IDs")
+        outside = sorted(set(requested_scenes) - set(manifest["selected_scenes"]))
+        if outside:
+            raise ConfigurationError(
+                f"Requested scenes are not selected by this dataset manifest: {outside}"
+            )
     states = _initial_scene_states(manifest)
     previous = _read_json(root / "production_status.json", {})
     for scene, record in previous.get("scenes", {}).items():
         if scene in states and record.get("status") in {"complete", "failed"}:
             states[scene] = record
     selected = [
-        scene for scene in manifest["selected_scenes"]
+        scene for scene in requested_scenes
         if _should_launch_scene(states.get(scene, {}).get("status"), retry_failed)
     ]
     worker_count = min(max_workers, len(gpus), max(1, len(selected)))
@@ -835,9 +852,13 @@ def _launch_scene_shards_unlocked(
                 future.result()
     failed = sorted(scene for scene, record in states.items() if record["status"] == "failed")
     pending = sorted(scene for scene in manifest["selected_scenes"] if states[scene]["status"] != "complete")
+    final_status = "pass" if not failed and not pending else (
+        "partial" if not failed and scene_ids is not None else "error"
+    )
     result = {
         **status,
-        "status": "pass" if not failed and not pending else "error",
+        "status": final_status,
+        "scheduled_scenes": list(requested_scenes),
         "scenes": states,
         "complete_scenes": sorted(
             scene for scene, record in states.items() if record["status"] == "complete"
@@ -858,6 +879,7 @@ def launch_scene_shards(
     max_workers: int,
     allow_large: bool,
     retry_failed: bool = False,
+    scene_ids: Sequence[str] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     root = runtime.require_output()
     with _exclusive_production_root(root):
@@ -865,6 +887,7 @@ def launch_scene_shards(
             runtime, config, config_path,
             gpus=gpus, max_workers=max_workers,
             allow_large=allow_large, retry_failed=retry_failed,
+            scene_ids=scene_ids,
         )
 
 
@@ -896,7 +919,9 @@ def merge_taxonomies(taxonomies: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     return merged
 
 
-def finalize_dataset(dataset_root: str | Path) -> tuple[Path, dict[str, Any]]:
+def finalize_dataset(
+    dataset_root: str | Path, *, allow_partial: bool = False
+) -> tuple[Path, dict[str, Any]]:
     root = Path(dataset_root).expanduser().resolve()
     manifest = _read_json(root / "global" / "production_manifest.json")
     if manifest is None:
@@ -915,8 +940,14 @@ def finalize_dataset(dataset_root: str | Path) -> tuple[Path, dict[str, Any]]:
     for scene_id in sorted(selected):
         shard = scene_shard_path(root, scene_id)
         status = _read_json(shard / "shard_status.json", {})
-        if status.get("status") != "complete":
+        complete = status.get("status") == "complete"
+        if not complete and not allow_partial:
             raise ConfigurationError(f"Cannot finalize incomplete shard {scene_id}")
+        episodes = sorted(
+            path.parent for path in (shard / "episodes").glob("*/*/episode_*/meta.json")
+        )
+        if not complete and not episodes:
+            continue
         metadata = _read_json(shard / "dataset_meta.json", {})
         if metadata.get("configuration_fingerprint") != expected_fingerprint:
             raise ConfigurationError(f"Shard fingerprint mismatch for {scene_id}")
@@ -927,9 +958,6 @@ def finalize_dataset(dataset_root: str | Path) -> tuple[Path, dict[str, Any]]:
         configurations = sorted(
             path.parent for path in (shard / "configurations").glob("*/*/config_meta.json")
         )
-        episodes = sorted(
-            path.parent for path in (shard / "episodes").glob("*/*/episode_*/meta.json")
-        )
         for path in configurations:
             configuration_index.append({
                 "scene_id": scene_id,
@@ -937,6 +965,17 @@ def finalize_dataset(dataset_root: str | Path) -> tuple[Path, dict[str, Any]]:
                 "path": str(path.relative_to(root)),
             })
         for path in episodes:
+            if not complete:
+                qa = _read_json(path / "qa.json")
+                required = ("trajectories.npz", "generation_metrics.json")
+                if (
+                    not isinstance(qa, list) or not qa
+                    or not all(isinstance(check, dict) and check.get("passed") is True for check in qa)
+                    or not all((path / name).is_file() for name in required)
+                ):
+                    raise ConfigurationError(
+                        f"Cannot index incomplete shard episode without complete passing QA: {path}"
+                    )
             episode_index.append({
                 "scene_id": scene_id,
                 "configuration_id": path.parent.name,
@@ -958,12 +997,15 @@ def finalize_dataset(dataset_root: str | Path) -> tuple[Path, dict[str, Any]]:
         total_bytes += shard_bytes
         shard_records.append({
             "scene_id": scene_id,
+            "status": "complete" if complete else "partial",
             "path": str(shard.relative_to(root)),
             "configuration_count": len(configurations),
             "episode_count": len(episodes),
             "bytes": shard_bytes,
             "configuration_fingerprint": expected_fingerprint,
         })
+    if not shard_records:
+        raise ConfigurationError("No completed scene shards or committed episodes to index")
     taxonomy = merge_taxonomies(taxonomies)
     global_root = root / "global"
     dump_json(global_root / "taxonomy.json", taxonomy)
@@ -977,7 +1019,10 @@ def finalize_dataset(dataset_root: str | Path) -> tuple[Path, dict[str, Any]]:
     total_realized = sum(realized_regimes.values())
     finalized = {
         **manifest,
-        "status": "complete",
+        "status": "complete" if len(shard_records) == len(selected) and all(record["status"] == "complete" for record in shard_records) else "partial",
+        "indexed_completed_scenes": [record["scene_id"] for record in shard_records if record["status"] == "complete"],
+        "indexed_partial_scenes": [record["scene_id"] for record in shard_records if record["status"] == "partial"],
+        "pending_scene_count": len(selected) - sum(record["status"] == "complete" for record in shard_records),
         "shard_count": len(shard_records),
         "configuration_count": len(configuration_index),
         "episode_count": len(episode_index),
