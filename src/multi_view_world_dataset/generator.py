@@ -37,7 +37,10 @@ from multi_view_world_dataset.rendering.inspection_v11 import (
     save_overlap_graph_inspection,
     save_robot_appearance_summary,
 )
-from multi_view_world_dataset.sampling.configurations import near_duplicate_configuration
+from multi_view_world_dataset.sampling.configurations import (
+    exact_state_hash,
+    near_duplicate_configuration,
+)
 from multi_view_world_dataset.sampling.diversity import stable_seed, temporal_overlap_acceptance
 from multi_view_world_dataset.sampling.interventions import eligible_intervention_targets
 from multi_view_world_dataset.sampling.splits import assign_scene_family_splits, infer_scene_family
@@ -66,6 +69,61 @@ from multi_view_world_dataset.utils.serialization import dump_json
 
 def _write_status(root: Path, **values: Any) -> None:
     dump_json(root / "generation_status.json", values)
+
+
+def _configuration_navigation_seed(configuration_metadata: Mapping[str, Any]) -> int:
+    """Rebuild a persisted configuration's route bank with its acceptance seed."""
+    return stable_seed(
+        int(configuration_metadata["seed"]), "configuration-navigation-context"
+    )
+
+
+def _check_configuration_geometry(
+    expected_objects: Sequence[ObjectState] | Sequence[Mapping[str, Any]],
+    actual_objects: Sequence[ObjectState],
+    *,
+    aabb_tolerance_m: float,
+) -> None:
+    """Reject a snapshot whose collision geometry differs from its catalog."""
+    def field(obj: ObjectState | Mapping[str, Any], name: str) -> Any:
+        return obj[name] if isinstance(obj, Mapping) else getattr(obj, name)
+
+    expected = {str(field(obj, "instance_id")): obj for obj in expected_objects}
+    actual = {obj.instance_id: obj for obj in actual_objects}
+    missing = sorted(set(expected) - set(actual))
+    unexpected = sorted(set(actual) - set(expected))
+    mismatches: list[dict[str, Any]] = []
+    for instance_id in sorted(set(expected) & set(actual)):
+        saved = expected[instance_id]
+        current = actual[instance_id]
+        aabb_error = max(
+            float(np.max(np.abs(
+                np.asarray(field(saved, name), dtype=np.float64)
+                - np.asarray(getattr(current, name), dtype=np.float64)
+            )))
+            for name in ("bbox_min_world", "bbox_max_world")
+        )
+        pose_error = float(np.max(np.abs(
+            np.asarray(field(saved, "object_to_world"), dtype=np.float64)
+            - np.asarray(current.object_to_world, dtype=np.float64)
+        )))
+        if aabb_error > aabb_tolerance_m or pose_error > 1.0e-4:
+            mismatches.append({
+                "instance_id": instance_id,
+                "category": current.category,
+                "aabb_error_m": aabb_error,
+                "pose_matrix_error": pose_error,
+            })
+    if missing or unexpected or mismatches:
+        raise SampleRejected("configuration_snapshot_geometry_mismatch", {
+            "missing_object_ids": missing[:10],
+            "unexpected_object_ids": unexpected[:10],
+            "mismatch_count": len(mismatches),
+            "largest_mismatches": sorted(
+                mismatches, key=lambda item: -item["aabb_error_m"]
+            )[:10],
+            "aabb_tolerance_m": aabb_tolerance_m,
+        })
 
 
 def _render_environment_floors(
@@ -124,6 +182,7 @@ def _render_environment_floors(
         prefix = f"floor_{floor_index:02d}"
         for name, value in render.modalities.items():
             arrays[f"{prefix}/{name}"] = np.asarray(value)
+        adapter.refresh_collision_geometry_cache()
         navigation_layers = adapter.traversability_bev_layers(
             floor_index, calibration
         )
@@ -1003,11 +1062,22 @@ def _post_render_intervention_effect(
     before_views: dict[str, dict[str, np.ndarray]],
     after_views: dict[str, dict[str, np.ndarray]],
     config: dict[str, Any],
+    intervention_type: InterventionType | str,
 ) -> dict[str, Any]:
     ordered = sorted(before_catalog, key=lambda item: item.instance_id)
     public_id = 4 + next(index for index, obj in enumerate(ordered) if obj.instance_id == target_instance_id)
     effect = config["intervention"]["post_render_effect"]
-    delta_threshold = float(effect["minimum_mean_rgb_delta"])
+    intervention_type_name = (
+        intervention_type.value
+        if isinstance(intervention_type, InterventionType)
+        else str(intervention_type)
+    )
+    configured_threshold = effect["minimum_mean_rgb_delta"]
+    delta_threshold = float(
+        configured_threshold[intervention_type_name]
+        if isinstance(configured_threshold, Mapping)
+        else configured_threshold
+    )
     changed_pixels = 0
     union_pixels = 0
     delta_sum = 0.0
@@ -1036,6 +1106,8 @@ def _post_render_intervention_effect(
     }
     return {
         "passed": all(checks.values()), "checks": checks,
+        "intervention_type": intervention_type_name,
+        "minimum_mean_rgb_delta": delta_threshold,
         "target_public_instance_id": public_id,
         "changed_pixels": changed_pixels, "union_pixels": union_pixels,
         "mean_rgb_delta": mean_delta, "per_robot": per_robot,
@@ -1141,6 +1213,7 @@ def generate_dataset(
     *,
     scene_id: str | None = None,
     allow_large: bool = False,
+    sampling_retry_epoch: int = 0,
 ) -> tuple[Path, dict[str, Any]]:
     profile = str(config["profile"])
     if profile not in {"smoke", "integration"} and not allow_large:
@@ -1151,6 +1224,8 @@ def generate_dataset(
         raise ConfigurationError(
             "Multi-scene generation requires production-launch so every scene uses a fresh process"
         )
+    if sampling_retry_epoch < 0:
+        raise ConfigurationError("sampling_retry_epoch must be non-negative")
     root = runtime.require_output()
     repository_root = Path(__file__).resolve().parents[2]
     commit = generator_git_commit(repository_root)
@@ -1306,6 +1381,7 @@ def generate_dataset(
                 ),
             )
             base_snapshot = adapter.dump_snapshot()
+            adapter.refresh_collision_geometry_cache()
             base_catalog = adapter.object_catalog_with_relations()
             writer.update_scene_taxonomy(selected_scene, base_catalog)
             scene_root = root / "scenes" / selected_scene
@@ -1341,6 +1417,10 @@ def generate_dataset(
             accepted_configurations += len(
                 completed_configurations & expected_configuration_ids
             )
+            accepted_episodes += sum(
+                len(writer.completed_episode_ids(selected_scene, configuration_id))
+                for configuration_id in expected_configuration_ids
+            )
             for configuration_index in range(requested_configurations):
                 configuration_id = f"config_{configuration_index:03d}"
                 configuration_root = (
@@ -1349,9 +1429,19 @@ def generate_dataset(
                 if configuration_id not in completed_configurations:
                     accepted = None
                     for attempt in range(int(config["generation"]["maximum_configuration_attempts"])):
+                        configuration_seed_parts: tuple[object, ...] = (
+                            selected_scene,
+                            configuration_id,
+                            "configuration",
+                            attempt,
+                        )
+                        if sampling_retry_epoch:
+                            configuration_seed_parts += (
+                                "sampling-retry-epoch",
+                                sampling_retry_epoch,
+                            )
                         seed = stable_seed(
-                            int(config["seed"]), selected_scene,
-                            configuration_id, "configuration", attempt,
+                            int(config["seed"]), *configuration_seed_parts
                         )
                         _write_status(
                             root,
@@ -1366,6 +1456,50 @@ def generate_dataset(
                         adapter.load_snapshot(base_snapshot)
                         try:
                             candidate = adapter.randomize_relation_preserving_configuration(seed)
+                            initial_catalog = candidate["catalog"]
+                            adapter.load_snapshot(candidate["snapshot"])
+                            adapter.refresh_collision_geometry_cache()
+                            _check_configuration_geometry(
+                                initial_catalog,
+                                adapter.object_catalog(),
+                                aabb_tolerance_m=float(config["generation"]["configuration_geometry_aabb_tolerance_m"]),
+                            )
+                            navigation_context_started = time.perf_counter()
+                            environment_arrays, _ = _render_environment_floors(adapter, config)
+                            # BEV rendering initializes and flushes Fabric geometry.
+                            # Canonicalize after that flush so fresh processes see
+                            # the same collision hulls as the stored catalog.
+                            adapter.load_snapshot(candidate["snapshot"])
+                            adapter.refresh_collision_geometry_cache()
+                            canonical_catalog = adapter.object_catalog_with_relations()
+                            maximum_restore_error, discrete_equal = (
+                                adapter._catalog_restore_metrics(initial_catalog, canonical_catalog)
+                            )
+                            if (
+                                maximum_restore_error > float(config["generation"]["snapshot_restore_tolerance"])
+                                or not discrete_equal
+                            ):
+                                raise SampleRejected("configuration_after_bev_state_mismatch", {
+                                    "maximum_restore_error": maximum_restore_error,
+                                    "discrete_equal": discrete_equal,
+                                })
+                            initial_by_id = {obj.instance_id: obj for obj in initial_catalog}
+                            canonical_aabb_shift = max(
+                                max(
+                                    float(np.max(np.abs(
+                                        np.asarray(getattr(obj, field))
+                                        - np.asarray(getattr(initial_by_id[obj.instance_id], field))
+                                    )))
+                                    for field in ("bbox_min_world", "bbox_max_world")
+                                )
+                                for obj in canonical_catalog
+                            )
+                            candidate["catalog"] = canonical_catalog
+                            candidate["exact_state_hash"] = exact_state_hash(
+                                canonical_catalog,
+                                decimals=int(config["generation"]["exact_hash_decimals"]),
+                            )
+                            candidate["canonical_aabb_shift_after_bev_m"] = canonical_aabb_shift
                             if candidate["exact_state_hash"] in accepted_hashes:
                                 raise SampleRejected("exact_duplicate_configuration")
                             if any(
@@ -1382,14 +1516,18 @@ def generate_dataset(
                                 for catalog in accepted_catalogs
                             ):
                                 raise SampleRejected("near_duplicate_configuration")
-                            navigation_context_started = time.perf_counter()
                             adapter.prepare_navigation_context(
                                 str(candidate["exact_state_hash"]),
-                                stable_seed(seed, "configuration-navigation-context"),
+                                _configuration_navigation_seed({"seed": seed}),
                                 force=True,
                             )
                             navigation_metadata = adapter.navigation_context_metadata()
-                            environment_arrays, _ = _render_environment_floors(adapter, config)
+                            adapter.load_snapshot(candidate["snapshot"])
+                            adapter.refresh_collision_geometry_cache()
+                            _check_configuration_geometry(
+                                candidate["catalog"], adapter.object_catalog(),
+                                aabb_tolerance_m=float(config["generation"]["configuration_geometry_aabb_tolerance_m"]),
+                            )
                             navigation_context_build_s = (
                                 time.perf_counter() - navigation_context_started
                             )
@@ -1445,6 +1583,9 @@ def generate_dataset(
                                     ),
                                     "configuration_checks": candidate.get(
                                         "checks", {}
+                                    ),
+                                    "canonical_aabb_shift_after_bev_m": candidate.get(
+                                        "canonical_aabb_shift_after_bev_m", 0.0
                                     ),
                                     "maximum_snapshot_restore_error": (
                                         candidate.get(
@@ -1502,14 +1643,22 @@ def generate_dataset(
                     configuration_metadata["exact_state_hash"]
                 )
                 adapter.load_snapshot(configuration_snapshot)
+                adapter.refresh_collision_geometry_cache()
+                try:
+                    _check_configuration_geometry(
+                        configuration_metadata["world_state"]["objects"],
+                        adapter.object_catalog(),
+                        aabb_tolerance_m=float(config["generation"]["configuration_geometry_aabb_tolerance_m"]),
+                    )
+                except SampleRejected as error:
+                    raise SampleRejected(error.reason, {
+                        "scene_id": selected_scene,
+                        "configuration_id": configuration_id,
+                        **error.details,
+                    }) from error
                 adapter.prepare_navigation_context(
                     configuration_token,
-                    stable_seed(
-                        int(config["seed"]),
-                        selected_scene,
-                        configuration_id,
-                        "configuration-navigation-context",
-                    ),
+                    _configuration_navigation_seed(configuration_metadata),
                 )
                 navigation_metadata_path = (
                     configuration_root / "navigation_context.json"
@@ -1522,7 +1671,6 @@ def generate_dataset(
                 existing_episodes = set(
                     writer.completed_episode_ids(selected_scene, configuration_id)
                 )
-                accepted_episodes += len(existing_episodes)
                 used_targets = set(
                     _existing_event_targets(root, selected_scene, configuration_id)
                 )
@@ -1553,9 +1701,18 @@ def generate_dataset(
                     episode_id = f"episode_{episode_index:03d}"
                     if episode_id in existing_episodes:
                         continue
+                    episode_seed_parts: tuple[object, ...] = (
+                        selected_scene,
+                        configuration_id,
+                        episode_id,
+                    )
+                    if sampling_retry_epoch:
+                        episode_seed_parts += (
+                            "sampling-retry-epoch",
+                            sampling_retry_epoch,
+                        )
                     episode_seed = stable_seed(
-                        int(config["seed"]), selected_scene,
-                        configuration_id, episode_id,
+                        int(config["seed"]), *episode_seed_parts
                     )
                     episode_started = time.perf_counter()
                     episode_timing: dict[str, float] = {}
@@ -1576,7 +1733,17 @@ def generate_dataset(
                             split_name, Counter()
                         ),
                     )
-                    for placement_attempt in range(int(config["placement"]["maximum_attempts"])):
+                    placement_attempts_per_round = int(
+                        config["placement"]["maximum_attempts"]
+                    )
+                    episode_sampling_rounds = int(
+                        config["generation"]["maximum_episode_sampling_rounds"]
+                    )
+                    for placement_attempt in range(
+                        placement_attempts_per_round * episode_sampling_rounds
+                    ):
+                        sampling_round = placement_attempt // placement_attempts_per_round
+                        attempt_in_round = placement_attempt % placement_attempts_per_round
                         _write_status(
                             root,
                             status="running",
@@ -1585,8 +1752,11 @@ def generate_dataset(
                             configuration_id=configuration_id,
                             episode_id=episode_id,
                             attempt=placement_attempt,
+                            sampling_round=sampling_round,
+                            attempt_in_round=attempt_in_round,
                             accepted_configurations=accepted_configurations,
                             accepted_episodes=accepted_episodes,
+                            sampling_retry_epoch=sampling_retry_epoch,
                         )
                         adapter.load_snapshot(configuration_snapshot)
                         try:
@@ -1785,7 +1955,15 @@ def generate_dataset(
                             rescue_candidate_counts: Counter[str] = Counter()
                             rescue_generation_failures: list[dict[str, Any]] = []
                             rescue_candidates: tuple[Any, ...] = ()
-                            if not gt_valid_candidates:
+                            minimum_gt_valid_candidates = int(
+                                config["trajectory"][
+                                    "minimum_gt_valid_candidates_before_rescue"
+                                ]
+                            )
+                            if (
+                                len(gt_valid_candidates)
+                                < minimum_gt_valid_candidates
+                            ):
                                 adapter.load_snapshot(configuration_snapshot)
                                 (
                                     rescue_candidates,
@@ -1979,7 +2157,10 @@ def generate_dataset(
                                 for feedback_round in range(
                                     1, maximum_feedback_rounds
                                 ):
-                                    if gt_valid_candidates:
+                                    if (
+                                        len(gt_valid_candidates)
+                                        >= minimum_gt_valid_candidates
+                                    ):
                                         break
                                     adapter.load_snapshot(configuration_snapshot)
                                     combined_candidates = tuple(
@@ -2358,12 +2539,26 @@ def generate_dataset(
                             writer.record_reject(
                                 f"episode-before:{selected_scene}/{configuration_id}/{episode_id}",
                                 error.reason,
-                                {"attempt": placement_attempt, **error.details},
+                                {
+                                    "attempt": placement_attempt,
+                                    "sampling_round": sampling_round,
+                                    "attempt_in_round": attempt_in_round,
+                                    **error.details,
+                                },
                             )
                     if before is None:
                         raise SampleRejected(
                             "episode_before_attempts_exhausted",
-                            {"scene_id": selected_scene, "configuration_id": configuration_id},
+                            {
+                                "scene_id": selected_scene,
+                                "configuration_id": configuration_id,
+                                "episode_id": episode_id,
+                                "sampling_rounds": episode_sampling_rounds,
+                                "total_attempts": (
+                                    placement_attempts_per_round
+                                    * episode_sampling_rounds
+                                ),
+                            },
                         )
                     after = None
                     intervention = None
@@ -2387,11 +2582,17 @@ def generate_dataset(
                         available_intervention_types,
                         stable_seed(episode_seed, "intervention_type"),
                     )
-                    event_attempt_count = min(
+                    event_attempts_per_round = min(
                         int(config["intervention"]["maximum_attempts"]),
                         int(config["intervention"]["post_render_effect"]["maximum_resample_attempts"]),
                     )
+                    event_attempt_count = min(
+                        int(config["intervention"]["maximum_attempts"]),
+                        event_attempts_per_round * episode_sampling_rounds,
+                    )
                     for event_attempt in range(event_attempt_count):
+                        sampling_round = event_attempt // event_attempts_per_round
+                        attempt_in_round = event_attempt % event_attempts_per_round
                         _write_status(
                             root,
                             status="running",
@@ -2400,8 +2601,11 @@ def generate_dataset(
                             configuration_id=configuration_id,
                             episode_id=episode_id,
                             attempt=event_attempt,
+                            sampling_round=sampling_round,
+                            attempt_in_round=attempt_in_round,
                             accepted_configurations=accepted_configurations,
                             accepted_episodes=accepted_episodes,
+                            sampling_retry_epoch=sampling_retry_epoch,
                         )
                         adapter.load_snapshot(w0_snapshot)
                         try:
@@ -2431,6 +2635,7 @@ def generate_dataset(
                                 intervention["event"].target_instance_id,
                                 w0_catalog,
                                 before["robot_views"], after["robot_views"], config,
+                                intervention["event"].intervention_type,
                             )
                             if not post_render_effect["passed"]:
                                 raise SampleRejected(
@@ -2521,7 +2726,12 @@ def generate_dataset(
                             writer.record_reject(
                                 f"event:{selected_scene}/{configuration_id}/{episode_id}",
                                 error.reason,
-                                {"attempt": event_attempt, **error.details},
+                                {
+                                    "attempt": event_attempt,
+                                    "sampling_round": sampling_round,
+                                    "attempt_in_round": attempt_in_round,
+                                    **error.details,
+                                },
                             )
                     if after is None or intervention is None:
                         raise SampleRejected(
@@ -2530,6 +2740,8 @@ def generate_dataset(
                                 "scene_id": selected_scene,
                                 "configuration_id": configuration_id,
                                 "episode_id": episode_id,
+                                "sampling_rounds": episode_sampling_rounds,
+                                "total_attempts": event_attempt_count,
                             },
                         )
                     robot_states = _robot_states(config, heights, trajectories)
@@ -2733,6 +2945,7 @@ def generate_dataset(
                             "post_render_intervention_effect": post_render_effect,
                             "sibling_episode_diversity": sibling_diversity,
                             "runtime_s": episode_timing,
+                            "sampling_retry_epoch": sampling_retry_epoch,
                         }
                         transaction.write_json(
                             "generation_metrics.json", generation_metrics
@@ -2801,6 +3014,7 @@ def generate_dataset(
                 for name, values in realized_regime_counts_by_split.items()
             },
             "scope": "single-scene shard generation; full production is never started implicitly",
+            "sampling_retry_epoch": sampling_retry_epoch,
         }
         dump_json(root / "generation_result.json", result)
         (root / "generation_failure.json").unlink(missing_ok=True)
@@ -2815,7 +3029,10 @@ def generate_dataset(
             "traceback": traceback.format_exc(),
             "accepted_configurations": accepted_configurations,
             "accepted_episodes": accepted_episodes,
+            "sampling_retry_epoch": sampling_retry_epoch,
         }
+        if isinstance(error, SampleRejected):
+            failure["rejection_details"] = error.details
         dump_json(root / "generation_failure.json", failure)
         _write_status(root, **failure, stage="failed")
         raise

@@ -2,6 +2,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from multi_view_world_dataset.adapters.navigation import (
     _bind_route,
@@ -10,10 +11,12 @@ from multi_view_world_dataset.adapters.navigation import (
     _cheap_visibility_score_from_pairwise,
     _incomplete_view_cohort_regions,
     _shared_surface_target_visibility,
+    build_navigation_contexts,
     measured_overlap_route_mutations,
 )
 import multi_view_world_dataset.adapters.navigation as navigation_adapter_module
 from multi_view_world_dataset.diagnostics import _kit_log_has_gpu_device_loss
+from multi_view_world_dataset.errors import SampleRejected
 from multi_view_world_dataset.sampling.diversity import temporal_overlap_acceptance
 from multi_view_world_dataset.sampling.navigation import (
     RouteCandidate,
@@ -27,6 +30,8 @@ from multi_view_world_dataset.sampling.navigation import (
 )
 from multi_view_world_dataset.sampling.se2 import (
     plan_se2_grid,
+    plan_se2_waypoints,
+    sample_reachable_waypoint_cells,
     se2_plan_is_safe,
     swept_rotation_is_safe,
 )
@@ -39,6 +44,60 @@ from multi_view_world_dataset.utils.config import load_yaml_config
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
+
+
+def test_navigation_context_rejects_route_bank_below_configured_minimum(
+    monkeypatch,
+):
+    context = SimpleNamespace(
+        route_bank=(object(),) * 10,
+        diagnostics={},
+        compatibility=SimpleNamespace(compatible_pair_fraction=0.5),
+        region_graph=SimpleNamespace(),
+    )
+    adapter = SimpleNamespace(
+        config={
+            "navigation": {
+                "route_bank_target_size": 64,
+                "route_bank_minimum_size": 24,
+                "joint_route_search_budget": 100,
+                "require_connected_start_regions": False,
+            }
+        },
+        _navigation_configuration_token=None,
+        _navigation_contexts={},
+        _runtime_findings={},
+        _require_scene=lambda: SimpleNamespace(n_floors=1),
+    )
+    monkeypatch.setattr(
+        navigation_adapter_module,
+        "_robot_footprint",
+        lambda _adapter: SimpleNamespace(metadata=lambda: {}),
+    )
+    monkeypatch.setattr(
+        navigation_adapter_module,
+        "_build_floor_context",
+        lambda *_args, **_kwargs: context,
+    )
+
+    with pytest.raises(SampleRejected) as error:
+        build_navigation_contexts(adapter, "configuration", 7, force=True)
+
+    assert error.value.reason == "configuration_navigation_infeasible"
+    floor_failure = error.value.details["floor_failures"][0]
+    assert floor_failure["reason"] == "navigation_route_bank_below_minimum"
+    assert floor_failure["details"] == {
+        "floor_index": 0,
+        "route_count": 10,
+        "route_count_minimum": 24,
+        "route_count_target": 64,
+        "raw_route_attempts": None,
+        "route_acceptance_rate": None,
+        "route_reject_counts": {},
+        "footprint_safe_cell_count": None,
+        "start_region_distribution": {},
+    }
+    assert context.diagnostics["route_count_minimum_met"] is False
 
 
 def _route(route_id: str, points: list[list[float]], family: str = "one_waypoint") -> RouteCandidate:
@@ -366,6 +425,35 @@ def test_se2_forward_primitive_never_approximates_a_misaligned_yaw():
             yaw = 2.0 * np.pi * left.yaw_index / 16
             tangent = np.arctan2(right.row - left.row, right.column - left.column)
             assert abs((yaw - tangent + np.pi) % (2.0 * np.pi) - np.pi) < 1.0e-9
+
+
+def test_reachable_waypoint_sampler_is_deterministic_curved_and_safe():
+    masks = np.ones((8, 31, 31), dtype=bool)
+    kwargs = {
+        "segment_count": 2,
+        "minimum_length_m": 1.0,
+        "maximum_length_m": 2.0,
+        "map_resolution_m": 0.1,
+        "maximum_turn_rad": np.pi / 2.0,
+        "maximum_attempts": 16,
+    }
+    first = sample_reachable_waypoint_cells(
+        masks, (15, 15), rng=np.random.default_rng(31), **kwargs
+    )
+    second = sample_reachable_waypoint_cells(
+        masks, (15, 15), rng=np.random.default_rng(31), **kwargs
+    )
+
+    assert first is not None
+    assert np.array_equal(first, second)
+    assert first.shape == (3, 2)
+    left = first[1] - first[0]
+    right = first[2] - first[1]
+    assert abs(int(left[0] * right[1] - left[1] * right[0])) > 0
+
+    plan = plan_se2_waypoints(masks, first)
+    assert plan is not None
+    assert se2_plan_is_safe(plan, masks)
 
 
 def test_se2_time_parameterization_has_stationary_turns_without_lateral_slip():

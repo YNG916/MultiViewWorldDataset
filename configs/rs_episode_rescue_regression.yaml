@@ -1,0 +1,12 @@
+extends: production_v1.yaml
+profile: integration
+
+# Reproduces the constrained-scene sibling episode that exposed a gap between
+# GT-depth candidate validation and the full 60-frame collision rollout.
+dataset:
+  accepted_configurations_per_scene: 1
+  accepted_episodes_per_configuration: 3
+
+production:
+  selected_scenes: [Rs_int]
+  scale: rs_episode_rescue_regression_1x1x3

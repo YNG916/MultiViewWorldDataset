@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -8,7 +9,9 @@ import sys
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from pathlib import Path
+from threading import Event, Lock, Thread
 from typing import Any, Mapping, Sequence
 
 import yaml
@@ -32,6 +35,13 @@ from multi_view_world_dataset.utils.runtime import RuntimePaths, generator_git_c
 from multi_view_world_dataset.utils.serialization import dump_json, to_jsonable
 
 _SCENE_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
+_RECOVERABLE_SAMPLING_ERRORS = frozenset({
+    "configuration_attempts_exhausted",
+    "episode_before_attempts_exhausted",
+    "intervention_attempts_exhausted",
+    "worker_progress_stalled",
+    "configuration_snapshot_geometry_mismatch",
+})
 
 
 def scene_shard_path(dataset_root: str | Path, scene_id: str) -> Path:
@@ -44,6 +54,33 @@ def _read_json(path: Path, default: Any = None) -> Any:
     if not path.is_file():
         return default
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _file_signature(path: Path) -> tuple[int, int, int, int] | None:
+    """Identify a status write without trusting stale contents from an earlier worker."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+
+
+@contextmanager
+def _exclusive_production_root(root: Path):
+    """Keep one coordinator per dataset root across processes on shared storage."""
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / ".production.lock"
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ConfigurationError(
+                f"Another production launcher is already using {root}"
+            ) from error
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def _target_fingerprint(config: Mapping[str, Any], repository_root: Path) -> str:
@@ -170,12 +207,131 @@ def _should_launch_scene(status: str | None, retry_failed: bool) -> bool:
     return status in {None, "pending", "running"}
 
 
-def run_scene_worker(
+def _watch_worker_progress(
+    shard: Path,
+    stop: Event,
+    result: dict[str, Any],
+    *,
+    stall_timeout_s: float,
+    poll_interval_s: float,
+) -> None:
+    """Terminate a live worker whose atomic generation status stops changing."""
+    status_path = shard / "generation_status.json"
+    last_signature: tuple[int, int] | None = None
+    last_progress = time.monotonic()
+    while not stop.wait(poll_interval_s):
+        try:
+            stat = status_path.stat()
+            signature = (int(stat.st_mtime_ns), int(stat.st_size))
+        except OSError:
+            continue
+        if signature != last_signature:
+            last_signature = signature
+            last_progress = time.monotonic()
+            continue
+        stalled_s = time.monotonic() - last_progress
+        if stalled_s < stall_timeout_s:
+            continue
+        worker_status = _read_json(shard / "shard_status.json", {})
+        if worker_status.get("status") != "running":
+            return
+        try:
+            worker_pid = int(worker_status["worker_pid"])
+        except (KeyError, TypeError, ValueError):
+            return
+        if worker_pid <= 1 or worker_pid == os.getpid():
+            return
+        generation_status = _read_json(status_path, {})
+        result.update({
+            "triggered": True,
+            "worker_pid": worker_pid,
+            "stalled_s": stalled_s,
+            "stalled_stage": generation_status.get("stage"),
+            "stalled_configuration_id": generation_status.get(
+                "configuration_id"
+            ),
+            "stalled_episode_id": generation_status.get("episode_id"),
+            "stalled_attempt": generation_status.get("attempt"),
+        })
+        try:
+            os.kill(worker_pid, 15)
+        except ProcessLookupError:
+            pass
+        return
+
+
+def _quarantine_exhausted_empty_configuration(
+    shard: Path,
+    generation_status: Mapping[str, Any],
+    restart_history: Sequence[Mapping[str, Any]],
+    *,
+    minimum_failed_epochs: int,
+    sampling_retry_epoch: int,
+) -> str | None:
+    """Archive only an episode-free configuration that repeatedly exhausted sampling."""
+    reason = str(generation_status.get("error", ""))
+    if reason not in {
+        "episode_before_attempts_exhausted",
+        "intervention_attempts_exhausted",
+        "configuration_snapshot_geometry_mismatch",
+    }:
+        return None
+    details = generation_status.get("rejection_details") or {}
+    configuration_id = str(details.get("configuration_id", ""))
+    if (
+        details.get("scene_id") != shard.name
+        or not re.fullmatch(r"config_[0-9]{3}", configuration_id)
+    ):
+        return None
+    configuration_root = (
+        shard / "configurations" / shard.name / configuration_id
+    )
+    metadata = _read_json(configuration_root / "config_meta.json", {})
+    if "seed" not in metadata:
+        return None
+    configuration_seed = int(metadata["seed"])
+    failures = sum(
+        record.get("error") in {
+            "episode_before_attempts_exhausted",
+            "intervention_attempts_exhausted",
+            "configuration_snapshot_geometry_mismatch",
+        }
+        and record.get("failure_configuration_id") == configuration_id
+        and record.get("failure_configuration_seed") == configuration_seed
+        for record in restart_history
+    )
+    if reason == "configuration_snapshot_geometry_mismatch":
+        minimum_failed_epochs = 1
+    if failures < minimum_failed_epochs:
+        return None
+    episode_root = shard / "episodes" / shard.name / configuration_id
+    if episode_root.is_dir() and any(
+        (path / "meta.json").is_file() for path in episode_root.glob("episode_*")
+    ):
+        return None
+    destination = (
+        shard / "quarantine" / "configurations" / shard.name
+        / configuration_id / f"epoch_{sampling_retry_epoch:03d}_{time.time_ns()}"
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(configuration_root, destination)
+    dump_json(destination / "sampling_quarantine.json", {
+        "reason": reason,
+        "sampling_retry_epoch": sampling_retry_epoch,
+        "failed_epochs": failures,
+        "configuration_seed": configuration_seed,
+        "source_path": str(configuration_root.relative_to(shard)),
+    })
+    return str(destination.relative_to(shard))
+
+
+def _run_scene_worker_unlocked(
     runtime: RuntimePaths,
     config: dict[str, Any],
     scene_id: str,
     *,
     allow_large: bool,
+    sampling_retry_epoch: int = 0,
 ) -> tuple[Path, dict[str, Any]]:
     from multi_view_world_dataset.generator import generate_dataset
 
@@ -197,6 +353,7 @@ def run_scene_worker(
         "configuration_fingerprint": fingerprint,
         "started_unix_s": started,
         "worker_pid": os.getpid(),
+        "sampling_retry_epoch": sampling_retry_epoch,
     })
     shard_runtime = RuntimePaths(
         behavior_root=runtime.behavior_root,
@@ -205,7 +362,11 @@ def run_scene_worker(
     )
     try:
         _, result = generate_dataset(
-            shard_runtime, config, scene_id=scene_id, allow_large=allow_large
+            shard_runtime,
+            config,
+            scene_id=scene_id,
+            allow_large=allow_large,
+            sampling_retry_epoch=sampling_retry_epoch,
         )
         if result.get("status") != "pass":
             reason = result.get("error", "scene generation returned a non-pass status")
@@ -223,6 +384,7 @@ def run_scene_worker(
             "elapsed_s": finished - started,
             "error_type": type(error).__name__,
             "error": str(error),
+            "sampling_retry_epoch": sampling_retry_epoch,
         }
         dump_json(shard / "shard_status.json", failure)
         dump_json(shard / "timing.json", {"total_scene_worker_s": finished - started})
@@ -237,10 +399,28 @@ def run_scene_worker(
         "elapsed_s": finished - started,
         "accepted_configurations": int(result["accepted_configurations"]),
         "accepted_episodes": int(result["accepted_episodes"]),
+        "sampling_retry_epoch": sampling_retry_epoch,
     }
     dump_json(shard / "shard_status.json", status)
     dump_json(shard / "timing.json", {"total_scene_worker_s": finished - started})
     return shard, status
+
+
+def run_scene_worker(
+    runtime: RuntimePaths,
+    config: dict[str, Any],
+    scene_id: str,
+    *,
+    allow_large: bool,
+    sampling_retry_epoch: int = 0,
+) -> tuple[Path, dict[str, Any]]:
+    shard = scene_shard_path(runtime.require_output(), scene_id)
+    with _exclusive_production_root(shard):
+        return _run_scene_worker_unlocked(
+            runtime, config, scene_id,
+            allow_large=allow_large,
+            sampling_retry_epoch=sampling_retry_epoch,
+        )
 
 
 def _worker_command(
@@ -249,6 +429,7 @@ def _worker_command(
     scene_id: str,
     *,
     allow_large: bool,
+    sampling_retry_epoch: int = 0,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -263,6 +444,8 @@ def _worker_command(
         str(runtime.behavior_root),
         "--output-root",
         str(runtime.require_output()),
+        "--sampling-retry-epoch",
+        str(sampling_retry_epoch),
     ]
     if runtime.cache_root is not None:
         command.extend(("--cache-root", str(runtime.cache_root)))
@@ -271,7 +454,7 @@ def _worker_command(
     return command
 
 
-def launch_scene_shards(
+def _launch_scene_shards_unlocked(
     runtime: RuntimePaths,
     config: dict[str, Any],
     config_path: str | Path,
@@ -283,6 +466,8 @@ def launch_scene_shards(
 ) -> tuple[Path, dict[str, Any]]:
     if not gpus:
         raise ConfigurationError("At least one GPU ID is required")
+    if len(set(map(str, gpus))) != len(gpus):
+        raise ConfigurationError("GPU IDs must be unique")
     if max_workers < 1:
         raise ConfigurationError("max_workers must be positive")
     root = runtime.require_output()
@@ -297,8 +482,10 @@ def launch_scene_shards(
         scene for scene in manifest["selected_scenes"]
         if _should_launch_scene(states.get(scene, {}).get("status"), retry_failed)
     ]
+    worker_count = min(max_workers, len(gpus), max(1, len(selected)))
+    active_gpus = tuple(map(str, gpus[:worker_count]))
     for index, scene in enumerate(selected):
-        states[scene] = {"status": "pending", "assigned_gpu": str(gpus[index % len(gpus)])}
+        states[scene] = {"status": "pending", "assigned_gpu": active_gpus[index % worker_count]}
     status = {
         "status": "running",
         "profile": config["profile"],
@@ -317,86 +504,283 @@ def launch_scene_shards(
         env.pop("CUDA_VISIBLE_DEVICES", None)
         env["OMNIGIBSON_GPU_ID"] = str(gpu)
         started = time.time()
-        with log_path.open("a", encoding="utf-8") as log:
-            log.write(f"\n[mvwd-parent] launch scene={scene} gpu={gpu}\n")
-            completed = subprocess.run(
-                _worker_command(
-                    Path(config_path).expanduser().resolve(), runtime, scene,
-                    allow_large=allow_large,
-                ),
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                env=env,
-                check=False,
+        shard = scene_shard_path(root, scene)
+        maximum_sampling_restarts = int(
+            config["generation"]["maximum_scene_sampling_restarts"]
+        )
+        empty_configuration_retry_limit = int(
+            config["generation"]["maximum_empty_configuration_sampling_restarts"]
+        )
+        progress_stall_timeout_s = float(
+            config["generation"]["worker_progress_stall_timeout_s"]
+        )
+        progress_poll_interval_s = float(
+            config["generation"]["worker_progress_poll_interval_s"]
+        )
+        prior_recovery = _read_json(shard / "sampling_recovery.json", {})
+        restart_history: list[dict[str, Any]] = list(prior_recovery.get("attempts", []))
+        initial_epoch = max(
+            (int(record["sampling_retry_epoch"]) for record in restart_history),
+            default=-1,
+        ) + 1
+        worker_status: dict[str, Any] = {}
+        generation_status: dict[str, Any] = {}
+        completed: Any = None
+        sampling_retry_epoch = initial_epoch
+        worker_complete = False
+        for sampling_retry_epoch in range(initial_epoch, initial_epoch + maximum_sampling_restarts + 1):
+            epoch_started = time.time()
+            generation_status_path = shard / "generation_status.json"
+            status_signature_before = _file_signature(generation_status_path)
+            shard_status_path = shard / "shard_status.json"
+            shard_status_signature_before = _file_signature(shard_status_path)
+            watchdog_stop = Event()
+            watchdog_result: dict[str, Any] = {}
+            watchdog = Thread(
+                target=_watch_worker_progress,
+                args=(shard, watchdog_stop, watchdog_result),
+                kwargs={
+                    "stall_timeout_s": progress_stall_timeout_s,
+                    "poll_interval_s": progress_poll_interval_s,
+                },
+                name=f"mvwd-progress-watchdog-{scene}",
+                daemon=True,
             )
-        worker_status = _read_json(
-            scene_shard_path(root, scene) / "shard_status.json", {}
-        )
-        generation_status = _read_json(
-            scene_shard_path(root, scene) / "generation_status.json", {}
-        )
-        # Isaac Sim's configured fast shutdown may terminate the interpreter
-        # from adapter.close() before run_scene_worker regains control. Reconcile
-        # the generator's already-atomic terminal record in the parent instead
-        # of leaving a dead worker marked as running forever.
-        if worker_status.get("status") not in {"complete", "failed"}:
-            terminal = generation_status.get("status")
-            if terminal in {"pass", "error"}:
-                finished = time.time()
-                generator_passed = terminal == "pass"
-                expected_configurations = int(
-                    config["dataset"]["accepted_configurations_per_scene"]
+            watchdog.start()
+            with log_path.open("a", encoding="utf-8") as log:
+                log.write(
+                    "\n[mvwd-parent] launch "
+                    f"scene={scene} gpu={gpu} "
+                    f"sampling_retry_epoch={sampling_retry_epoch}\n"
                 )
-                expected_episodes = expected_configurations * int(
-                    config["dataset"]["accepted_episodes_per_configuration"]
-                )
-                accepted_configurations = int(
-                    generation_status.get("accepted_configurations", 0)
-                )
-                accepted_episodes = int(
-                    generation_status.get("accepted_episodes", 0)
-                )
-                complete_counts = bool(
-                    accepted_configurations == expected_configurations
-                    and accepted_episodes == expected_episodes
-                )
-                reconciled_complete = bool(
-                    completed.returncode == 0
-                    and generator_passed
-                    and complete_counts
-                )
-                worker_status = {
-                    **worker_status,
-                    "scene_id": scene,
-                    "status": "complete" if reconciled_complete else "failed",
-                    "finished_unix_s": finished,
-                    "elapsed_s": finished - started,
-                    "accepted_configurations": accepted_configurations,
-                    "accepted_episodes": accepted_episodes,
-                    "terminal_status_source": "generation_status_parent_reconciliation",
-                }
-                if not reconciled_complete:
-                    worker_status.update({
-                        "error_type": str(
-                            generation_status.get("error_type", "WorkerStatusError")
+                try:
+                    completed = subprocess.run(
+                        _worker_command(
+                            Path(config_path).expanduser().resolve(),
+                            runtime,
+                            scene,
+                            allow_large=allow_large,
+                            sampling_retry_epoch=sampling_retry_epoch,
                         ),
-                        "error": str(generation_status.get(
-                            "error",
-                            "generator terminal counts did not match the scene target",
-                        )),
-                    })
-                dump_json(
-                    scene_shard_path(root, scene) / "shard_status.json",
-                    worker_status,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        env=env,
+                        check=False,
+                    )
+                finally:
+                    watchdog_stop.set()
+                    watchdog.join(timeout=progress_poll_interval_s + 1.0)
+            if _file_signature(generation_status_path) == status_signature_before:
+                prior_status = _read_json(generation_status_path, {})
+                stale_status = {
+                    **prior_status,
+                    "status": "error",
+                    "stage": "failed",
+                    "error_type": "WorkerStartupError",
+                    "error": "worker_exited_without_status_update",
+                    "sampling_retry_epoch": sampling_retry_epoch,
+                    "worker_returncode": int(completed.returncode),
+                }
+                dump_json(generation_status_path, stale_status)
+                dump_json(shard / "generation_failure.json", stale_status)
+                prior_worker_status = _read_json(shard / "shard_status.json", {})
+                dump_json(shard / "shard_status.json", {
+                    **prior_worker_status,
+                    "scene_id": scene,
+                    "status": "failed",
+                    "error_type": "WorkerStartupError",
+                    "error": "worker_exited_without_status_update",
+                    "sampling_retry_epoch": sampling_retry_epoch,
+                    "worker_returncode": int(completed.returncode),
+                })
+            if watchdog_result.get("triggered"):
+                prior_generation_status = _read_json(
+                    shard / "generation_status.json", {}
                 )
-                dump_json(
-                    scene_shard_path(root, scene) / "timing.json",
-                    {"total_scene_worker_s": finished - started},
+                stalled_status = {
+                    **prior_generation_status,
+                    "status": "error",
+                    "stage": "failed",
+                    "error_type": "WorkerProgressStalled",
+                    "error": "worker_progress_stalled",
+                    "sampling_retry_epoch": sampling_retry_epoch,
+                    "progress_watchdog": watchdog_result,
+                }
+                dump_json(shard / "generation_status.json", stalled_status)
+                dump_json(shard / "generation_failure.json", stalled_status)
+                prior_worker_status = _read_json(
+                    shard / "shard_status.json", {}
                 )
-        worker_complete = bool(
-            completed.returncode == 0
-            and worker_status.get("status") == "complete"
-        )
+                dump_json(shard / "shard_status.json", {
+                    **prior_worker_status,
+                    "scene_id": scene,
+                    "status": "failed",
+                    "error_type": "WorkerProgressStalled",
+                    "error": "worker_progress_stalled",
+                    "sampling_retry_epoch": sampling_retry_epoch,
+                    "progress_watchdog": watchdog_result,
+                })
+                with log_path.open("a", encoding="utf-8") as log:
+                    log.write(
+                        "[mvwd-parent] progress watchdog terminated stalled "
+                        f"worker pid={watchdog_result.get('worker_pid')} "
+                        f"stage={watchdog_result.get('stalled_stage')} "
+                        f"stalled_s={watchdog_result.get('stalled_s', 0.0):.1f}\n"
+                    )
+            worker_status = _read_json(shard / "shard_status.json", {})
+            generation_status = _read_json(
+                shard / "generation_status.json", {}
+            )
+            # A previous epoch's complete marker cannot certify this launch.
+            # Fast shutdown may skip the shard marker, but its fresh generator
+            # terminal status can still be reconciled below.
+            if (
+                worker_status.get("status") == "complete"
+                and _file_signature(shard_status_path) == shard_status_signature_before
+            ):
+                worker_status = {**worker_status, "status": "running"}
+            # Isaac Sim's configured fast shutdown may terminate the interpreter
+            # from adapter.close() before run_scene_worker regains control.
+            if worker_status.get("status") not in {"complete", "failed"}:
+                terminal = generation_status.get("status")
+                if terminal in {"pass", "error"}:
+                    finished = time.time()
+                    generator_passed = terminal == "pass"
+                    expected_configurations = int(
+                        config["dataset"]["accepted_configurations_per_scene"]
+                    )
+                    expected_episodes = expected_configurations * int(
+                        config["dataset"]["accepted_episodes_per_configuration"]
+                    )
+                    accepted_configurations = int(
+                        generation_status.get("accepted_configurations", 0)
+                    )
+                    accepted_episodes = int(
+                        generation_status.get("accepted_episodes", 0)
+                    )
+                    complete_counts = bool(
+                        accepted_configurations == expected_configurations
+                        and accepted_episodes == expected_episodes
+                    )
+                    reconciled_complete = bool(
+                        completed.returncode == 0
+                        and generator_passed
+                        and complete_counts
+                    )
+                    worker_status = {
+                        **worker_status,
+                        "scene_id": scene,
+                        "status": (
+                            "complete" if reconciled_complete else "failed"
+                        ),
+                        "finished_unix_s": finished,
+                        "elapsed_s": finished - started,
+                        "accepted_configurations": accepted_configurations,
+                        "accepted_episodes": accepted_episodes,
+                        "sampling_retry_epoch": sampling_retry_epoch,
+                        "terminal_status_source": (
+                            "generation_status_parent_reconciliation"
+                        ),
+                    }
+                    if not reconciled_complete:
+                        worker_status.update({
+                            "error_type": str(generation_status.get(
+                                "error_type", "WorkerStatusError"
+                            )),
+                            "error": str(generation_status.get(
+                                "error",
+                                "generator terminal counts did not match the "
+                                "scene target",
+                            )),
+                        })
+                    dump_json(shard / "shard_status.json", worker_status)
+                    dump_json(
+                        shard / "timing.json",
+                        {"total_scene_worker_s": finished - started},
+                    )
+            worker_complete = bool(
+                completed.returncode == 0
+                and worker_status.get("status") == "complete"
+            )
+            restart_record = {
+                "sampling_retry_epoch": sampling_retry_epoch,
+                "returncode": int(completed.returncode),
+                "status": str(worker_status.get("status", "unknown")),
+                "error": generation_status.get("error"),
+                "accepted_configurations": int(
+                    generation_status.get("accepted_configurations", 0)
+                ),
+                "accepted_episodes": int(
+                    generation_status.get("accepted_episodes", 0)
+                ),
+                "elapsed_s": time.time() - epoch_started,
+            }
+            rejection_details = generation_status.get("rejection_details") or {}
+            failure_configuration_id = str(
+                rejection_details.get("configuration_id", "")
+            )
+            if (
+                rejection_details.get("scene_id") == scene
+                and re.fullmatch(r"config_[0-9]{3}", failure_configuration_id)
+            ):
+                metadata = _read_json(
+                    shard / "configurations" / scene
+                    / failure_configuration_id / "config_meta.json", {}
+                )
+                if "seed" in metadata:
+                    restart_record["failure_configuration_id"] = failure_configuration_id
+                    restart_record["failure_configuration_seed"] = int(metadata["seed"])
+            restart_history.append(restart_record)
+            if not worker_complete:
+                archived = _quarantine_exhausted_empty_configuration(
+                    shard, generation_status, restart_history,
+                    minimum_failed_epochs=empty_configuration_retry_limit,
+                    sampling_retry_epoch=sampling_retry_epoch,
+                )
+                if archived is not None:
+                    restart_record["quarantined_configuration"] = archived
+                    with log_path.open("a", encoding="utf-8") as log:
+                        log.write(
+                            "[mvwd-parent] archived exhausted empty configuration "
+                            f"scene={scene} path={archived}\n"
+                        )
+            source_changed = False
+            if not worker_complete:
+                current_fingerprint = _target_fingerprint(config, repository_root)
+                source_changed = current_fingerprint != manifest["configuration_fingerprint"]
+                if source_changed:
+                    restart_record["retry_blocked"] = "generator_source_changed_during_run"
+                    worker_status = {
+                        **worker_status,
+                        "retry_blocked": "generator_source_changed_during_run",
+                        "current_configuration_fingerprint": current_fingerprint,
+                    }
+                    dump_json(shard / "shard_status.json", worker_status)
+            dump_json(shard / "sampling_recovery.json", {
+                "scene_id": scene,
+                "maximum_scene_sampling_restarts": maximum_sampling_restarts,
+                "attempts": restart_history,
+                "complete": worker_complete,
+            })
+            if worker_complete:
+                break
+            if source_changed:
+                break
+            recoverable_error = generation_status.get("error")
+            if (recoverable_error == "configuration_snapshot_geometry_mismatch"
+                    and archived is None):
+                break
+            if (
+                recoverable_error not in _RECOVERABLE_SAMPLING_ERRORS
+                or sampling_retry_epoch >= initial_epoch + maximum_sampling_restarts
+            ):
+                break
+            with log_path.open("a", encoding="utf-8") as log:
+                log.write(
+                    "[mvwd-parent] recoverable sampling exhaustion; "
+                    f"retrying scene={scene} next_sampling_retry_epoch="
+                    f"{sampling_retry_epoch + 1}\n"
+                )
         status_error = None
         if completed.returncode == 0 and not worker_complete:
             status_error = (
@@ -410,28 +794,45 @@ def launch_scene_shards(
             "assigned_gpu": gpu,
             "log": str(log_path),
             "parent_elapsed_s": time.time() - started,
+            "sampling_retry_epoch": sampling_retry_epoch,
+            "sampling_restart_count": sampling_retry_epoch,
+            "sampling_recovery_history": restart_history,
             **({"parent_error": status_error} if status_error else {}),
         }
 
-    worker_count = min(max_workers, len(gpus), max(1, len(selected)))
-    if selected:
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = {
-                executor.submit(invoke, scene, str(gpus[index % len(gpus)])): scene
-                for index, scene in enumerate(selected)
-            }
-            for future in as_completed(futures):
-                scene = futures[future]
-                try:
-                    states[scene] = future.result()
-                except BaseException as error:
-                    states[scene] = {
-                        "scene_id": scene,
-                        "status": "failed",
-                        "error_type": type(error).__name__,
-                        "error": str(error),
-                    }
+    state_lock = Lock()
+
+    def run_gpu_queue(gpu: str, scenes: Sequence[str]) -> None:
+        for scene in scenes:
+            with state_lock:
+                states[scene] = {"status": "running", "assigned_gpu": gpu}
                 dump_json(root / "production_status.json", {**status, "scenes": states})
+            try:
+                scene_result = invoke(scene, gpu)
+            except BaseException as error:
+                scene_result = {
+                    "scene_id": scene,
+                    "status": "failed",
+                    "assigned_gpu": gpu,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }
+            with state_lock:
+                states[scene] = scene_result
+                dump_json(root / "production_status.json", {**status, "scenes": states})
+
+    if selected:
+        queues = {
+            gpu: selected[index::worker_count]
+            for index, gpu in enumerate(active_gpus)
+        }
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(run_gpu_queue, gpu, scenes)
+                for gpu, scenes in queues.items()
+            ]
+            for future in as_completed(futures):
+                future.result()
     failed = sorted(scene for scene, record in states.items() if record["status"] == "failed")
     pending = sorted(scene for scene in manifest["selected_scenes"] if states[scene]["status"] != "complete")
     result = {
@@ -446,6 +847,25 @@ def launch_scene_shards(
     }
     dump_json(root / "production_status.json", result)
     return root, result
+
+
+def launch_scene_shards(
+    runtime: RuntimePaths,
+    config: dict[str, Any],
+    config_path: str | Path,
+    *,
+    gpus: Sequence[str],
+    max_workers: int,
+    allow_large: bool,
+    retry_failed: bool = False,
+) -> tuple[Path, dict[str, Any]]:
+    root = runtime.require_output()
+    with _exclusive_production_root(root):
+        return _launch_scene_shards_unlocked(
+            runtime, config, config_path,
+            gpus=gpus, max_workers=max_workers,
+            allow_large=allow_large, retry_failed=retry_failed,
+        )
 
 
 def merge_taxonomies(taxonomies: Sequence[Mapping[str, Any]]) -> dict[str, Any]:

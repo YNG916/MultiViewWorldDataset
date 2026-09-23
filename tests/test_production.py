@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import time
 from collections import Counter
 from pathlib import Path
+from threading import Lock
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +14,7 @@ from multi_view_world_dataset.errors import ConfigurationError, SampleRejected
 from multi_view_world_dataset.generator import (
     _adaptive_exact_validation,
     _candidate_accounting,
+    _configuration_navigation_seed,
     _gt_rescue_candidates,
     _gt_valid_candidate_soft_score,
     _temporal_overlap_preflight,
@@ -20,6 +23,8 @@ import multi_view_world_dataset.pilot_report as pilot_report_module
 import multi_view_world_dataset.production as production_module
 from multi_view_world_dataset.pilot_report import generate_pilot_report
 from multi_view_world_dataset.production import (
+    _exclusive_production_root,
+    _quarantine_exhausted_empty_configuration,
     _should_launch_scene,
     finalize_dataset,
     initialize_production_root,
@@ -27,7 +32,7 @@ from multi_view_world_dataset.production import (
     merge_taxonomies,
     scene_shard_path,
 )
-from multi_view_world_dataset.sampling.diversity import temporal_overlap_acceptance
+from multi_view_world_dataset.sampling.diversity import stable_seed, temporal_overlap_acceptance
 from multi_view_world_dataset.sampling.splits import assign_scene_family_splits
 from multi_view_world_dataset.scene_eligibility import (
     load_scene_eligibility,
@@ -38,6 +43,7 @@ from multi_view_world_dataset.storage.writer import DatasetWriter
 from multi_view_world_dataset.utils.config import load_yaml_config
 from multi_view_world_dataset.utils.runtime import RuntimePaths
 from multi_view_world_dataset.utils.serialization import dump_json
+import multi_view_world_dataset.utils.serialization as serialization_module
 
 
 def _overlap(frames):
@@ -597,6 +603,10 @@ def test_parent_launcher_is_only_global_status_writer_and_records_worker_result(
         dump_json(scene_shard_path(runtime.output_root, scene) / "shard_status.json", {
             "scene_id": scene, "status": "complete", "accepted_episodes": 15,
         })
+        dump_json(scene_shard_path(runtime.output_root, scene) / "generation_status.json", {
+            "status": "pass", "accepted_configurations": 5,
+            "accepted_episodes": 15,
+        })
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(production_module.subprocess, "run", fake_run)
@@ -609,6 +619,102 @@ def test_parent_launcher_is_only_global_status_writer_and_records_worker_result(
     status = json.loads((runtime.output_root / "production_status.json").read_text())
     assert status["scenes"]["Beechwood_0_int"]["assigned_gpu"] == "7"
     assert status["full_production_started"] is False
+
+
+def test_launcher_does_not_retry_worker_that_wrote_no_new_status(tmp_path, monkeypatch):
+    config = load_yaml_config("configs/integration_final.yaml")
+    config["generation"]["maximum_scene_sampling_restarts"] = 3
+    runtime = RuntimePaths(tmp_path / "behavior", tmp_path / "dataset", tmp_path / "cache")
+    shard = scene_shard_path(runtime.output_root, "Beechwood_0_int")
+    dump_json(shard / "generation_status.json", {
+        "status": "error", "error": "worker_progress_stalled",
+        "accepted_episodes": 19,
+    })
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(production_module.subprocess, "run", fake_run)
+    _, result = launch_scene_shards(
+        runtime, config, "configs/integration_final.yaml",
+        gpus=("7",), max_workers=1, allow_large=False,
+    )
+    assert result["status"] == "error"
+    assert len(calls) == 1
+    status = json.loads((shard / "generation_status.json").read_text())
+    assert status["error"] == "worker_exited_without_status_update"
+    assert len(json.loads((shard / "sampling_recovery.json").read_text())["attempts"]) == 1
+
+
+def test_parent_refuses_stale_complete_marker_after_worker_exits(tmp_path, monkeypatch):
+    config = load_yaml_config("configs/integration_final.yaml")
+    config["generation"]["maximum_scene_sampling_restarts"] = 0
+    runtime = RuntimePaths(tmp_path / "behavior", tmp_path / "dataset", tmp_path / "cache")
+    shard = scene_shard_path(runtime.output_root, "Beechwood_0_int")
+    dump_json(shard / "shard_status.json", {
+        "status": "complete", "accepted_configurations": 5, "accepted_episodes": 15,
+    })
+    dump_json(shard / "generation_status.json", {
+        "status": "pass", "accepted_configurations": 5, "accepted_episodes": 15,
+    })
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(production_module.subprocess, "run", fake_run)
+    _, result = launch_scene_shards(
+        runtime, config, "configs/integration_final.yaml",
+        gpus=("7",), max_workers=1, allow_large=False,
+    )
+    assert len(calls) == 1
+    assert result["status"] == "error"
+    assert json.loads((shard / "shard_status.json").read_text())["status"] == "failed"
+    assert json.loads((shard / "generation_status.json").read_text())["error"] == (
+        "worker_exited_without_status_update"
+    )
+
+
+def test_launcher_stops_retry_when_generator_source_changes(tmp_path, monkeypatch):
+    config = load_yaml_config("configs/integration_final.yaml")
+    config["generation"]["maximum_scene_sampling_restarts"] = 3
+    runtime = RuntimePaths(tmp_path / "behavior", tmp_path / "dataset", tmp_path / "cache")
+    shard = scene_shard_path(runtime.output_root, "Beechwood_0_int")
+    original_fingerprint = production_module._target_fingerprint
+    source_changed = {"value": False}
+
+    def fingerprint(*args, **kwargs):
+        if source_changed["value"]:
+            return "changed-source-fingerprint"
+        return original_fingerprint(*args, **kwargs)
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        dump_json(shard / "shard_status.json", {
+            "status": "failed", "error": "episode_before_attempts_exhausted",
+        })
+        dump_json(shard / "generation_status.json", {
+            "status": "error", "error": "episode_before_attempts_exhausted",
+        })
+        source_changed["value"] = True
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(production_module, "_target_fingerprint", fingerprint)
+    monkeypatch.setattr(production_module.subprocess, "run", fake_run)
+    _, result = launch_scene_shards(
+        runtime, config, "configs/integration_final.yaml",
+        gpus=("7",), max_workers=1, allow_large=False,
+    )
+    assert result["status"] == "error"
+    assert len(calls) == 1
+    scene = result["scenes"]["Beechwood_0_int"]
+    assert scene["retry_blocked"] == "generator_source_changed_during_run"
+    assert len(scene["sampling_recovery_history"]) == 1
 
 
 def test_scene_worker_turns_generator_error_result_into_failed_shard(
@@ -660,6 +766,7 @@ def test_parent_refuses_zero_exit_without_complete_shard_status(tmp_path, monkey
 
 def test_parent_reconciles_fast_shutdown_generator_failure(tmp_path, monkeypatch):
     config = load_yaml_config("configs/integration_final.yaml")
+    config["generation"]["maximum_scene_sampling_restarts"] = 0
     runtime = RuntimePaths(tmp_path / "behavior", tmp_path / "dataset", tmp_path / "cache")
 
     def fake_run(command, **kwargs):
@@ -696,6 +803,312 @@ def test_parent_reconciles_fast_shutdown_generator_failure(tmp_path, monkeypatch
         "generation_status_parent_reconciliation"
     )
     assert shard_status["error"] == "episode_before_attempts_exhausted"
+
+
+def test_parent_automatically_recovers_sampling_exhaustion(tmp_path, monkeypatch):
+    config = load_yaml_config("configs/integration_final.yaml")
+    config["generation"]["maximum_scene_sampling_restarts"] = 2
+    runtime = RuntimePaths(
+        tmp_path / "behavior", tmp_path / "dataset", tmp_path / "cache"
+    )
+    observed_epochs = []
+
+    def fake_run(command, **kwargs):
+        scene = command[command.index("--scene") + 1]
+        epoch = int(command[command.index("--sampling-retry-epoch") + 1])
+        observed_epochs.append(epoch)
+        shard = scene_shard_path(runtime.output_root, scene)
+        if epoch == 0:
+            dump_json(shard / "shard_status.json", {
+                "scene_id": scene,
+                "status": "running",
+            })
+            dump_json(shard / "generation_status.json", {
+                "status": "error",
+                "error_type": "SampleRejected",
+                "error": "episode_before_attempts_exhausted",
+                "accepted_configurations": 1,
+                "accepted_episodes": 1,
+                "sampling_retry_epoch": epoch,
+            })
+        else:
+            dump_json(shard / "shard_status.json", {
+                "scene_id": scene,
+                "status": "complete",
+                "accepted_configurations": 5,
+                "accepted_episodes": 15,
+                "sampling_retry_epoch": epoch,
+            })
+            dump_json(shard / "generation_status.json", {
+                "status": "pass",
+                "accepted_configurations": 5,
+                "accepted_episodes": 15,
+                "sampling_retry_epoch": epoch,
+            })
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(production_module.subprocess, "run", fake_run)
+    _, result = launch_scene_shards(
+        runtime,
+        config,
+        "configs/integration_final.yaml",
+        gpus=("7",),
+        max_workers=1,
+        allow_large=False,
+    )
+
+    assert result["status"] == "pass"
+    assert observed_epochs == [0, 1]
+    scene_result = result["scenes"]["Beechwood_0_int"]
+    assert scene_result["sampling_restart_count"] == 1
+    assert [
+        item["error"] for item in scene_result["sampling_recovery_history"]
+    ] == ["episode_before_attempts_exhausted", None]
+    recovery = json.loads(
+        (scene_shard_path(runtime.output_root, "Beechwood_0_int")
+         / "sampling_recovery.json").read_text()
+    )
+    assert recovery["complete"] is True
+    assert len(recovery["attempts"]) == 2
+
+
+def test_configuration_navigation_seed_survives_resume():
+    saved_configuration = {"seed": 4114367871, "accepted_attempt": 3}
+    assert _configuration_navigation_seed(saved_configuration) == stable_seed(
+        saved_configuration["seed"], "configuration-navigation-context"
+    )
+
+
+def test_retry_failed_continues_after_persisted_epoch(tmp_path, monkeypatch):
+    config = load_yaml_config("configs/integration_final.yaml")
+    config["generation"]["maximum_scene_sampling_restarts"] = 0
+    runtime = RuntimePaths(tmp_path / "behavior", tmp_path / "dataset", tmp_path / "cache")
+    initialize_production_root(runtime.output_root, config, Path(__file__).resolve().parents[1])
+    shard = scene_shard_path(runtime.output_root, "Beechwood_0_int")
+    dump_json(shard / "shard_status.json", {"status": "failed"})
+    dump_json(shard / "sampling_recovery.json", {
+        "attempts": [{"sampling_retry_epoch": 3, "status": "failed"}],
+    })
+    observed_epochs = []
+
+    def fake_run(command, **kwargs):
+        epoch = int(command[command.index("--sampling-retry-epoch") + 1])
+        observed_epochs.append(epoch)
+        dump_json(shard / "shard_status.json", {
+            "status": "complete", "accepted_configurations": 5,
+            "accepted_episodes": 15,
+        })
+        dump_json(shard / "generation_status.json", {
+            "status": "pass", "accepted_configurations": 5,
+            "accepted_episodes": 15,
+        })
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(production_module.subprocess, "run", fake_run)
+    _, result = launch_scene_shards(
+        runtime, config, "configs/integration_final.yaml",
+        gpus=("7",), max_workers=1, allow_large=False, retry_failed=True,
+    )
+    assert result["status"] == "pass"
+    assert observed_epochs == [4]
+    assert [item["sampling_retry_epoch"] for item in json.loads(
+        (shard / "sampling_recovery.json").read_text()
+    )["attempts"]] == [3, 4]
+
+
+def test_scene_workers_are_serial_on_each_gpu(tmp_path, monkeypatch):
+    config = load_yaml_config("configs/integration_final.yaml")
+    config["production"]["selected_scenes"] = [
+        "Beechwood_0_int", "Beechwood_1_int", "Rs_int",
+    ]
+    runtime = RuntimePaths(tmp_path / "behavior", tmp_path / "dataset", tmp_path / "cache")
+    lock = Lock()
+    active = {"0": 0, "1": 0}
+    maximum_active = {"0": 0, "1": 0}
+    assignments = {}
+
+    def fake_run(command, **kwargs):
+        scene = command[command.index("--scene") + 1]
+        gpu = kwargs["env"]["OMNIGIBSON_GPU_ID"]
+        with lock:
+            active[gpu] += 1
+            maximum_active[gpu] = max(maximum_active[gpu], active[gpu])
+            assignments[scene] = gpu
+        time.sleep(0.02)
+        shard = scene_shard_path(runtime.output_root, scene)
+        dump_json(shard / "shard_status.json", {
+            "status": "complete", "accepted_configurations": 5,
+            "accepted_episodes": 15,
+        })
+        dump_json(shard / "generation_status.json", {
+            "status": "pass", "accepted_configurations": 5,
+            "accepted_episodes": 15,
+        })
+        with lock:
+            active[gpu] -= 1
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(production_module.subprocess, "run", fake_run)
+    _, result = launch_scene_shards(
+        runtime, config, "configs/integration_final.yaml",
+        gpus=("0", "1"), max_workers=2, allow_large=False,
+    )
+    assert result["status"] == "pass"
+    assert maximum_active == {"0": 1, "1": 1}
+    assert assignments == {
+        "Beechwood_0_int": "0", "Beechwood_1_int": "1", "Rs_int": "0",
+    }
+
+
+def test_atomic_json_replace_failure_preserves_previous_status(tmp_path, monkeypatch):
+    status_path = tmp_path / "generation_status.json"
+    dump_json(status_path, {"accepted_episodes": 6})
+
+    def interrupted_replace(source, target):
+        raise OSError("interrupted before commit")
+
+    monkeypatch.setattr(serialization_module.os, "replace", interrupted_replace)
+    with pytest.raises(OSError, match="interrupted before commit"):
+        dump_json(status_path, {"accepted_episodes": 7})
+    assert json.loads(status_path.read_text()) == {"accepted_episodes": 6}
+    assert not list(tmp_path.glob(".generation_status.json.*.tmp"))
+
+
+def test_production_root_rejects_concurrent_launcher(tmp_path):
+    root = tmp_path / "dataset"
+    with _exclusive_production_root(root):
+        with pytest.raises(ConfigurationError, match="already using"):
+            with _exclusive_production_root(root):
+                pass
+
+
+def test_empty_configuration_is_archived_only_after_repeated_failure(tmp_path):
+    shard = tmp_path / "shards" / "Rs_int"
+    configuration = shard / "configurations" / "Rs_int" / "config_002"
+    dump_json(configuration / "config_meta.json", {"seed": 4114367871})
+    (configuration / "simulator_state.npy").write_bytes(b"saved snapshot")
+    failure = {
+        "error": "episode_before_attempts_exhausted",
+        "rejection_details": {
+            "scene_id": "Rs_int", "configuration_id": "config_002",
+            "episode_id": "episode_000",
+        },
+    }
+    attempts = [
+        {
+            "error": "episode_before_attempts_exhausted",
+            "failure_configuration_id": "config_002",
+            "failure_configuration_seed": 4114367871,
+        }
+        for _ in range(2)
+    ]
+    assert _quarantine_exhausted_empty_configuration(
+        shard, failure, attempts[:1], minimum_failed_epochs=2,
+        sampling_retry_epoch=0,
+    ) is None
+    assert configuration.is_dir()
+
+    archive = _quarantine_exhausted_empty_configuration(
+        shard, failure, attempts, minimum_failed_epochs=2,
+        sampling_retry_epoch=1,
+    )
+    assert archive is not None
+    assert not configuration.exists()
+    assert (shard / archive / "simulator_state.npy").read_bytes() == b"saved snapshot"
+    assert json.loads((shard / archive / "sampling_quarantine.json").read_text())[
+        "failed_epochs"
+    ] == 2
+
+
+def test_geometry_mismatch_archives_only_episode_free_configuration(tmp_path):
+    shard = tmp_path / "shards" / "Rs_int"
+    configuration = shard / "configurations" / "Rs_int" / "config_002"
+    dump_json(configuration / "config_meta.json", {"seed": 42})
+    (configuration / "simulator_state.npy").write_bytes(b"saved snapshot")
+    failure = {
+        "error": "configuration_snapshot_geometry_mismatch",
+        "rejection_details": {
+            "scene_id": "Rs_int", "configuration_id": "config_002",
+        },
+    }
+    attempts = [{
+        "error": failure["error"],
+        "failure_configuration_id": "config_002",
+        "failure_configuration_seed": 42,
+    }]
+    archive = _quarantine_exhausted_empty_configuration(
+        shard, failure, attempts, minimum_failed_epochs=2,
+        sampling_retry_epoch=0,
+    )
+    assert archive is not None
+    assert (shard / archive / "simulator_state.npy").read_bytes() == b"saved snapshot"
+    assert not configuration.exists()
+
+
+def test_configuration_with_completed_episode_is_never_archived(tmp_path):
+    shard = tmp_path / "shards" / "Rs_int"
+    configuration = shard / "configurations" / "Rs_int" / "config_002"
+    dump_json(configuration / "config_meta.json", {"seed": 42})
+    episode = shard / "episodes" / "Rs_int" / "config_002" / "episode_000"
+    dump_json(episode / "meta.json", {"episode_id": "episode_000"})
+    failure = {
+        "error": "episode_before_attempts_exhausted",
+        "rejection_details": {
+            "scene_id": "Rs_int", "configuration_id": "config_002",
+        },
+    }
+    attempts = [{
+        "error": failure["error"],
+        "failure_configuration_id": "config_002",
+        "failure_configuration_seed": 42,
+    }]
+    assert _quarantine_exhausted_empty_configuration(
+        shard, failure, attempts, minimum_failed_epochs=1,
+        sampling_retry_epoch=0,
+    ) is None
+    assert configuration.is_dir()
+    assert (episode / "meta.json").is_file()
+    failure["error"] = "configuration_snapshot_geometry_mismatch"
+    attempts[0]["error"] = failure["error"]
+    assert _quarantine_exhausted_empty_configuration(
+        shard, failure, attempts, minimum_failed_epochs=2,
+        sampling_retry_epoch=1,
+    ) is None
+    assert configuration.is_dir()
+
+
+def test_progress_watchdog_terminates_stalled_running_worker(
+    tmp_path, monkeypatch,
+):
+    shard = tmp_path / "shard"
+    dump_json(shard / "generation_status.json", {
+        "status": "running",
+        "stage": "sample_episode_intervention",
+        "configuration_id": "config_002",
+        "episode_id": "episode_001",
+        "attempt": 0,
+    })
+    dump_json(shard / "shard_status.json", {
+        "status": "running",
+        "worker_pid": 424242,
+    })
+    killed = []
+    monkeypatch.setattr(production_module.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    result = {}
+
+    production_module._watch_worker_progress(
+        shard,
+        production_module.Event(),
+        result,
+        stall_timeout_s=0.005,
+        poll_interval_s=0.001,
+    )
+
+    assert killed == [(424242, 15)]
+    assert result["triggered"] is True
+    assert result["stalled_stage"] == "sample_episode_intervention"
+    assert result["stalled_configuration_id"] == "config_002"
+    assert result["stalled_episode_id"] == "episode_001"
 
 
 def test_pilot_report_projects_full_scale_and_explicitly_stops(tmp_path, monkeypatch):

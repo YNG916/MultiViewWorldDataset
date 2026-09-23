@@ -31,6 +31,45 @@ def test_native_relation_attempt_budget_must_be_positive():
         validate_config(config)
 
 
+def test_episode_sampling_rounds_must_be_positive():
+    config = load_yaml_config(REPOSITORY / "configs" / "smoke.yaml")
+    config["generation"]["maximum_episode_sampling_rounds"] = 0
+    with pytest.raises(ConfigurationError, match="maximum_episode_sampling_rounds"):
+        validate_config(config)
+
+
+def test_scene_sampling_restarts_must_be_non_negative():
+    config = load_yaml_config(REPOSITORY / "configs" / "smoke.yaml")
+    config["generation"]["maximum_scene_sampling_restarts"] = -1
+    with pytest.raises(ConfigurationError, match="maximum_scene_sampling_restarts"):
+        validate_config(config)
+
+
+def test_worker_progress_poll_must_be_shorter_than_stall_timeout():
+    config = load_yaml_config(REPOSITORY / "configs" / "smoke.yaml")
+    config["generation"]["worker_progress_stall_timeout_s"] = 10
+    config["generation"]["worker_progress_poll_interval_s"] = 10
+    with pytest.raises(ConfigurationError, match="poll_interval_s"):
+        validate_config(config)
+
+
+def test_post_render_effect_requires_per_intervention_thresholds():
+    config = load_yaml_config(REPOSITORY / "configs" / "smoke.yaml")
+    config["intervention"]["post_render_effect"]["minimum_mean_rgb_delta"] = 3.0
+    with pytest.raises(ConfigurationError, match="minimum_mean_rgb_delta"):
+        validate_config(config)
+
+
+def test_minimum_gt_valid_candidates_before_rescue_is_bounded():
+    config = load_yaml_config(REPOSITORY / "configs" / "smoke.yaml")
+    config["trajectory"]["minimum_gt_valid_candidates_before_rescue"] = 0
+    with pytest.raises(
+        ConfigurationError,
+        match="minimum_gt_valid_candidates_before_rescue",
+    ):
+        validate_config(config)
+
+
 def test_navigation_route_bank_minimum_is_deprecated_diagnostic_only():
     config = load_yaml_config(REPOSITORY / "configs" / "smoke.yaml")
     config["navigation"]["route_bank_minimum_size"] = (

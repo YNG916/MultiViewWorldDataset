@@ -3,6 +3,8 @@ from __future__ import annotations
 import dataclasses
 import enum
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +33,19 @@ def to_jsonable(value: Any) -> Any:
 
 def dump_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as stream:
-        json.dump(to_jsonable(value), stream, indent=2, sort_keys=True, allow_nan=False)
-        stream.write("\n")
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            json.dump(to_jsonable(value), stream, indent=2, sort_keys=True, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 

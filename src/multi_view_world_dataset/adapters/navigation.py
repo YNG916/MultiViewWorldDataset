@@ -28,6 +28,7 @@ from multi_view_world_dataset.sampling.navigation import (
 from multi_view_world_dataset.sampling.se2 import (
     SE2GridPlan,
     plan_se2_waypoints,
+    sample_reachable_waypoint_cells,
     se2_plan_is_safe,
 )
 from multi_view_world_dataset.sampling.trajectories import (
@@ -191,6 +192,7 @@ def _se2_route_candidate(
     floor_z: float,
     camera_mount: np.ndarray,
     path_family: str,
+    reject_counts: Counter[str] | None = None,
 ) -> tuple[Trajectory, SE2GridPlan] | None:
     """Plan and time-parameterize all control segments in true SE(2)."""
     navigation = adapter.config["navigation"]
@@ -208,7 +210,13 @@ def _se2_route_candidate(
         yaw_freedom_penalty=float(navigation["yaw_freedom_ranking_weight"]),
         maximum_expansions=int(navigation["se2_maximum_expansions"]),
     )
-    if plan is None or not se2_plan_is_safe(plan, safe_masks):
+    if plan is None:
+        if reject_counts is not None:
+            reject_counts["se2_plan_missing"] += 1
+        return None
+    if not se2_plan_is_safe(plan, safe_masks):
+        if reject_counts is not None:
+            reject_counts["se2_plan_unsafe"] += 1
         return None
     state_pixels = np.asarray(
         [[state.row, state.column] for state in plan.states], dtype=np.int64
@@ -254,6 +262,8 @@ def _se2_route_candidate(
             },
         )
     except ValueError:
+        if reject_counts is not None:
+            reject_counts["se2_time_parameterization"] += 1
         return None
     # Revalidate every physical output frame against its exact orientation bin.
     frame_cells = _map_points(adapter, trajectory.base_to_world[:, :2, 3])
@@ -271,6 +281,8 @@ def _se2_route_candidate(
     if not np.all(inside) or not np.all(
         safe_masks[bins, frame_cells[:, 0], frame_cells[:, 1]]
     ):
+        if reject_counts is not None:
+            reject_counts["se2_output_frame_unsafe"] += 1
         return None
     return trajectory, plan
 
@@ -809,6 +821,14 @@ def _build_floor_context(
     families, family_probabilities = _normalised_family_distribution(
         trajectory_config["path_family_weights"]
     )
+    family_segment_counts = {
+        "direct": 1,
+        "one_waypoint": 2,
+        "two_waypoint": 3,
+    }
+    heading_steps, forward_enabled = _calibrated_heading_primitives(
+        adapter, len(safe_masks)
+    )
     for raw_attempt in range(maximum_attempts):
         if len(routes) >= target_size:
             break
@@ -908,19 +928,45 @@ def _build_floor_context(
             )
         for _ in range(attempts_per_raw):
             family = str(route_rng.choice(families, p=family_probabilities))
-            controls = _sample_route_controls(
-                start_xy,
-                preferred_heading,
-                candidates,
-                family,
-                float(trajectory_config["path_length_min_m"]),
-                float(trajectory_config["path_length_max_m"]),
-                np.pi,
-                np.deg2rad(float(trajectory_config["maximum_control_turn_deg"])),
-                route_rng,
-                soft_initial_heading=True,
-                initial_heading_probability_floor=heading_probability_floor,
+            control_cells = sample_reachable_waypoint_cells(
+                safe_masks,
+                start_pixel,
+                segment_count=family_segment_counts[family],
+                minimum_length_m=float(trajectory_config["path_length_min_m"]),
+                maximum_length_m=float(trajectory_config["path_length_max_m"]),
+                map_resolution_m=float(trav_map.map_resolution),
+                maximum_turn_rad=np.deg2rad(
+                    float(trajectory_config["maximum_control_turn_deg"])
+                ),
+                rng=route_rng,
+                heading_steps=heading_steps,
+                forward_enabled_by_yaw=forward_enabled,
             )
+            if control_cells is None:
+                reject_counts["se2_reachable_control_unavailable"] += 1
+                controls = _sample_route_controls(
+                    start_xy,
+                    preferred_heading,
+                    candidates,
+                    family,
+                    float(trajectory_config["path_length_min_m"]),
+                    float(trajectory_config["path_length_max_m"]),
+                    np.pi,
+                    np.deg2rad(
+                        float(trajectory_config["maximum_control_turn_deg"])
+                    ),
+                    route_rng,
+                    soft_initial_heading=True,
+                    initial_heading_probability_floor=heading_probability_floor,
+                )
+            else:
+                controls = adapter._native_value(
+                    trav_map.map_to_world(
+                        adapter._th.as_tensor(
+                            control_cells, dtype=adapter._th.int64
+                        )
+                    )
+                ).astype(np.float64)
             if controls is None:
                 reject_counts["se2_no_control_candidates"] += 1
                 continue
@@ -932,9 +978,9 @@ def _build_floor_context(
                 floor_z=floor_z,
                 camera_mount=np.eye(4, dtype=np.float64),
                 path_family=family,
+                reject_counts=reject_counts,
             )
             if result is None:
-                reject_counts["se2_plan_or_time_parameterization"] += 1
                 continue
             candidate, _ = result
             arc_length = float(candidate.metadata["smoothed_arc_length_m"])
@@ -1067,6 +1113,9 @@ def build_navigation_contexts(
     contexts: dict[int, NavigationContext] = {}
     failures: dict[int, dict[str, Any]] = {}
     route_count_target = int(adapter.config["navigation"]["route_bank_target_size"])
+    route_count_minimum = int(
+        adapter.config["navigation"]["route_bank_minimum_size"]
+    )
     for floor_index in range(int(adapter._require_scene().n_floors)):
         try:
             context = _build_floor_context(
@@ -1079,6 +1128,35 @@ def build_navigation_contexts(
             context.diagnostics["route_count_target_met"] = bool(
                 len(context.route_bank) >= route_count_target
             )
+            context.diagnostics["route_count_minimum"] = route_count_minimum
+            context.diagnostics["route_count_minimum_met"] = bool(
+                len(context.route_bank) >= route_count_minimum
+            )
+            if len(context.route_bank) < route_count_minimum:
+                raise SampleRejected(
+                    "navigation_route_bank_below_minimum",
+                    {
+                        "floor_index": floor_index,
+                        "route_count": len(context.route_bank),
+                        "route_count_minimum": route_count_minimum,
+                        "route_count_target": route_count_target,
+                        "raw_route_attempts": context.diagnostics.get(
+                            "raw_route_attempts"
+                        ),
+                        "route_acceptance_rate": context.diagnostics.get(
+                            "route_acceptance_rate"
+                        ),
+                        "route_reject_counts": context.diagnostics.get(
+                            "route_reject_counts", {}
+                        ),
+                        "footprint_safe_cell_count": context.diagnostics.get(
+                            "footprint_safe_cell_count"
+                        ),
+                        "start_region_distribution": context.diagnostics.get(
+                            "start_region_distribution", {}
+                        ),
+                    },
+                )
             probe = select_joint_route_candidates(
                 context.route_bank,
                 context.compatibility,

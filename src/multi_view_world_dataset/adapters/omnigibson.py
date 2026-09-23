@@ -757,6 +757,24 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 }
         return mapped
 
+    def refresh_collision_geometry_cache(self) -> None:
+        """Rebuild local collision hulls after scene or furniture state changes.
+
+        OmniGibson caches each rigid link's local hull on first access. A hull
+        first read while Fabric is being initialized can otherwise survive
+        subsequent snapshot restores and yield a different AABB in a fresh
+        process even when the object's root pose and scale are identical.
+        Robot collision hulls are authored differently and must retain their
+        initialized cache (some meshes do not expose xformOp:scale).
+        """
+        scene = self._require_scene()
+        robot_paths = {str(robot.prim_path) for robot in self._env.robots}
+        for obj in scene.objects:
+            if str(obj.prim_path) in robot_paths:
+                continue
+            for link in getattr(obj, "links", {}).values():
+                vars(link).pop("collision_boundary_points_local", None)
+
     def object_catalog(self) -> tuple[ObjectState, ...]:
         scene = self._require_scene()
         floor_heights = np.asarray(self._floor_heights())
@@ -1082,6 +1100,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         accepted_snapshot = self.dump_snapshot()
         catalog = self.object_catalog_with_relations()
         self.load_snapshot(accepted_snapshot)
+        self.refresh_collision_geometry_cache()
         restored = self.object_catalog_with_relations()
         restored_native = self._native_objects_by_path()
         relations_preserved = all(

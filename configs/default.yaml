@@ -84,10 +84,15 @@ navigation:
   se2_rotation_cost_cells: 0.12
   se2_maximum_expansions: 250000
   route_bank_target_size: 64
-  # Deprecated diagnostic target; floor feasibility is based on a valid
-  # compatible 3-route combination, not a universal bank-size threshold.
+  # Production floor feasibility requires both this minimum RouteBank size
+  # and at least one compatible three-route combination.
   route_bank_minimum_size: 24
-  route_bank_max_raw_attempts: 1500
+  # Constrained scenes have a low valid SE(2)-route yield. Keep a larger
+  # configuration-level budget so they can satisfy the production minimum
+  # RouteBank size instead of repeatedly resampling otherwise-valid furniture
+  # configurations. The loop still exits as soon as target_size is reached,
+  # so healthy scenes do not pay the full budget.
+  route_bank_max_raw_attempts: 6000
   route_candidate_attempts_per_raw: 10
   # Once a region produces one valid route, preferentially complete a
   # three-route local view cohort before returning to broad scene coverage.
@@ -164,6 +169,10 @@ trajectory:
   maximum_joint_valid_candidates: 128
   trajectory_sets_per_placement: 8
   maximum_complementary_hybrid_candidates: 2
+  # A very small GT-valid shortlist is brittle: all candidates can fail the
+  # full 60-frame physics rollout before route-mutation rescue is considered.
+  # Fill the shortlist to this size without relaxing any GT or physics gate.
+  minimum_gt_valid_candidates_before_rescue: 4
   # Preserve a measured edge and mutate only the currently isolated robot's
   # native RouteBank route. A second bounded round may use the first round's
   # exact-GT isolation feedback; no overlap threshold is changed.
@@ -257,7 +266,12 @@ intervention:
     preferred_robots: 2
   post_render_effect:
     minimum_changed_pixels: 32
-    minimum_mean_rgb_delta: 3.0
+    # Boolean simulator states can be semantically valid yet produce subtler
+    # material/light changes than rigid motion or articulation silhouettes.
+    minimum_mean_rgb_delta:
+      rigid_relocation: 3.0
+      articulation: 3.0
+      state_change: 0.5
     maximum_resample_attempts: 8
 
 sampling_diagnostics:
@@ -285,7 +299,22 @@ generation:
   native_relation_high_level_attempts: 10
   native_relation_low_level_attempts: 10
   snapshot_restore_tolerance: 1.0e-5
+  configuration_geometry_aabb_tolerance_m: 1.0e-3
   maximum_configuration_attempts: 1000
+  # A single unlucky route/visibility or intervention batch must not abort a
+  # scene. Each round gets new deterministic seeds while retaining exact QA.
+  maximum_episode_sampling_rounds: 3
+  # Recoverable sampling exhaustion restarts the isolated scene worker with a
+  # new deterministic epoch. Completed episodes remain atomic and are skipped.
+  maximum_scene_sampling_restarts: 8
+  # A configuration with no finalized episodes is archived after this many
+  # exhausted worker epochs, then its slot is sampled anew.
+  maximum_empty_configuration_sampling_restarts: 2
+  # The production parent watches atomic generation_status updates. A live
+  # worker that makes no stage/attempt progress for this long is restarted as
+  # a recoverable sampling epoch instead of occupying a GPU indefinitely.
+  worker_progress_stall_timeout_s: 1800
+  worker_progress_poll_interval_s: 10
   exact_hash_decimals: 8
   near_duplicate_translation_m: 0.03
   near_duplicate_rotation_deg: 3.0

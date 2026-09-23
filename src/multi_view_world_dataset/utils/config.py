@@ -82,6 +82,26 @@ def validate_config(config: dict[str, Any]) -> None:
         errors.append("Intervention type weights must sum to 1")
     if intervention.get("application_mode") != "pre_rollout":
         errors.append("Dataset v1 only supports pre_rollout interventions")
+    post_render_effect = intervention.get("post_render_effect", {})
+    mean_rgb_thresholds = post_render_effect.get("minimum_mean_rgb_delta")
+    intervention_type_names = {
+        "rigid_relocation", "articulation", "state_change",
+    }
+    if (
+        not isinstance(mean_rgb_thresholds, dict)
+        or set(mean_rgb_thresholds) != intervention_type_names
+        or any(
+            not isinstance(value, (int, float))
+            or not isfinite(float(value))
+            or float(value) < 0.0
+            for value in mean_rgb_thresholds.values()
+        )
+    ):
+        errors.append(
+            "intervention.post_render_effect.minimum_mean_rgb_delta must "
+            "define finite non-negative thresholds for rigid_relocation, "
+            "articulation, and state_change"
+        )
     configuration_sampling = config.get("configuration_sampling", {})
     minimum_changed = configuration_sampling.get("minimum_changed_objects")
     maximum_changed = configuration_sampling.get("maximum_changed_objects")
@@ -103,13 +123,53 @@ def validate_config(config: dict[str, Any]) -> None:
     for key in (
         "native_relation_high_level_attempts",
         "native_relation_low_level_attempts",
+        "maximum_episode_sampling_rounds",
+        "maximum_empty_configuration_sampling_restarts",
     ):
         value = generation.get(key)
         if not isinstance(value, int) or value < 1:
             errors.append(f"Generation setting {key} must be a positive integer")
+    maximum_scene_sampling_restarts = generation.get(
+        "maximum_scene_sampling_restarts"
+    )
+    if (
+        not isinstance(maximum_scene_sampling_restarts, int)
+        or maximum_scene_sampling_restarts < 0
+    ):
+        errors.append(
+            "Generation setting maximum_scene_sampling_restarts must be a "
+            "non-negative integer"
+        )
+    for key in (
+        "worker_progress_stall_timeout_s",
+        "worker_progress_poll_interval_s",
+    ):
+        value = generation.get(key)
+        if not isinstance(value, (int, float)) or float(value) <= 0.0:
+            errors.append(f"Generation setting {key} must be positive")
+    if (
+        isinstance(generation.get("worker_progress_stall_timeout_s"), (int, float))
+        and isinstance(
+            generation.get("worker_progress_poll_interval_s"), (int, float)
+        )
+        and float(generation["worker_progress_poll_interval_s"])
+        >= float(generation["worker_progress_stall_timeout_s"])
+    ):
+        errors.append(
+            "worker_progress_poll_interval_s must be smaller than "
+            "worker_progress_stall_timeout_s"
+        )
     restore_tolerance = generation.get("snapshot_restore_tolerance")
     if not isinstance(restore_tolerance, (int, float)) or restore_tolerance <= 0:
         errors.append("Generation setting snapshot_restore_tolerance must be positive")
+    geometry_tolerance = generation.get("configuration_geometry_aabb_tolerance_m")
+    if (
+        not isinstance(geometry_tolerance, (int, float))
+        or not 0.0 < float(geometry_tolerance) <= 0.01
+    ):
+        errors.append(
+            "Generation setting configuration_geometry_aabb_tolerance_m must be in (0, 0.01]"
+        )
     family_weights = trajectory.get("path_family_weights", {})
     required_families = {"direct", "one_waypoint", "two_waypoint"}
     if set(family_weights) != required_families:
@@ -148,6 +208,9 @@ def validate_config(config: dict[str, Any]) -> None:
     hybrid_count = trajectory.get("maximum_complementary_hybrid_candidates")
     bridge_count = trajectory.get("maximum_measured_overlap_bridge_candidates")
     feedback_rounds = trajectory.get("maximum_gt_feedback_mutation_rounds")
+    minimum_gt_valid_candidates = trajectory.get(
+        "minimum_gt_valid_candidates_before_rescue"
+    )
     candidate_counts_valid = (
         isinstance(hybrid_count, int)
         and hybrid_count >= 0
@@ -166,6 +229,14 @@ def validate_config(config: dict[str, Any]) -> None:
     if not isinstance(feedback_rounds, int) or not 1 <= feedback_rounds <= 3:
         errors.append(
             "maximum_gt_feedback_mutation_rounds must be an integer in [1,3]"
+        )
+    if (
+        not isinstance(minimum_gt_valid_candidates, int)
+        or not 1 <= minimum_gt_valid_candidates <= 16
+    ):
+        errors.append(
+            "minimum_gt_valid_candidates_before_rescue must be an integer "
+            "in [1,16]"
         )
     for key in (
         "measured_overlap_bridge_pool_size",

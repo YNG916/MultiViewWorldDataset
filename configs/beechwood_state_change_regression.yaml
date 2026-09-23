@@ -1,0 +1,18 @@
+extends: production_v1.yaml
+profile: integration
+
+# Targeted final-robot regression for subtle but semantically verified boolean
+# state changes. This keeps all production camera, trajectory, and QA settings.
+dataset:
+  accepted_configurations_per_scene: 1
+  accepted_episodes_per_configuration: 1
+
+intervention:
+  type_weights:
+    rigid_relocation: 0.0
+    articulation: 0.0
+    state_change: 1.0
+
+production:
+  selected_scenes: [Beechwood_0_int]
+  scale: beechwood_state_change_regression_1x1x1

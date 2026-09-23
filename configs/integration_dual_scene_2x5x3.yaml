@@ -1,0 +1,11 @@
+extends: production_v1.yaml
+profile: integration
+
+# Multi-GPU production-coordinator integration: two independent scene shards,
+# five dynamic configurations and three paired episodes per configuration.
+dataset:
+  accepted_configurations_per_scene: 5
+  accepted_episodes_per_configuration: 3
+
+production:
+  selected_scenes: [Beechwood_0_int, Rs_int]

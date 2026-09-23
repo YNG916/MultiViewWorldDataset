@@ -88,6 +88,25 @@ refused. `finalize-dataset` merges metadata/indexes and taxonomy deterministical
 The readiness report is written under `global/pilot_report.{json,md}`, with plots and per-scene summaries. It always
 stops after reporting; it never starts full production.
 
+The launcher assigns a serial scene queue to each listed physical GPU. On a node with four usable H100s, pass
+`--gpus 0,1,2,3 --max-workers 4`; at most one scene worker runs per listed GPU. A production root has one
+coordinator lock, and each scene shard has its own worker lock. Run the long command in `tmux` or the cluster's
+batch scheduler. To resume the same code and configuration after interruption:
+
+```bash
+mvwd production-launch --config configs/pilot_production.yaml --gpus 0,1 --max-workers 2 \
+  --allow-large --retry-failed --output-root /path/to/pilot-production --cache-root /path/to/cache
+```
+
+The parent restarts sampling exhaustion and stalled workers with new deterministic retry epochs. Completed episodes
+are committed by atomic directory rename and skipped on resume. Status JSON is also replaced atomically. A code or
+configuration change changes the dataset fingerprint and requires a new output root; keep old roots as separate
+provenance snapshots. Multi-node production should use one coordinator per dataset root, with GPU IDs local to that
+node; concurrent launchers targeting one root are rejected.
+If the same configuration repeatedly exhausts episode sampling before producing any complete episode, the parent
+archives it under `shards/<scene>/quarantine/configurations/` and samples a replacement for that configuration slot.
+Configurations with even one complete episode are retained.
+
 `configs/scene_eligibility.yaml` records all 51 swept scenes: 50 eligible and the explicitly excluded
 `Wainscott_0_garden`, whose final robot footprint has no valid navigable state. Installed-scene reconciliation fails
 loudly if the catalog changes. Primary splits are generated only from eligible scenes and remain scene-family disjoint.

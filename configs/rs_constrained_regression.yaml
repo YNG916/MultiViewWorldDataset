@@ -1,0 +1,13 @@
+extends: production_v1.yaml
+profile: integration
+
+# Minimal production-semantics regression for the constrained pilot scene.
+# It verifies that undersized RouteBanks are rejected at configuration time
+# before the expensive three-robot GT-overlap episode search begins.
+dataset:
+  accepted_configurations_per_scene: 1
+  accepted_episodes_per_configuration: 1
+
+production:
+  selected_scenes: [Rs_int]
+  scale: constrained_route_bank_regression_1x1x1

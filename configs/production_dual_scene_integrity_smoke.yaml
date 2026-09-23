@@ -1,0 +1,11 @@
+extends: production_v1.yaml
+profile: integration
+
+# Small coordinator regression with production research semantics. The two
+# scenes run in separate fresh workers, one scene per GPU.
+dataset:
+  accepted_configurations_per_scene: 1
+  accepted_episodes_per_configuration: 1
+
+production:
+  selected_scenes: [Beechwood_0_int, Rs_int]

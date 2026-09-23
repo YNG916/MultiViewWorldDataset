@@ -1,5 +1,6 @@
 import json
 from collections import Counter
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,7 +10,9 @@ import multi_view_world_dataset.rendering.labels as label_module
 from multi_view_world_dataset.adapters.omnigibson import OmniGibsonAdapter
 from multi_view_world_dataset.errors import ConfigurationError, SampleRejected, SimulatorUnavailableError
 from multi_view_world_dataset.generator import (
+    _check_configuration_geometry,
     _gt_valid_candidate_soft_score,
+    _post_render_intervention_effect,
     _robot_states,
     _sparse_intervention_visibility_preflight,
     _temporal_overlap_preflight,
@@ -29,7 +32,7 @@ from multi_view_world_dataset.sampling.diversity import (
     temporal_overlap_acceptance,
 )
 from multi_view_world_dataset.sampling.trajectories import trajectory_from_spatial_path
-from multi_view_world_dataset.schema.records import ObjectState, RobotState
+from multi_view_world_dataset.schema.records import InterventionType, ObjectState, RobotState
 from multi_view_world_dataset.storage.writer import DatasetWriter
 
 
@@ -40,6 +43,88 @@ def _object(instance_id: str, path: str, category: str = "chair") -> ObjectState
         available_states=(), object_to_world=np.eye(4),
         bbox_min_world=(0, 0, 0), bbox_max_world=(1, 1, 1), scale=(1, 1, 1),
     )
+
+
+def test_configuration_geometry_guard_rejects_aabb_drift_but_accepts_rounding():
+    saved = _object("chair", "/World/chair")
+    nearly_equal = replace(saved, bbox_max_world=(1.0005, 1, 1))
+    _check_configuration_geometry((saved,), (nearly_equal,), aabb_tolerance_m=0.001)
+    drifted = replace(saved, bbox_min_world=(0.2, 0, 0))
+    with pytest.raises(SampleRejected) as error:
+        _check_configuration_geometry((saved,), (drifted,), aabb_tolerance_m=0.001)
+    assert error.value.reason == "configuration_snapshot_geometry_mismatch"
+    assert error.value.details["largest_mismatches"][0]["aabb_error_m"] == pytest.approx(0.2)
+
+
+def test_configuration_geometry_guard_accepts_json_and_checks_pose():
+    saved = _object("chair", "/World/chair")
+    saved_json = {
+        "instance_id": saved.instance_id,
+        "bbox_min_world": list(saved.bbox_min_world),
+        "bbox_max_world": list(saved.bbox_max_world),
+        "object_to_world": saved.object_to_world.tolist(),
+    }
+    _check_configuration_geometry((saved_json,), (saved,), aabb_tolerance_m=0.001)
+    moved = np.eye(4)
+    moved[0, 3] = 0.01
+    with pytest.raises(SampleRejected) as error:
+        _check_configuration_geometry((saved_json,), (replace(saved, object_to_world=moved),), aabb_tolerance_m=0.001)
+    assert error.value.details["largest_mismatches"][0]["pose_matrix_error"] == pytest.approx(0.01)
+
+
+def test_collision_geometry_cache_refresh_invalidates_local_hulls():
+    link = SimpleNamespace(collision_boundary_points_local=np.ones((3, 3)))
+    obj = SimpleNamespace(prim_path="/World/chair", links={"base_link": link})
+    robot_link = SimpleNamespace(collision_boundary_points_local=np.ones((3, 3)))
+    robot = SimpleNamespace(prim_path="/World/robot", links={"base_link": robot_link})
+    adapter = SimpleNamespace(
+        _require_scene=lambda: SimpleNamespace(objects=(obj, robot)),
+        _env=SimpleNamespace(robots=(robot,)),
+    )
+    OmniGibsonAdapter.refresh_collision_geometry_cache(adapter)
+    assert "collision_boundary_points_local" not in vars(link)
+    assert "collision_boundary_points_local" in vars(robot_link)
+
+
+def test_post_render_effect_uses_intervention_specific_rgb_threshold():
+    catalog = (_object("target", "/World/target"),)
+    instance = np.full((2, 4, 4), 4, dtype=np.int32)
+    before = {
+        "robot_00": {
+            "instance": instance,
+            "rgb": np.zeros((2, 4, 4, 3), dtype=np.uint8),
+        }
+    }
+    after = {
+        "robot_00": {
+            "instance": instance,
+            "rgb": np.ones((2, 4, 4, 3), dtype=np.uint8),
+        }
+    }
+    config = {
+        "intervention": {
+            "post_render_effect": {
+                "minimum_changed_pixels": 1,
+                "minimum_mean_rgb_delta": {
+                    "rigid_relocation": 3.0,
+                    "articulation": 3.0,
+                    "state_change": 0.5,
+                },
+            }
+        }
+    }
+
+    state_change = _post_render_intervention_effect(
+        "target", catalog, before, after, config, InterventionType.STATE_CHANGE
+    )
+    rigid = _post_render_intervention_effect(
+        "target", catalog, before, after, config, InterventionType.RIGID_RELOCATION
+    )
+
+    assert state_change["passed"]
+    assert state_change["minimum_mean_rgb_delta"] == 0.5
+    assert not rigid["passed"]
+    assert rigid["checks"]["minimum_mean_rgb_delta"] is False
 
 
 def test_sparse_intervention_visibility_preflight_uses_public_instance_ids():

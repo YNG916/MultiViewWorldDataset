@@ -107,6 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--config", required=True)
     worker.add_argument("--scene", required=True)
     worker.add_argument("--allow-large", action="store_true")
+    worker.add_argument("--sampling-retry-epoch", type=int, default=0)
     _machine_arguments(worker, output=True)
 
     launch = subparsers.add_parser(
@@ -188,7 +189,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "scene-worker":
         output, result = run_scene_worker(
-            runtime, config, args.scene, allow_large=bool(args.allow_large)
+            runtime,
+            config,
+            args.scene,
+            allow_large=bool(args.allow_large),
+            sampling_retry_epoch=int(args.sampling_retry_epoch),
         )
         print(json.dumps(
             {"status": "pass", "output": str(output), **result},

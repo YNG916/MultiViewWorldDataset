@@ -125,6 +125,173 @@ def _translation_is_safe(
     return True
 
 
+def sample_reachable_waypoint_cells(
+    safe_masks: BoolArray,
+    start_cell: Sequence[int],
+    *,
+    segment_count: int,
+    minimum_length_m: float,
+    maximum_length_m: float,
+    map_resolution_m: float,
+    maximum_turn_rad: float,
+    rng: np.random.Generator,
+    heading_steps: IntArray | None = None,
+    forward_enabled_by_yaw: BoolArray | None = None,
+    maximum_attempts: int = 48,
+) -> IntArray | None:
+    """Propose waypoint cells from collision-safe SE(2) motion primitives.
+
+    Random XY endpoints from a 2-D connected component are often unreachable
+    for a non-circular robot. This sampler traces valid forward primitives and
+    permits a waypoint turn only when the complete in-place yaw sweep is safe.
+    The returned controls are still replanned by the shortest-path planner.
+    """
+    masks = np.asarray(safe_masks, dtype=bool)
+    if masks.ndim != 3 or len(masks) < 4:
+        raise ValueError("safe_masks must have shape [B,H,W] with B >= 4")
+    if segment_count < 1 or maximum_attempts < 1:
+        raise ValueError("segment_count and maximum_attempts must be positive")
+    if not (
+        0.0 < minimum_length_m <= maximum_length_m
+        and map_resolution_m > 0.0
+        and 0.0 < maximum_turn_rad <= np.pi
+    ):
+        raise ValueError("invalid reachable-waypoint sampling limits")
+
+    yaw_bins, height, width = masks.shape
+    start = np.asarray(start_cell, dtype=np.int64)
+    if start.shape != (2,) or not (
+        0 <= start[0] < height and 0 <= start[1] < width
+    ):
+        return None
+    steps = (
+        default_heading_steps(yaw_bins)
+        if heading_steps is None
+        else np.asarray(heading_steps, dtype=np.int64)
+    )
+    if steps.shape != (yaw_bins, 2):
+        raise ValueError("heading_steps must have shape [yaw_bins,2]")
+    if forward_enabled_by_yaw is None:
+        step_angles = np.arctan2(steps[:, 0], steps[:, 1])
+        yaw_angles = 2.0 * np.pi * np.arange(yaw_bins) / yaw_bins
+        forward_enabled = np.abs(
+            (yaw_angles - step_angles + np.pi) % (2.0 * np.pi) - np.pi
+        ) <= 1.0e-7
+    else:
+        forward_enabled = np.asarray(forward_enabled_by_yaw, dtype=bool)
+    if forward_enabled.shape != (yaw_bins,):
+        raise ValueError("forward_enabled_by_yaw must have shape [yaw_bins]")
+
+    maximum_steps = max(1, int(np.ceil(maximum_length_m / map_resolution_m)))
+    yaw_radians = 2.0 * np.pi / yaw_bins
+
+    def rotation_safe(row: int, column: int, source: int, target: int) -> bool:
+        left_steps = (source - target) % yaw_bins
+        right_steps = (target - source) % yaw_bins
+        delta_bins = min(left_steps, right_steps)
+        if delta_bins == 0 or delta_bins * yaw_radians > maximum_turn_rad + 1.0e-9:
+            return False
+        directions = []
+        if left_steps == delta_bins:
+            directions.append(-1)
+        if right_steps == delta_bins:
+            directions.append(1)
+        return any(
+            swept_rotation_is_safe(
+                masks, row, column, source, target, direction=direction
+            )
+            for direction in directions
+        )
+
+    for _ in range(maximum_attempts):
+        desired_total = float(rng.uniform(minimum_length_m, maximum_length_m))
+        desired_segments = (
+            np.asarray([desired_total], dtype=np.float64)
+            if segment_count == 1
+            else desired_total * rng.dirichlet(np.full(segment_count, 2.0))
+        )
+        controls = [start.copy()]
+        current = start.copy()
+        current_yaw: int | None = None
+        accumulated = 0.0
+        feasible = True
+        for segment_index, desired_length in enumerate(desired_segments):
+            yaw_candidates = np.flatnonzero(
+                forward_enabled & masks[:, current[0], current[1]]
+            )
+            if current_yaw is not None:
+                yaw_candidates = np.asarray(
+                    [
+                        int(yaw)
+                        for yaw in yaw_candidates
+                        if rotation_safe(
+                            int(current[0]),
+                            int(current[1]),
+                            current_yaw,
+                            int(yaw),
+                        )
+                    ],
+                    dtype=np.int64,
+                )
+            if not len(yaw_candidates):
+                feasible = False
+                break
+            yaw_candidates = rng.permutation(yaw_candidates)
+            chosen: tuple[int, np.ndarray, float] | None = None
+            for yaw_value in yaw_candidates:
+                yaw = int(yaw_value)
+                state = SE2GridState(int(current[0]), int(current[1]), yaw)
+                ray: list[np.ndarray] = []
+                ray_lengths: list[float] = []
+                distance = 0.0
+                for _step in range(maximum_steps):
+                    row_step, column_step = map(int, steps[yaw])
+                    target_row = state.row + row_step
+                    target_column = state.column + column_step
+                    if not _translation_is_safe(
+                        masks, state, target_row, target_column
+                    ):
+                        break
+                    distance += float(np.hypot(row_step, column_step)) * map_resolution_m
+                    state = SE2GridState(target_row, target_column, yaw)
+                    ray.append(np.asarray([target_row, target_column], dtype=np.int64))
+                    ray_lengths.append(distance)
+                if not ray:
+                    continue
+                lengths = np.asarray(ray_lengths, dtype=np.float64)
+                remaining_minimum = max(
+                    0.0,
+                    minimum_length_m
+                    - accumulated
+                    - float(np.sum(desired_segments[segment_index + 1 :])),
+                )
+                eligible = np.flatnonzero(
+                    (lengths >= max(map_resolution_m, remaining_minimum))
+                    & (accumulated + lengths <= maximum_length_m + 1.0e-9)
+                )
+                if not len(eligible):
+                    continue
+                errors = np.abs(lengths[eligible] - float(desired_length))
+                best_error = float(np.min(errors))
+                near = eligible[errors <= best_error + 0.5 * map_resolution_m]
+                selected = int(rng.choice(near))
+                chosen = (yaw, ray[selected], float(lengths[selected]))
+                break
+            if chosen is None:
+                feasible = False
+                break
+            current_yaw, current, segment_length = chosen
+            accumulated += segment_length
+            controls.append(current.copy())
+        if (
+            feasible
+            and minimum_length_m <= accumulated <= maximum_length_m
+            and len(controls) == segment_count + 1
+        ):
+            return np.asarray(controls, dtype=np.int64)
+    return None
+
+
 def plan_se2_grid(
     safe_masks: BoolArray,
     start_cell: Sequence[int],
