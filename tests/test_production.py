@@ -13,14 +13,17 @@ import numpy as np
 from multi_view_world_dataset.errors import ConfigurationError, SampleRejected
 from multi_view_world_dataset.generator import (
     _adaptive_exact_validation,
+    _available_intervention_types,
     _candidate_accounting,
     _configuration_navigation_seed,
+    _has_all_requested_episodes,
     _gt_rescue_candidates,
     _gt_valid_candidate_soft_score,
     _temporal_overlap_preflight,
 )
 import multi_view_world_dataset.pilot_report as pilot_report_module
 import multi_view_world_dataset.production as production_module
+from multi_view_world_dataset.schema.records import InterventionType
 from multi_view_world_dataset.pilot_report import generate_pilot_report
 from multi_view_world_dataset.production import (
     _exclusive_production_root,
@@ -877,6 +880,52 @@ def test_configuration_navigation_seed_survives_resume():
     assert _configuration_navigation_seed(saved_configuration) == stable_seed(
         saved_configuration["seed"], "configuration-navigation-context"
     )
+
+
+def test_available_intervention_types_excludes_used_and_unplaced_targets():
+    def target(name, *, placed=True, state=False):
+        return SimpleNamespace(
+            instance_id=name,
+            movable=True,
+            structural=False,
+            articulated=False,
+            joint_names=(),
+            joint_values=(),
+            joint_limits=(),
+            semantic_states={"on": True} if state else {},
+            relations=({"predicate": "OnFloor"},) if placed else (),
+        )
+
+    catalog = (target("used"), target("unplaced", placed=False), target("state", state=True))
+    assert _available_intervention_types(
+        catalog, {"used", "unplaced", "state"}, {"used"}
+    ) == {InterventionType.RIGID_RELOCATION, InterventionType.STATE_CHANGE}
+    assert _available_intervention_types(
+        catalog, {"used", "unplaced"}, {"used"}
+    ) == set()
+
+
+def test_resume_skips_only_fully_committed_configurations(tmp_path):
+    writer = DatasetWriter(tmp_path)
+    episode_root = tmp_path / "episodes" / "Rs_int" / "config_000"
+    for index in (0, 2):
+        episode = episode_root / f"episode_{index:03d}"
+        episode.mkdir(parents=True)
+        (episode / "meta.json").write_text("{}", encoding="utf-8")
+    partial = writer.completed_episode_ids("Rs_int", "config_000")
+    assert not _has_all_requested_episodes(partial, 3)
+    assert _has_all_requested_episodes(partial, 1)
+
+    incomplete_staging = episode_root / ".episode_001.staging"
+    incomplete_staging.mkdir()
+    assert not _has_all_requested_episodes(
+        writer.completed_episode_ids("Rs_int", "config_000"), 3
+    )
+
+    episode = episode_root / "episode_001"
+    episode.mkdir()
+    (episode / "meta.json").write_text("{}", encoding="utf-8")
+    assert _has_all_requested_episodes(writer.completed_episode_ids("Rs_int", "config_000"), 3)
 
 
 def test_retry_failed_continues_after_persisted_epoch(tmp_path, monkeypatch):

@@ -78,6 +78,14 @@ def _configuration_navigation_seed(configuration_metadata: Mapping[str, Any]) ->
     )
 
 
+def _has_all_requested_episodes(completed_episode_ids: Sequence[str], requested_episodes: int) -> bool:
+    """A committed configuration needs no simulator replay once every episode exists."""
+    return all(
+        f"episode_{index:03d}" in completed_episode_ids
+        for index in range(requested_episodes)
+    )
+
+
 def _check_configuration_geometry(
     expected_objects: Sequence[ObjectState] | Sequence[Mapping[str, Any]],
     actual_objects: Sequence[ObjectState],
@@ -902,6 +910,28 @@ def _existing_event_types(root: Path, scene_id: str) -> dict[str, int]:
     return counts
 
 
+def _available_intervention_types(
+    catalog: tuple[ObjectState, ...],
+    visible_target_ids: set[str],
+    excluded_target_ids: set[str],
+) -> set[InterventionType]:
+    """Preselect only types with at least one candidate the adapter can use."""
+    eligible_ids = visible_target_ids - excluded_target_ids
+    available = set()
+    for intervention_type in InterventionType:
+        for obj in eligible_intervention_targets(catalog, intervention_type):
+            if obj.instance_id not in eligible_ids:
+                continue
+            if intervention_type is InterventionType.RIGID_RELOCATION and not any(
+                relation.get("predicate") in {"OnFloor", "OnTop", "Inside"}
+                for relation in obj.relations
+            ):
+                continue
+            available.add(intervention_type)
+            break
+    return available
+
+
 def _choose_quota_intervention_type(
     weights: dict[str, float], counts: dict[str, int], available: set[InterventionType], seed: int
 ) -> InterventionType:
@@ -1423,6 +1453,40 @@ def generate_dataset(
             )
             for configuration_index in range(requested_configurations):
                 configuration_id = f"config_{configuration_index:03d}"
+                if configuration_id in completed_configurations and _has_all_requested_episodes(
+                    writer.completed_episode_ids(selected_scene, configuration_id), requested_episodes
+                ):
+                    for episode_index in range(requested_episodes):
+                        metrics_path = (
+                            root / "episodes" / selected_scene / configuration_id
+                            / f"episode_{episode_index:03d}" / "generation_metrics.json"
+                        )
+                        try:
+                            prior_trajectory = json.loads(
+                                metrics_path.read_text(encoding="utf-8")
+                            )["trajectory"]
+                            prior_requested = str(prior_trajectory.get(
+                                "requested_observation_regime", "unclassified"
+                            ))
+                            prior_realized = str(prior_trajectory.get(
+                                "observation_regime", "unclassified"
+                            ))
+                            requested_regime_counts[prior_requested] += 1
+                            realized_regime_counts[prior_realized] += 1
+                            requested_regime_counts_by_split.setdefault(
+                                splits[selected_scene], Counter()
+                            )[prior_requested] += 1
+                            realized_regime_counts_by_split.setdefault(
+                                splits[selected_scene], Counter()
+                            )[prior_realized] += 1
+                        except (OSError, KeyError, json.JSONDecodeError):
+                            pass
+                    _write_status(
+                        root, status="running", stage="resume_skip_completed_configuration",
+                        scene_id=selected_scene, configuration_id=configuration_id,
+                        accepted_configurations=accepted_configurations, accepted_episodes=accepted_episodes,
+                    )
+                    continue
                 configuration_root = (
                     root / "configurations" / selected_scene / configuration_id
                 )
@@ -1633,6 +1697,12 @@ def generate_dataset(
                             {"scene_id": selected_scene, "configuration_id": configuration_id},
                         )
                 snapshot_path = configuration_root / "simulator_state.npy"
+                if configuration_id in completed_configurations:
+                    _write_status(
+                        root, status="running", stage="resume_configuration",
+                        scene_id=selected_scene, configuration_id=configuration_id,
+                        accepted_configurations=accepted_configurations, accepted_episodes=accepted_episodes,
+                    )
                 configuration_snapshot = np.load(snapshot_path, allow_pickle=False)
                 configuration_metadata = json.loads(
                     (configuration_root / "config_meta.json").read_text(
@@ -1656,6 +1726,11 @@ def generate_dataset(
                         "configuration_id": configuration_id,
                         **error.details,
                     }) from error
+                _write_status(
+                    root, status="running", stage="build_navigation_context",
+                    scene_id=selected_scene, configuration_id=configuration_id,
+                    accepted_configurations=accepted_configurations, accepted_episodes=accepted_episodes,
+                )
                 adapter.prepare_navigation_context(
                     configuration_token,
                     _configuration_navigation_seed(configuration_metadata),
@@ -2568,14 +2643,11 @@ def generate_dataset(
                     qa_results = None
                     post_render_effect = None
                     visible_ids = set(visibility_table["eligible_target_ids"])
-                    available_intervention_types = {
-                        intervention_type
-                        for intervention_type in InterventionType
-                        if any(
-                            obj.instance_id in visible_ids
-                            for obj in eligible_intervention_targets(w0_catalog, intervention_type)
-                        )
-                    }
+                    available_intervention_types = _available_intervention_types(
+                        w0_catalog,
+                        visible_ids,
+                        used_targets,
+                    )
                     fixed_intervention_type = _choose_quota_intervention_type(
                         config["intervention"]["type_weights"],
                         accepted_intervention_types,

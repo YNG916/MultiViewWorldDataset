@@ -129,6 +129,10 @@ index after each interruption or completed batch. Never copy data from a differe
 one. Check free space before each batch: the full 50-scene projection can exceed the current filesystem.
 Multi-node production uses one coordinator per dataset root, with GPU IDs local to that node; concurrent launchers
 targeting one root are rejected.
+
+For the existing `dataset_v11_production_full_20260923` root, use the frozen
+producer and audited resume overlay described in
+[`scripts/resume_overlay/README.md`](scripts/resume_overlay/README.md).
 If the same configuration repeatedly exhausts episode sampling before producing any complete episode, the parent
 archives it under `shards/<scene>/quarantine/configurations/` and samples a replacement for that configuration slot.
 Configurations with even one complete episode are retained.
