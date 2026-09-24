@@ -41,6 +41,8 @@ _RECOVERABLE_SAMPLING_ERRORS = frozenset({
     "intervention_attempts_exhausted",
     "worker_progress_stalled",
     "configuration_snapshot_geometry_mismatch",
+    # Seen intermittently while loading a scene that succeeded in prior epochs.
+    "Support for instanceable prims has not been implemented yet!",
 })
 
 
@@ -207,6 +209,16 @@ def _should_launch_scene(status: str | None, retry_failed: bool) -> bool:
     return status in {None, "pending", "running"}
 
 
+
+
+def _worker_cpu_ticks(pid: int) -> int | None:
+    """Read process CPU usage without adding a psutil dependency."""
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(") ", 1)[1].split()
+        return int(fields[11]) + int(fields[12])
+    except (OSError, IndexError, ValueError):
+        return None
+
 def _watch_worker_progress(
     shard: Path,
     stop: Event,
@@ -214,11 +226,17 @@ def _watch_worker_progress(
     *,
     stall_timeout_s: float,
     poll_interval_s: float,
+    active_stage_timeout_s: float | None = None,
 ) -> None:
-    """Terminate a live worker whose atomic generation status stops changing."""
+    """Stop an idle worker, but allow bounded CPU-active long simulator stages."""
     status_path = shard / "generation_status.json"
     last_signature: tuple[int, int] | None = None
     last_progress = time.monotonic()
+    last_cpu_ticks: int | None = None
+    active_limit = (
+        4.0 * stall_timeout_s
+        if active_stage_timeout_s is None else active_stage_timeout_s
+    )
     while not stop.wait(poll_interval_s):
         try:
             stat = status_path.stat()
@@ -228,6 +246,7 @@ def _watch_worker_progress(
         if signature != last_signature:
             last_signature = signature
             last_progress = time.monotonic()
+            last_cpu_ticks = None
             continue
         stalled_s = time.monotonic() - last_progress
         if stalled_s < stall_timeout_s:
@@ -241,11 +260,21 @@ def _watch_worker_progress(
             return
         if worker_pid <= 1 or worker_pid == os.getpid():
             return
+        cpu_ticks = _worker_cpu_ticks(worker_pid)
+        cpu_active = (
+            cpu_ticks is not None
+            and (last_cpu_ticks is None or cpu_ticks > last_cpu_ticks)
+        )
+        last_cpu_ticks = cpu_ticks
+        if cpu_active and stalled_s < active_limit:
+            continue
         generation_status = _read_json(status_path, {})
         result.update({
             "triggered": True,
             "worker_pid": worker_pid,
             "stalled_s": stalled_s,
+            "cpu_active_at_limit": cpu_active,
+            "active_stage_timeout_s": active_limit,
             "stalled_stage": generation_status.get("stage"),
             "stalled_configuration_id": generation_status.get(
                 "configuration_id"
@@ -534,6 +563,12 @@ def _launch_scene_shards_unlocked(
         progress_poll_interval_s = float(
             config["generation"]["worker_progress_poll_interval_s"]
         )
+        active_stage_timeout_s = float(
+            config["generation"].get(
+                "worker_progress_active_stage_timeout_s",
+                4.0 * progress_stall_timeout_s,
+            )
+        )
         prior_recovery = _read_json(shard / "sampling_recovery.json", {})
         restart_history: list[dict[str, Any]] = list(prior_recovery.get("attempts", []))
         initial_epoch = max(
@@ -559,6 +594,7 @@ def _launch_scene_shards_unlocked(
                 kwargs={
                     "stall_timeout_s": progress_stall_timeout_s,
                     "poll_interval_s": progress_poll_interval_s,
+                    "active_stage_timeout_s": active_stage_timeout_s,
                 },
                 name=f"mvwd-progress-watchdog-{scene}",
                 daemon=True,

@@ -17,6 +17,24 @@ def test_all_profiles_are_valid():
         assert config["camera"]["hfov_deg"] == 70.0
 
 
+def test_nonrigid_fallback_requires_separate_schema_version():
+    config = load_yaml_config(
+        REPOSITORY / "configs" / "production_v12_nonrigid_fallback.yaml"
+    )
+    assert config["dataset"]["schema_version"] == "1.2.0"
+    assert config["configuration_sampling"]["nonrigid_fallback"] is True
+    assert config["configuration_sampling"]["minimum_changed_objects"] == 2
+    assert config["configuration_sampling"]["nonrigid_max_changed_objects"] == 4
+    config["configuration_sampling"]["nonrigid_max_changed_objects"] = 1
+    with pytest.raises(ConfigurationError, match="nonrigid_max_changed_objects"):
+        validate_config(config)
+    config["configuration_sampling"]["nonrigid_max_changed_objects"] = 4
+    config["dataset"]["schema_version"] = "1.1.0"
+    with pytest.raises(ConfigurationError, match="nonrigid configuration fallback"):
+        validate_config(config)
+
+
+
 def test_frozen_camera_setting_cannot_drift():
     config = load_yaml_config(REPOSITORY / "configs" / "default.yaml")
     config["camera"]["pitch_deg"] = 0.0

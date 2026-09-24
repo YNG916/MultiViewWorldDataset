@@ -6,7 +6,7 @@ umask 077
 base=/home/usqki/behavior_world
 env_prefix=/tmp/mvwd-env-usqki-v392
 assets=/tmp/mvwd-assets-usqki-v392
-source_snapshot="$base/output/mvwd/dataset_v11_production_newcluster_20260924/global/frozen_producer"
+source_snapshot="${MVWD_SOURCE_SNAPSHOT:-$base/output/mvwd/dataset_v11_production_newcluster_20260924/global/frozen_producer}"
 
 : "${SLURM_JOB_ID:?Run through sbatch}"
 : "${CUDA_VISIBLE_DEVICES:?A GPU allocation is required}"
@@ -58,7 +58,7 @@ if [[ "$MVWD_MODE" == smoke ]]; then
     cd "$source_snapshot"
     set +e
     python -m multi_view_world_dataset.cli generate \
-        --config configs/final_robot_preview.yaml \
+        --config "${MVWD_SMOKE_CONFIG:-configs/final_robot_preview.yaml}" \
         --scene "$MVWD_SCENES" --behavior-root "$BEHAVIOR_ROOT" \
         --output-root "$MVWD_OUTPUT_ROOT" --cache-root "$runtime/cache"
     generator_exit=$?
@@ -78,7 +78,7 @@ elif [[ "$MVWD_MODE" == production ]]; then
     export PYTHONPATH="$producer/src"
     cd "$producer"
     python -m multi_view_world_dataset.cli production-launch \
-        --config configs/production_v1.yaml --scenes "$MVWD_SCENES" \
+        --config "${MVWD_PRODUCTION_CONFIG:-configs/production_v1.yaml}" --scenes "$MVWD_SCENES" \
         --gpus "$CUDA_VISIBLE_DEVICES" \
         --max-workers "${MVWD_WORKERS:-1}" --allow-large --retry-failed \
         --output-root "$MVWD_OUTPUT_ROOT" --cache-root "$runtime/cache"

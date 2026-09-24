@@ -1281,6 +1281,40 @@ def test_progress_watchdog_terminates_stalled_running_worker(
     assert result["stalled_episode_id"] == "episode_001"
 
 
+def test_progress_watchdog_allows_cpu_active_stage_until_hard_limit(
+    tmp_path, monkeypatch,
+):
+    shard = tmp_path / "shard"
+    dump_json(shard / "generation_status.json", {
+        "status": "running",
+        "stage": "sample_configuration",
+        "attempt": 0,
+    })
+    dump_json(shard / "shard_status.json", {
+        "status": "running",
+        "worker_pid": 424242,
+    })
+    ticks = iter(range(1, 1000))
+    monkeypatch.setattr(production_module, "_worker_cpu_ticks", lambda pid: next(ticks))
+    killed = []
+    monkeypatch.setattr(
+        production_module.os, "kill", lambda pid, sig: killed.append((pid, sig))
+    )
+    result = {}
+    production_module._watch_worker_progress(
+        shard,
+        production_module.Event(),
+        result,
+        stall_timeout_s=0.005,
+        poll_interval_s=0.001,
+        active_stage_timeout_s=0.025,
+    )
+    assert killed == [(424242, 15)]
+    assert result["stalled_s"] >= 0.025
+    assert result["cpu_active_at_limit"] is True
+
+
+
 def test_pilot_report_projects_full_scale_and_explicitly_stops(tmp_path, monkeypatch):
     root = tmp_path / "pilot"
     config = load_yaml_config("configs/pilot_production.yaml")

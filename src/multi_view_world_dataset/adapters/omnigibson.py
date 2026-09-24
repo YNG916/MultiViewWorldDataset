@@ -15,7 +15,10 @@ from multi_view_world_dataset.assets import (
 )
 from multi_view_world_dataset.cameras.transforms import rotation_angle, validate_transform
 from multi_view_world_dataset.errors import GeometryError, SampleRejected, SimulatorUnavailableError
-from multi_view_world_dataset.rendering.bev import BEVCalibration
+from multi_view_world_dataset.rendering.bev import (
+    BEVCalibration,
+    interior_bev_camera_height,
+)
 from multi_view_world_dataset.rendering.labels import remap_public_labels
 from multi_view_world_dataset.rendering.modalities import canonicalize_public_modality
 from multi_view_world_dataset.sampling.placement import (
@@ -1041,6 +1044,10 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
         requested = max(int(policy["minimum_changed_objects"]), requested)
         requested = min(int(policy["maximum_changed_objects"]), requested, len(eligible_ids))
         if requested < int(policy["minimum_changed_objects"]):
+            if policy.get("nonrigid_fallback", False):
+                return self._randomize_nonrigid_configuration(
+                    seed, baseline=baseline, original_snapshot=original_snapshot,
+                )
             raise SampleRejected(
                 "insufficient_multi_object_configuration_targets",
                 {"eligible_target_count": len(eligible_ids), "required": int(policy["minimum_changed_objects"])},
@@ -1143,6 +1150,158 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             "translation_m": float(sum(item["translation_m"] for item in results)),
             "rotation_deg": float(sum(item["rotation_deg"] for item in results)),
         }
+
+
+    def _randomize_nonrigid_configuration(
+        self, seed: int, *, baseline: tuple[ObjectState, ...],
+        original_snapshot: np.ndarray,
+    ) -> dict[str, Any]:
+        """Change distinct real articulated/stateful objects in v1.2 scenes."""
+        from multi_view_world_dataset.sampling.configurations import (
+            exact_state_hash,
+            nonrigid_configuration_candidates,
+        )
+
+        policy = self.config["configuration_sampling"]
+        minimum_requested = int(policy["nonrigid_changed_objects"])
+        maximum_requested = int(
+            policy.get("nonrigid_max_changed_objects", minimum_requested)
+        )
+        candidates = nonrigid_configuration_candidates(baseline)
+        if len(candidates) < minimum_requested:
+            raise SampleRejected(
+                "insufficient_nonrigid_configuration_targets",
+                {"eligible_target_count": len(candidates), "required": minimum_requested},
+            )
+        rng = np.random.default_rng(seed)
+        requested = int(
+            rng.integers(minimum_requested, min(maximum_requested, len(candidates)) + 1)
+        )
+        baseline_by_id = {obj.instance_id: obj for obj in baseline}
+        current_snapshot = original_snapshot
+        changes: list[dict[str, Any]] = []
+        changed_ids: set[str] = set()
+        accepted = False
+        try:
+            target_order = rng.permutation(sorted(candidates))
+            for target_index, target_value in enumerate(target_order):
+                target_id = str(target_value)
+                if len(changed_ids) >= requested:
+                    break
+                for type_index, intervention_type in enumerate(candidates[target_id]):
+                    self.load_snapshot(current_snapshot)
+                    try:
+                        result = self.apply_atomic_intervention(
+                            seed + 104729 * (target_index + 1) + type_index,
+                            forced_type=intervention_type,
+                            visible_target_ids=(target_id,),
+                        )
+                    except SampleRejected:
+                        continue
+                    if not all(result["checks"].values()):
+                        continue
+                    if result["changed_instance_ids"] != [target_id]:
+                        continue
+                    current_snapshot = result["snapshot"]
+                    changed_ids.add(target_id)
+                    event = result["event"]
+                    changes.append({
+                        "target_instance_id": target_id,
+                        "target_category": baseline_by_id[target_id].category,
+                        "change_type": event.intervention_type.value,
+                        "parameters": event.parameters,
+                    })
+                    break
+            if len(changed_ids) != requested:
+                raise SampleRejected(
+                    "nonrigid_configuration_sampling_failed",
+                    {"accepted_changes": len(changed_ids), "requested_changes": requested},
+                )
+            self.load_snapshot(current_snapshot)
+            candidate_catalog = self.object_catalog_with_relations()
+            self.load_snapshot(current_snapshot)
+            self.refresh_collision_geometry_cache()
+            restored = self.object_catalog_with_relations()
+            maximum_error, discrete_equal = self._catalog_restore_metrics(
+                candidate_catalog, restored,
+            )
+            actual_changed_ids = {
+                obj.instance_id
+                for obj in restored
+                if (
+                    not np.allclose(
+                        obj.object_to_world,
+                        baseline_by_id[obj.instance_id].object_to_world,
+                        atol=1.0e-4,
+                        rtol=0.0,
+                    )
+                    or not np.allclose(
+                        obj.joint_values,
+                        baseline_by_id[obj.instance_id].joint_values,
+                        atol=1.0e-4,
+                        rtol=0.0,
+                    )
+                    or obj.semantic_states != baseline_by_id[obj.instance_id].semantic_states
+                )
+            }
+            relations_preserved = all(
+                obj.relations == baseline_by_id[obj.instance_id].relations
+                for obj in restored
+            )
+            if (
+                actual_changed_ids != changed_ids
+                or not relations_preserved
+                or not discrete_equal
+                or maximum_error > float(
+                    self.config["generation"]["snapshot_restore_tolerance"]
+                )
+            ):
+                raise SampleRejected(
+                    "nonrigid_configuration_validation_failed",
+                    {
+                        "expected_changed_ids": sorted(changed_ids),
+                        "actual_changed_ids": sorted(actual_changed_ids),
+                        "relations_preserved": relations_preserved,
+                        "discrete_equal": discrete_equal,
+                        "maximum_restore_error": maximum_error,
+                    },
+                )
+            baseline_hash = exact_state_hash(
+                baseline, decimals=int(self.config["generation"]["exact_hash_decimals"]),
+            )
+            candidate_hash = exact_state_hash(
+                restored, decimals=int(self.config["generation"]["exact_hash_decimals"]),
+            )
+            if candidate_hash == baseline_hash:
+                raise SampleRejected("nonrigid_configuration_unchanged")
+            accepted = True
+            return {
+                "catalog": restored,
+                "snapshot": current_snapshot,
+                "exact_state_hash": candidate_hash,
+                "baseline_exact_state_hash": baseline_hash,
+                "configuration_family": "nonrigid_fallback",
+                "changed_instance_ids": sorted(changed_ids),
+                "changes": changes,
+                "changed_object_count": len(changed_ids),
+                "requested_changed_object_count": requested,
+                "stratification": {
+                    "change_types": {
+                        kind.value: sum(change["change_type"] == kind.value for change in changes)
+                        for kind in (InterventionType.ARTICULATION, InterventionType.STATE_CHANGE)
+                    },
+                },
+                "accepted_attempt": 0,
+                "checks": {
+                    "minimum_changed_objects": True,
+                    "snapshot_restored": True,
+                    "relations_preserved": True,
+                },
+                "maximum_snapshot_restore_error": maximum_error,
+            }
+        finally:
+            if not accepted:
+                self.load_snapshot(original_snapshot)
 
     def _randomize_one_relation_preserving_configuration(
         self, seed: int, *, excluded_target_ids: tuple[str, ...] = (),
@@ -4420,8 +4579,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
             if projection != "orthographic":
                 raise GeometryError(f"BEV camera projection is {projection!r}, not orthographic")
             catalog = self.object_catalog()
-            top_z = max((obj.bbox_max_world[2] for obj in catalog), default=calibration.floor_z + 3.0)
-            camera_z = top_z + 2.0
+            camera_z = interior_bev_camera_height(catalog, calibration.floor_z)
             xmin, ymin, xmax, ymax = calibration.world_bounds
             camera.set_position_orientation(
                 position=self._th.tensor([(xmin + xmax) / 2, (ymin + ymax) / 2, camera_z]),
@@ -4601,8 +4759,7 @@ class OmniGibsonAdapter(BaseSimulatorAdapter):
                 camera.load(None)
             self._configure_bev_camera(camera, calibration)
             catalog = self.object_catalog()
-            top_z = max((obj.bbox_max_world[2] for obj in catalog), default=calibration.floor_z + 3.0)
-            camera_z = top_z + 2.0
+            camera_z = interior_bev_camera_height(catalog, calibration.floor_z)
             xmin, ymin, xmax, ymax = calibration.world_bounds
             world_bev_capture_position = self._th.tensor(
                 [(xmin + xmax) / 2, (ymin + ymax) / 2, camera_z]

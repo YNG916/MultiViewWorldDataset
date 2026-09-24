@@ -1576,6 +1576,10 @@ def generate_dataset(
                                     rotation_threshold_deg=float(
                                         config["generation"]["near_duplicate_rotation_deg"]
                                     ),
+                                    include_nonrigid=(
+                                        candidate.get("configuration_family")
+                                        == "nonrigid_fallback"
+                                    ),
                                 )
                                 for catalog in accepted_catalogs
                             ):
@@ -1612,6 +1616,9 @@ def generate_dataset(
                                 simulator_snapshot_ref="simulator_state.npy",
                                 accepted_attempt=attempt,
                                 metadata={
+                                    "configuration_family": candidate.get(
+                                        "configuration_family", "relation_relocation"
+                                    ),
                                     "baseline_exact_state_hash": candidate.get(
                                         "baseline_exact_state_hash"
                                     ),
@@ -1691,6 +1698,12 @@ def generate_dataset(
                                 error.reason,
                                 {"attempt": attempt, **error.details},
                             )
+                            # Fixed scene inventories cannot change with a new seed.
+                            if error.reason in {
+                                "insufficient_multi_object_configuration_targets",
+                                "insufficient_nonrigid_configuration_targets",
+                            }:
+                                raise
                     if accepted is None:
                         raise SampleRejected(
                             "configuration_attempts_exhausted",
@@ -2564,6 +2577,18 @@ def generate_dataset(
                                         raise SampleRejected(
                                             "no_visible_intervention_target",
                                             candidate_visibility["requirements"],
+                                        )
+                                    if not _available_intervention_types(
+                                        candidate_catalog,
+                                        set(candidate_visibility["eligible_target_ids"]),
+                                        used_targets,
+                                    ):
+                                        raise SampleRejected(
+                                            "no_visible_target_for_any_intervention_type",
+                                            {
+                                                "visible_target_count": len(candidate_visibility["eligible_target_ids"]),
+                                                "used_target_count": len(used_targets),
+                                            },
                                         )
                                     trajectories = candidate_trajectories
                                     trajectory_metrics = candidate_metrics

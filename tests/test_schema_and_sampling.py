@@ -11,7 +11,11 @@ from multi_view_world_dataset.adapters.omnigibson import (
     _restore_world_to_map_batch_order,
 )
 from multi_view_world_dataset.errors import SampleRejected
-from multi_view_world_dataset.sampling.configurations import exact_state_hash, near_duplicate_configuration
+from multi_view_world_dataset.sampling.configurations import (
+    exact_state_hash,
+    near_duplicate_configuration,
+    nonrigid_configuration_candidates,
+)
 from multi_view_world_dataset.sampling.placement import (
     select_consensus_local_headings,
     select_local_traversable_heading,
@@ -429,6 +433,138 @@ def test_state_hash_is_order_independent_and_near_duplicate():
     assert near_duplicate_configuration(
         (shifted, b), (a, b), translation_threshold_m=0.03, rotation_threshold_deg=3
     )
+
+
+def test_nonrigid_configuration_dedup_considers_fixed_base_state_and_joint():
+    fixed = replace(make_object("fixed"), movable=False, semantic_states={"Frozen": False})
+    frozen = replace(fixed, semantic_states={"Frozen": True})
+    options = {"translation_threshold_m": 0.03, "rotation_threshold_deg": 3}
+    assert near_duplicate_configuration((frozen,), (fixed,), **options)
+    assert not near_duplicate_configuration(
+        (frozen,), (fixed,), include_nonrigid=True, **options
+    )
+
+    articulated = replace(
+        fixed, articulated=True, semantic_states={}, joint_names=("joint",),
+        joint_limits=((0.0, 1.0),), joint_values=(0.0,),
+    )
+    passive_noise = replace(articulated, joint_values=(1.0e-12,))
+    real_change = replace(articulated, joint_values=(0.5,))
+    assert near_duplicate_configuration(
+        (passive_noise,), (articulated,), include_nonrigid=True, **options
+    )
+    assert not near_duplicate_configuration(
+        (real_change,), (articulated,), include_nonrigid=True, **options
+    )
+
+
+def test_nonfinite_joint_value_is_rejected_before_hash_serialization():
+    bad = replace(
+        make_object("bad"),
+        articulated=True,
+        joint_names=("joint",),
+        joint_limits=((0.0, 1.0),),
+        joint_values=(float("nan"),),
+    )
+    with pytest.raises(SampleRejected, match="nonfinite_configuration_joint_values"):
+        exact_state_hash((bad,))
+
+
+def test_nonrigid_configuration_changes_two_real_fixed_base_targets():
+    base = tuple(
+        replace(
+            make_object(f"fixed_{index}"),
+            movable=False,
+            articulated=True,
+            joint_names=("joint",),
+            joint_limits=((0.0, 1.0),),
+            joint_values=(0.0,),
+        )
+        for index in range(2)
+    )
+    base += (
+        replace(
+            make_object("passive"),
+            structural=True,
+            movable=False,
+            articulated=True,
+            joint_names=("joint",),
+            joint_limits=((0.0, 1.0),),
+            joint_values=(0.0,),
+        ),
+    )
+    assert len(nonrigid_configuration_candidates(base)) == 2
+
+    class FakeAdapter:
+        config = {
+            "configuration_sampling": {"nonrigid_changed_objects": 2},
+            "generation": {
+                "exact_hash_decimals": 8,
+                "snapshot_restore_tolerance": 1.0e-5,
+            },
+        }
+
+        def __init__(self):
+            self.values = np.zeros(len(base), dtype=np.float64)
+
+        def dump_snapshot(self):
+            return self.values.copy()
+
+        def load_snapshot(self, snapshot):
+            self.values = np.asarray(snapshot, dtype=np.float64).copy()
+
+        def object_catalog_with_relations(self):
+            return tuple(
+                replace(
+                    obj,
+                    joint_values=(
+                        float(self.values[index] + (1.0e-12 if obj.structural else 0.0)),
+                    ),
+                )
+                for index, obj in enumerate(base)
+            )
+
+        def apply_atomic_intervention(self, seed, *, forced_type, visible_target_ids):
+            assert forced_type is InterventionType.ARTICULATION
+            target_id = visible_target_ids[0]
+            index = int(target_id.split("_")[-1])
+            self.values[index] = 1.0
+            return {
+                "checks": {"physically_valid": True},
+                "changed_instance_ids": [target_id],
+                "snapshot": self.dump_snapshot(),
+                "event": SimpleNamespace(
+                    intervention_type=forced_type,
+                    parameters={"joint_index": 0, "value_after": 1.0},
+                ),
+            }
+
+        def refresh_collision_geometry_cache(self):
+            pass
+
+        def _catalog_restore_metrics(self, expected, restored):
+            return 0.0, all(
+                left.joint_values == right.joint_values
+                for left, right in zip(expected, restored, strict=True)
+            )
+
+    adapter = FakeAdapter()
+    first = OmniGibsonAdapter._randomize_nonrigid_configuration(
+        adapter, 91, baseline=base, original_snapshot=adapter.dump_snapshot(),
+    )
+    assert first["configuration_family"] == "nonrigid_fallback"
+    assert first["changed_object_count"] == 2
+    assert set(first["changed_instance_ids"]) == {"fixed_0", "fixed_1"}
+    assert all(x["change_type"] == "articulation" for x in first["changes"])
+    assert first["exact_state_hash"] != first["baseline_exact_state_hash"]
+    second_adapter = FakeAdapter()
+    second = OmniGibsonAdapter._randomize_nonrigid_configuration(
+        second_adapter, 91, baseline=base,
+        original_snapshot=second_adapter.dump_snapshot(),
+    )
+    assert second["exact_state_hash"] == first["exact_state_hash"]
+    assert second["changes"] == first["changes"]
+
 
 
 def test_scene_family_splits_are_disjoint():

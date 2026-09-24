@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -12,7 +14,7 @@ from multi_view_world_dataset.cameras.transforms import (
     validate_transform,
 )
 from multi_view_world_dataset.errors import GeometryError
-from multi_view_world_dataset.rendering.bev import BEVCalibration
+from multi_view_world_dataset.rendering.bev import BEVCalibration, interior_bev_camera_height
 
 
 def test_transform_inverse_and_composition():
@@ -54,6 +56,19 @@ def test_bev_pixel_world_pixel_roundtrip():
     world = calibration.pixel_to_world(pixels)
     recovered = calibration.world_to_pixel(world)
     np.testing.assert_allclose(recovered, pixels, atol=1e-10)
+
+
+def test_interior_bev_camera_stays_below_overhead_geometry():
+    floor = SimpleNamespace(
+        category="floors", bbox_min_world=(0.0, 0.0, 0.0),
+        bbox_max_world=(1.0, 1.0, 0.1),
+    )
+    ceiling = SimpleNamespace(
+        category="ceilings", bbox_min_world=(0.0, 0.0, 3.0),
+        bbox_max_world=(1.0, 1.0, 3.3),
+    )
+    assert interior_bev_camera_height((floor, ceiling), 0.0) == pytest.approx(2.95)
+    assert interior_bev_camera_height((floor,), 0.0) == pytest.approx(2.1)
 
 
 def test_bad_transform_fails_loudly():

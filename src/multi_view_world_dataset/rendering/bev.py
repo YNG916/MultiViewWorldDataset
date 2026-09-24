@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Iterable
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from multi_view_world_dataset.errors import GeometryError
+from multi_view_world_dataset.schema.records import ObjectState
 
 FloatArray = NDArray[np.float64]
 
@@ -82,3 +84,28 @@ class BEVCalibration:
         pixels[..., 1] = (ymax - world[..., 1]) / self.meters_per_pixel - 0.5
         return pixels
 
+
+
+def interior_bev_camera_height(
+    objects: Iterable[ObjectState],
+    floor_z: float,
+    *,
+    minimum_headroom_m: float = 2.0,
+    overhead_clearance_m: float = 0.05,
+) -> float:
+    """Place a top-down camera below the nearest overhead slab on this floor.
+
+    Hiding a ceiling after Replicator initialization can leave a stale visible
+    mesh in the AOV. A camera physically below it cannot see that mesh.
+    """
+    catalog = tuple(objects)
+    top_z = max((float(obj.bbox_max_world[2]) for obj in catalog), default=floor_z + 3.0)
+    overhead_bottoms = [
+        float(obj.bbox_min_world[2])
+        for obj in catalog
+        if obj.category in {"ceilings", "roof", "floors"}
+        and float(obj.bbox_min_world[2]) >= floor_z + minimum_headroom_m
+    ]
+    if overhead_bottoms:
+        return min(overhead_bottoms) - overhead_clearance_m
+    return top_z + 2.0

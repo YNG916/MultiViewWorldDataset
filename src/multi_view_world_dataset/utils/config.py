@@ -103,6 +103,25 @@ def validate_config(config: dict[str, Any]) -> None:
             "articulation, and state_change"
         )
     configuration_sampling = config.get("configuration_sampling", {})
+    nonrigid_fallback = configuration_sampling.get("nonrigid_fallback", False)
+    nonrigid_changed = configuration_sampling.get("nonrigid_changed_objects", 2)
+    nonrigid_max_changed = configuration_sampling.get(
+        "nonrigid_max_changed_objects", nonrigid_changed
+    )
+    if not isinstance(nonrigid_fallback, bool):
+        errors.append("configuration_sampling.nonrigid_fallback must be boolean")
+    if not isinstance(nonrigid_changed, int) or not 2 <= nonrigid_changed <= 6:
+        errors.append("configuration_sampling.nonrigid_changed_objects must be in [2,6]")
+    if (
+        not isinstance(nonrigid_max_changed, int)
+        or not isinstance(nonrigid_changed, int)
+        or not nonrigid_changed <= nonrigid_max_changed <= 6
+    ):
+        errors.append(
+            "configuration_sampling.nonrigid_max_changed_objects must be between minimum and 6"
+        )
+    if nonrigid_fallback and dataset.get("schema_version") != "1.2.0":
+        errors.append("nonrigid configuration fallback requires schema_version 1.2.0")
     minimum_changed = configuration_sampling.get("minimum_changed_objects")
     maximum_changed = configuration_sampling.get("maximum_changed_objects")
     if (
@@ -158,6 +177,15 @@ def validate_config(config: dict[str, Any]) -> None:
         errors.append(
             "worker_progress_poll_interval_s must be smaller than "
             "worker_progress_stall_timeout_s"
+        )
+    active_timeout = generation.get("worker_progress_active_stage_timeout_s")
+    if active_timeout is not None and (
+        not isinstance(active_timeout, (int, float))
+        or not isfinite(float(active_timeout))
+        or float(active_timeout) <= float(generation["worker_progress_stall_timeout_s"])
+    ):
+        errors.append(
+            "worker_progress_active_stage_timeout_s must exceed worker_progress_stall_timeout_s"
         )
     restore_tolerance = generation.get("snapshot_restore_tolerance")
     if not isinstance(restore_tolerance, (int, float)) or restore_tolerance <= 0:
