@@ -24,6 +24,7 @@ from multi_view_world_dataset.sampling.navigation import (
     build_region_graph,
     build_robot_footprint_model,
     compute_pairwise_route_compatibility,
+    first_compatible_route_triplet,
     oriented_safe_masks,
     route_start_regions_connected,
     select_joint_route_candidates,
@@ -46,14 +47,22 @@ from multi_view_world_dataset.utils.config import load_yaml_config
 REPOSITORY = Path(__file__).resolve().parents[1]
 
 
-def test_navigation_context_rejects_route_bank_below_configured_minimum(
-    monkeypatch,
-):
+@pytest.mark.parametrize("has_triplet", [False, True])
+def test_navigation_context_requires_triplet_not_24_routes(monkeypatch, has_triplet):
+    compatible = np.zeros((10, 10), dtype=bool)
+    compatible[0, 1] = compatible[1, 0] = True
+    compatible[1, 2] = compatible[2, 1] = True
+    if has_triplet:
+        compatible[0, 2] = compatible[2, 0] = True
     context = SimpleNamespace(
-        route_bank=(object(),) * 10,
+        route_bank=tuple(SimpleNamespace(start_region="living") for _ in range(10)),
         diagnostics={},
-        compatibility=SimpleNamespace(compatible_pair_fraction=0.5),
+        compatibility=SimpleNamespace(
+            compatible=compatible,
+            compatible_pair_fraction=float(np.mean(compatible)),
+        ),
         region_graph=SimpleNamespace(),
+        metadata=lambda include_routes=False: {},
     )
     adapter = SimpleNamespace(
         config={
@@ -80,23 +89,16 @@ def test_navigation_context_rejects_route_bank_below_configured_minimum(
         lambda *_args, **_kwargs: context,
     )
 
-    with pytest.raises(SampleRejected) as error:
-        build_navigation_contexts(adapter, "configuration", 7, force=True)
-
-    assert error.value.reason == "configuration_navigation_infeasible"
-    floor_failure = error.value.details["floor_failures"][0]
-    assert floor_failure["reason"] == "navigation_route_bank_below_minimum"
-    assert floor_failure["details"] == {
-        "floor_index": 0,
-        "route_count": 10,
-        "route_count_minimum": 24,
-        "route_count_target": 64,
-        "raw_route_attempts": None,
-        "route_acceptance_rate": None,
-        "route_reject_counts": {},
-        "footprint_safe_cell_count": None,
-        "start_region_distribution": {},
-    }
+    if has_triplet:
+        assert build_navigation_contexts(adapter, "configuration", 7, force=True) == {0: context}
+        assert context.diagnostics["functional_triplet_indices"] == [0, 1, 2]
+    else:
+        with pytest.raises(SampleRejected) as error:
+            build_navigation_contexts(adapter, "configuration", 7, force=True)
+        assert error.value.reason == "configuration_navigation_infeasible"
+        floor_failure = error.value.details["floor_failures"][0]
+        assert floor_failure["reason"] == "navigation_no_compatible_route_triplet"
+        assert floor_failure["details"]["route_count"] == 10
     assert context.diagnostics["route_count_minimum_met"] is False
 
 
@@ -561,6 +563,54 @@ def test_pairwise_compatibility_rejects_real_footprint_overlap():
     assert not compatibility.compatible[0, 1]
     assert not compatibility.footprint_collision[0, 2]
     assert compatibility.compatible[0, 2]
+
+
+def test_exact_triplet_respects_compatibility_and_region_connectivity():
+    original = (
+        _route("r0", [[0.0, 0.0], [1.0, 0.0]]),
+        _route("r1", [[0.0, 1.0], [1.0, 1.0]]),
+        _route("r2", [[0.0, 2.0], [1.0, 2.0]]),
+        _route("r3", [[0.0, 3.0], [1.0, 3.0]]),
+    )
+    names = ("living", "island", "kitchen", "entry")
+    routes = tuple(
+        RouteCandidate(**{**route.__dict__, "start_region": name})
+        for route, name in zip(original, names, strict=True)
+    )
+    matrix = np.ones((4, 4), dtype=bool)
+    np.fill_diagonal(matrix, False)
+    compatibility = SimpleNamespace(compatible=matrix)
+    graph = RegionGraph(
+        nodes=names, edges=(("living", "entry"), ("entry", "kitchen")),
+        cell_counts={name: 1 for name in names},
+    )
+    assert first_compatible_route_triplet(routes, compatibility) == (0, 1, 2)
+    assert first_compatible_route_triplet(
+        routes, compatibility, region_graph=graph
+    ) == (0, 2, 3)
+    matrix[0, 2] = matrix[2, 0] = False
+    assert first_compatible_route_triplet(
+        routes, compatibility, region_graph=graph
+    ) is None
+
+
+def test_joint_search_falls_back_to_exact_triangle_when_random_budget_misses():
+    routes = tuple(
+        _route(f"route_{index}", [[0.0, float(index)], [1.0, float(index)]])
+        for index in range(6)
+    )
+    matrix = np.zeros((6, 6), dtype=bool)
+    for first, second in ((3, 4), (3, 5), (4, 5)):
+        matrix[first, second] = matrix[second, first] = True
+    diagnostics = {}
+    selected = select_joint_route_candidates(
+        routes, SimpleNamespace(compatible=matrix),
+        SimpleNamespace(choice=lambda *_args, **_kwargs: 0),
+        top_k=1, search_budget=1, minimum_waypoint_trajectories=0,
+        diagnostics=diagnostics,
+    )
+    assert selected == ((3, 4, 5),)
+    assert diagnostics["deterministic_fallback_used"]
 
 
 def test_bounded_joint_search_is_deterministic_and_allows_nonparallel_routes():

@@ -20,6 +20,7 @@ from multi_view_world_dataset.sampling.navigation import (
     build_robot_footprint_model,
     compute_pairwise_route_compatibility,
     connected_components,
+    first_compatible_route_triplet,
     oriented_safe_masks,
     route_candidate_from_trajectory,
     sample_footprint_interior,
@@ -1132,38 +1133,9 @@ def build_navigation_contexts(
             context.diagnostics["route_count_minimum_met"] = bool(
                 len(context.route_bank) >= route_count_minimum
             )
-            if len(context.route_bank) < route_count_minimum:
-                raise SampleRejected(
-                    "navigation_route_bank_below_minimum",
-                    {
-                        "floor_index": floor_index,
-                        "route_count": len(context.route_bank),
-                        "route_count_minimum": route_count_minimum,
-                        "route_count_target": route_count_target,
-                        "raw_route_attempts": context.diagnostics.get(
-                            "raw_route_attempts"
-                        ),
-                        "route_acceptance_rate": context.diagnostics.get(
-                            "route_acceptance_rate"
-                        ),
-                        "route_reject_counts": context.diagnostics.get(
-                            "route_reject_counts", {}
-                        ),
-                        "footprint_safe_cell_count": context.diagnostics.get(
-                            "footprint_safe_cell_count"
-                        ),
-                        "start_region_distribution": context.diagnostics.get(
-                            "start_region_distribution", {}
-                        ),
-                    },
-                )
-            probe = select_joint_route_candidates(
+            probe = first_compatible_route_triplet(
                 context.route_bank,
                 context.compatibility,
-                np.random.default_rng(stable_seed(seed, "joint-feasibility", floor_index)),
-                top_k=1,
-                search_budget=int(adapter.config["navigation"]["joint_route_search_budget"]),
-                minimum_waypoint_trajectories=0,
                 region_graph=(
                     context.region_graph
                     if adapter.config["navigation"][
@@ -1172,12 +1144,19 @@ def build_navigation_contexts(
                     else None
                 ),
             )
-            if not probe:
+            context.diagnostics["functional_triplet_indices"] = (
+                list(probe) if probe is not None else None
+            )
+            if probe is None:
                 raise SampleRejected(
                     "navigation_no_compatible_route_triplet",
                     {
                         "floor_index": floor_index,
                         "route_count": len(context.route_bank),
+                        "route_count_minimum": route_count_minimum,
+                        "route_count_minimum_met": context.diagnostics[
+                            "route_count_minimum_met"
+                        ],
                         "compatible_pair_fraction": (
                             context.compatibility.compatible_pair_fraction
                         ),

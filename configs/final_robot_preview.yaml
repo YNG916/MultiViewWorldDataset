@@ -27,9 +27,8 @@ trajectory:
 
 navigation:
   route_bank_target_size: 64
-  # Smoke-only diagnostic threshold. Twelve independent routes already yield
-  # 220 possible triplets; compatibility, PhysX, and GT-depth remain hard
-  # gates. Production keeps the stricter default of 24.
+  # Diagnostic-only route-count target; actual acceptance requires a compatible
+  # three-robot route set plus the unchanged PhysX and GT-depth QA gates.
   route_bank_minimum_size: 12
   route_bank_max_raw_attempts: 1500
   route_candidate_attempts_per_raw: 10

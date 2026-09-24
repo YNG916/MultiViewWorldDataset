@@ -84,14 +84,12 @@ navigation:
   se2_rotation_cost_cells: 0.12
   se2_maximum_expansions: 250000
   route_bank_target_size: 64
-  # Production floor feasibility requires both this minimum RouteBank size
-  # and at least one compatible three-route combination.
+  # Diagnostic target retained for provenance; not a floor-acceptance gate.
+  # Functional feasibility requires a compatible three-route combination.
   route_bank_minimum_size: 24
-  # Constrained scenes have a low valid SE(2)-route yield. Keep a larger
-  # configuration-level budget so they can satisfy the production minimum
-  # RouteBank size instead of repeatedly resampling otherwise-valid furniture
-  # configurations. The loop still exits as soon as target_size is reached,
-  # so healthy scenes do not pay the full budget.
+  # Constrained scenes have a low valid SE(2)-route yield. This budget retains
+  # useful route diversity where possible; floor acceptance is based on actual
+  # three-robot compatibility, not an arbitrary route count.
   route_bank_max_raw_attempts: 6000
   route_candidate_attempts_per_raw: 10
   # Once a region produces one valid route, preferentially complete a

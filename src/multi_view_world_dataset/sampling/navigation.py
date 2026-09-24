@@ -642,6 +642,35 @@ def route_start_regions_connected(
     return targets.issubset(reached)
 
 
+def first_compatible_route_triplet(
+    routes: Sequence[RouteCandidate],
+    compatibility: RouteCompatibility,
+    *,
+    region_graph: RegionGraph | None = None,
+) -> tuple[int, int, int] | None:
+    """Find a functional three-robot route set without a stochastic search budget."""
+    count = len(routes)
+    if count < 3:
+        return None
+    matrix = np.asarray(compatibility.compatible, dtype=bool)
+    if matrix.shape != (count, count):
+        raise ValueError("Route compatibility matrix must match the route bank")
+    for first in range(count - 2):
+        for second in range(first + 1, count - 1):
+            if not matrix[first, second]:
+                continue
+            possible_thirds = np.flatnonzero(
+                matrix[first, second + 1:] & matrix[second, second + 1:]
+            ) + second + 1
+            for third in possible_thirds:
+                indices = (first, second, int(third))
+                if region_graph is None or route_start_regions_connected(
+                    tuple(routes[index] for index in indices), region_graph
+                ):
+                    return indices
+    return None
+
+
 def select_joint_route_candidates(
     routes: Sequence[RouteCandidate],
     compatibility: RouteCompatibility,
@@ -711,6 +740,23 @@ def select_joint_route_candidates(
         if prior is None or value[0] > prior[0]:
             found[indices] = value
 
+    used_exact_fallback = False
+    if not found:
+        fallback = first_compatible_route_triplet(
+            routes, compatibility, region_graph=region_graph
+        )
+        if fallback is not None:
+            selected = tuple(routes[index] for index in fallback)
+            visibility_score = (
+                float(cheap_visibility_score(selected))
+                if cheap_visibility_score is not None else 0.0
+            )
+            if np.isfinite(visibility_score):
+                found[fallback] = (
+                    _triplet_score(selected) + visibility_score_weight * visibility_score,
+                    visibility_score,
+                )
+                used_exact_fallback = True
     combined_ranked = sorted(
         found, key=lambda item: (-found[item][0], -found[item][1], item)
     )
@@ -719,6 +765,7 @@ def select_joint_route_candidates(
             "search_budget": search_budget,
             "unique_joint_candidate_count": len(found),
             "requested_shortlist_size": top_k,
+            "deterministic_fallback_used": used_exact_fallback,
         })
     if cheap_visibility_score is None or visibility_priority_fraction <= 0.0:
         result = tuple(combined_ranked[:top_k])
